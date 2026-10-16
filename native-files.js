@@ -25,24 +25,39 @@ async function safePath(root, relative, createParents = false) {
   return current;
 }
 async function scan(root) {
-  const files = [], directories = [];
+  const files = [], directories = [], skipped = [];
   async function visit(folder, prefix = "") {
-    for (const entry of await fs.readdir(folder, { withFileTypes: true })) {
-      if (entry.name === ".fortesdrive" || entry.isSymbolicLink()) continue;
+    let entries;
+    try { entries = await fs.readdir(folder, { withFileTypes: true }); }
+    catch (e) { skipped.push({ path: prefix, reason: "Pasta não pôde ser lida: " + e.message }); return; }
+    for (const entry of entries) {
+      if (entry.name === ".fortesdrive") continue;
+      if (entry.isSymbolicLink()) { skipped.push({ path: prefix + entry.name, reason: "Link simbólico não sincronizado" }); continue; }
       const relative = prefix + entry.name;
-      const absolute = await safePath(root, relative);
-      const stat = await fs.stat(absolute);
-      const identity = `${stat.dev}:${stat.ino}`;
-      if (entry.isDirectory()) { directories.push({ path: relative, identity }); await visit(absolute, relative + "/"); }
-      else if (entry.isFile()) {
-        const hash = await checksum(absolute), after = await fs.stat(absolute);
-        if (stat.size !== after.size || stat.mtimeMs !== after.mtimeMs) throw new Error(`Arquivo em edição, tentando no próximo ciclo: ${relative}`);
-        files.push({ path: relative, name: entry.name, size: stat.size, checksum: hash, identity });
-      }
+      let absolute;
+      try { absolute = await safePath(root, relative); }
+      catch (e) { skipped.push({ path: relative, reason: e.message }); continue; }
+      try {
+        const stat = await fs.stat(absolute);
+        // Pula reparse points do OneDrive (Files On-Demand) e outros arquivos não regulares
+        if (!stat.isFile() && !stat.isDirectory()) { skipped.push({ path: relative, reason: "Tipo não suportado" }); continue; }
+        const identity = `${stat.dev}:${stat.ino}`;
+        if (stat.isDirectory()) { directories.push({ path: relative, identity }); await visit(absolute, relative + "/"); }
+        else if (stat.isFile()) {
+          if (stat.size > MAX_BYTES) { skipped.push({ path: relative, reason: "Acima de 100 MB" }); continue; }
+          let hash;
+          try {
+            hash = await checksum(absolute);
+            const after = await fs.stat(absolute);
+            if (stat.size !== after.size || stat.mtimeMs !== after.mtimeMs) { skipped.push({ path: relative, reason: "Arquivo em edição ou download" }); continue; }
+          } catch (e) { skipped.push({ path: relative, reason: "Não foi possível ler: " + e.message }); continue; }
+          files.push({ path: relative, name: entry.name, size: stat.size, checksum: hash, identity });
+        }
+      } catch (e) { skipped.push({ path: relative, reason: e.message }); }
     }
   }
   await visit(root);
-  return { files, directories };
+  return { files, directories, skipped };
 }
 async function assertExpected(absolute, expected) {
   let stat;
@@ -56,9 +71,10 @@ async function read(root, relative, expected) {
   await assertExpected(absolute, expected);
   const stat = await fs.stat(absolute);
   if (stat.size > MAX_BYTES) throw new Error("Este cliente transfere arquivos de até 100 MB por arquivo");
-  const bytes = await fs.readFile(absolute);
-  if (crypto.createHash("sha256").update(bytes).digest("hex") !== expected) throw new Error("Arquivo alterado durante a leitura");
-  return bytes;
+  const buf = await fs.readFile(absolute);
+  if (crypto.createHash("sha256").update(buf).digest("hex") !== expected) throw new Error("Arquivo alterado durante a leitura");
+  // Retorna Uint8Array explícito para transferência IPC segura (sandbox mode)
+  return new Uint8Array(buf);
 }
 async function write(root, relative, bytes, hash, expected) {
   if (!bytes || bytes.byteLength > MAX_BYTES) throw new Error("Arquivo excede 100 MB");

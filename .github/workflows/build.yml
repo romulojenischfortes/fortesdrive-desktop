@@ -3,10 +3,8 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
-
 permissions:
   contents: write
-
 jobs:
   build:
     runs-on: windows-latest
@@ -16,20 +14,30 @@ jobs:
         with:
           node-version: 20
       - run: npm install
+      - name: Test native transfers and updater
+        run: node --test tests/native.test.cjs tests/updater.test.cjs
+      - name: Set unique update version
+        id: version
+        shell: pwsh
+        run: |
+          $base = (Get-Content package.json | ConvertFrom-Json).version.Split('.')
+          $version = "$($base[0]).$($base[1]).${{ github.run_number }}"
+          npm version $version --no-git-tag-version
+          "version=$version" >> $env:GITHUB_OUTPUT
       - run: node generate-icon.js
-      - run: npx electron-builder --win nsis
-      - name: Create Release
+      - run: npx electron-builder --win nsis --publish never
+      - name: Publish installer and update feed
         uses: softprops/action-gh-release@v2
         with:
-          files: release/*.exe
-          tag_name: v1.1.0-${{ github.run_number }}
-          name: FortesDrive Desktop 1.1.0 (Build ${{ github.run_number }})
+          fail_on_unmatched_files: true
+          files: |
+            release/*.exe
+            release/*.exe.blockmap
+            release/latest.yml
+          tag_name: v${{ steps.version.outputs.version }}
+          name: FortesDrive Desktop ${{ steps.version.outputs.version }}
           body: |
-            Instalador Windows do FortesDrive Desktop.
-
-            ## Como instalar
-            1. Baixe o arquivo .exe
-            2. Execute o instalador
-            3. Abra o FortesDrive e escolha o diretorio raiz
+            Correções na sincronização, proteção de arquivos ignorados e atualizador integrado.
+            Após esta instalação inicial, use Atualizações do aplicativo para as próximas versões.
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

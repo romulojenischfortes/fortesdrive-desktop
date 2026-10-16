@@ -1,6 +1,6 @@
 {
   "name": "fortesdrive-desktop",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "FortesDrive Desktop Client — sincronização local com a nuvem",
   "author": "FortesDrive",
   "license": "MIT",
@@ -27,6 +27,7 @@
       "preload.js",
       "sync-engine.js",
       "native-files.js",
+      "updater.js",
       "renderer/**/*",
       "node_modules/**/*"
     ],
@@ -74,7 +75,7 @@
       "icon": "build/icon.icns",
       "format": "ULFO"
     },
-    "publish": null
+    "publish": { "provider": "github", "owner": "romulojenischfortes", "repo": "fortesdrive-desktop", "releaseType": "release" }
   },
   "devDependencies": {
     "electron": "^31.0.0",

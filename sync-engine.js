@@ -23,7 +23,7 @@ class SyncEngine {
     await this.start();
   }
   async start() {
-    if (!this.watchFolder) return;
+    if (!this.watchFolder || this.state.running) return;
     await fs.access(this.watchFolder);
     this.state.running = true;
     this.watcher = chokidar.watch(this.watchFolder, {
