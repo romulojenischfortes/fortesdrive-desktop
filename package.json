@@ -17,6 +17,7 @@
   "build": {
     "appId": "com.fortesdrive.desktop",
     "productName": "FortesDrive",
+    "artifactName": "FortesDrive-Setup-${version}.${ext}",
     "copyright": "Copyright © 2026 FortesDrive",
     "directories": {
       "output": "release",
