@@ -4,6 +4,9 @@ on:
     branches: [main]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: windows-latest
@@ -19,11 +22,11 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: release/*.exe
-          tag_name: v1.1.0
-          name: FortesDrive Desktop 1.1.0
+          tag_name: v1.1.0-${{ github.run_number }}
+          name: FortesDrive Desktop 1.1.0 (Build ${{ github.run_number }})
           body: |
             Instalador Windows do FortesDrive Desktop.
-            
+
             ## Como instalar
             1. Baixe o arquivo .exe
             2. Execute o instalador
