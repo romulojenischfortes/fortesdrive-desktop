@@ -1,0 +1,32 @@
+name: Build Installer
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm install
+      - run: node generate-icon.js
+      - run: npx electron-builder --win nsis
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*.exe
+          tag_name: v1.1.0
+          name: FortesDrive Desktop 1.1.0
+          body: |
+            Instalador Windows do FortesDrive Desktop.
+            
+            ## Como instalar
+            1. Baixe o arquivo .exe
+            2. Execute o instalador
+            3. Abra o FortesDrive e escolha o diretorio raiz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
