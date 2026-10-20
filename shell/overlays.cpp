@@ -69,8 +69,10 @@ public:
     if(!filename)return S_FALSE;
     try {
       const auto root=rootPath(), r=lower(root), file=lower(filename);
-      if(r.empty() || (file!=r && (file.size()<=r.size() || file.compare(0,r.size(),r)!=0 || file[r.size()]!=L'\\'))) return S_FALSE;
-      const auto relative=file==r?L"":file.substr(r.size()+1);
+      if(r.empty())return S_FALSE;
+      const auto prefix=r.back()==L'\\'?r:r+L"\\";
+      if(file!=r && file.rfind(prefix,0)!=0)return S_FALSE;
+      const auto relative=file==r?L"":file.substr(prefix.size());
       if(relative==L".fortesdrive" || relative.rfind(L".fortesdrive\\",0)==0)return S_FALSE;
       Entry entry;
       {std::lock_guard<std::mutex> lock(cacheMutex);load(root);auto found=cache.find(relative);if(found!=cache.end())entry=found->second;}

@@ -33,7 +33,7 @@ int wmain() {
     require(error.IsMemberOf(file.c_str(),0)==S_OK,"error badge");
     require(error.IsMemberOf(root.c_str(),0)==S_OK,"error root");
     moduleHandle=GetModuleHandleW(nullptr);wchar_t exe[MAX_PATH];GetModuleFileNameW(nullptr,exe,MAX_PATH);
-    HICON large=nullptr,small=nullptr;require(ExtractIconExW(exe,0,&large,&small,1)==1,"embedded badge icon");if(large)DestroyIcon(large);if(small)DestroyIcon(small);
+    HICON largeIcon=nullptr,smallIcon=nullptr;require(ExtractIconExW(exe,0,&largeIcon,&smallIcon,1)==1,"embedded badge icon");if(largeIcon)DestroyIcon(largeIcon);if(smallIcon)DestroyIcon(smallIcon);
     std::filesystem::remove_all(root);std::cout<<"Explorer badge tests passed\n";return 0;
   } catch(const std::exception& error){std::cerr<<error.what()<<"\n";std::filesystem::remove_all(root);return 1;}
 }

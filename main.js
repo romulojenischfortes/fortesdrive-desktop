@@ -89,7 +89,7 @@ function registerHandlers() {
     },
     getManifest: userId => syncEngine.getManifest(userId),
     saveManifest: (userId, manifest) => syncEngine.saveManifest(userId, manifest),
-    setState: state => {
+    setState: async state => {
       const allowed = ["syncing", "queue", "error", "lastSync", "userEmail", "online", "conflicts", "syncedCount", "skipped", "issues"];
       for (const key of allowed) if (Object.hasOwn(state, key)) syncEngine.state[key] = state[key];
       // Atualiza o ícone do tray com base no estado
@@ -98,6 +98,7 @@ function registerHandlers() {
       else if (current.syncing) updateTrayState("syncing");
       else if (current.online === false || current.skipped > 0) updateTrayState("offline");
       else updateTrayState("synced");
+      if (state.error) await syncEngine.badges.publish({entries: [...syncEngine.badges.entries.values()], state: state.online === false ? "pending" : "error"}).catch(error => { syncEngine.state.badgeError = error.message; });
     },
     notify: (params) => {
       notify(params.title, params.body, params.urgency);
