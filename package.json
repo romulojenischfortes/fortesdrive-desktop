@@ -41,10 +41,8 @@
           "arch": ["x64"]
         }
       ],
-      "signtoolOptions": {
-        "rfc3161TimeStampServer": "http://timestamp.digicert.com",
-        "signingHashAlgorithms": ["sha256"]
-      },
+      "rfc3161TimeStampServer": "http://timestamp.digicert.com",
+      "signingHashAlgorithms": ["sha256"],
       "verifyUpdateCodeSignature": false
     },
     "nsis": {
