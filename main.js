@@ -79,12 +79,18 @@ function registerHandlers() {
     checkForUpdates: () => updater.check(),
     downloadUpdate: () => updater.download(),
     installUpdate: () => updater.install(),
+    launchInstaller: () => updater.launchInstaller(),
+    verifyUpdateSignature: () => updater.verifyUpdateSignature(),
     syncNow: () => { requestSync(); return true; },
     snapshot: () => syncEngine.snapshot(),
+    publishSyncStatus: async payload => {
+      try { await syncEngine.badges.publish(payload); syncEngine.state.badgeError = ""; }
+      catch (error) { syncEngine.state.badgeError = error.message; }
+    },
     getManifest: userId => syncEngine.getManifest(userId),
     saveManifest: (userId, manifest) => syncEngine.saveManifest(userId, manifest),
     setState: state => {
-      const allowed = ["syncing", "queue", "error", "lastSync", "userEmail", "online", "conflicts", "syncedCount", "skipped"];
+      const allowed = ["syncing", "queue", "error", "lastSync", "userEmail", "online", "conflicts", "syncedCount", "skipped", "issues"];
       for (const key of allowed) if (Object.hasOwn(state, key)) syncEngine.state[key] = state[key];
       // Atualiza o ícone do tray com base no estado
       const current = syncEngine.state;

@@ -51,7 +51,7 @@ async function scan(root) {
             const after = await fs.stat(absolute);
             if (stat.size !== after.size || stat.mtimeMs !== after.mtimeMs) { skipped.push({ path: relative, reason: "Arquivo em edição ou download" }); continue; }
           } catch (e) { skipped.push({ path: relative, reason: "Não foi possível ler: " + e.message }); continue; }
-          files.push({ path: relative, name: entry.name, size: stat.size, checksum: hash, identity });
+          files.push({ path: relative, name: entry.name, size: stat.size, mtimeMs: stat.mtimeMs, checksum: hash, identity });
         }
       } catch (e) { skipped.push({ path: relative, reason: e.message }); }
     }
@@ -92,11 +92,15 @@ async function write(root, relative, bytes, hash, expected) {
     await assertExpected(absolute, expected);
     await fs.rename(temp, absolute);
   } finally { await fs.rm(temp, { force: true }); }
+  const saved = await fs.stat(absolute);
+  return { size: saved.size, mtimeMs: saved.mtimeMs, identity: `${saved.dev}:${saved.ino}` };
 }
 async function move(root, from, to, expected) {
   const source = await safePath(root, from), destination = await safePath(root, to, true);
   await assertExpected(source, expected);
   await assertExpected(destination, null);
   await fs.rename(source, destination);
+  const saved = await fs.stat(destination);
+  return { size: saved.size, mtimeMs: saved.mtimeMs, identity: `${saved.dev}:${saved.ino}` };
 }
 module.exports = { safePath, scan, read, write, move, checksum, assertExpected, MAX_BYTES };

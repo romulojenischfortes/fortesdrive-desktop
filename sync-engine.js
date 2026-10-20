@@ -3,6 +3,7 @@ const chokidar = require("chokidar");
 const crypto = require("crypto");
 const fs = require("fs/promises");
 const native = require("./native-files");
+const {ShellStatus} = require("./shell-status");
 
 class SyncEngine {
   constructor(notify) {
@@ -12,6 +13,7 @@ class SyncEngine {
     this.store.set("deviceId", this.deviceId);
     this.notify = notify;
     this.state = { running: false, syncing: false, queue: 0, error: "", lastSync: null };
+    this.badges = new ShellStatus();
   }
   async setWatchFolder(folder) {
     if (this.state.syncing) throw new Error("Aguarde a sincronização terminar antes de trocar a pasta");
@@ -25,13 +27,15 @@ class SyncEngine {
   async start() {
     if (!this.watchFolder || this.state.running) return;
     await fs.access(this.watchFolder);
+    await this.badges.start(this.watchFolder).catch(error => { this.state.badgeError = error.message; });
     this.state.running = true;
     this.watcher = chokidar.watch(this.watchFolder, {
       ignored: /(^|[/\\])\.fortesdrive([/\\]|$)/,
       ignoreInitial: true, followSymlinks: false,
       awaitWriteFinish: { stabilityThreshold: 1000, pollInterval: 200 },
     });
-    this.watcher.on("all", () => {
+    this.watcher.on("all", (event, absolute) => {
+      this.badges.dirty(absolute);
       clearTimeout(this.debounce);
       this.debounce = setTimeout(() => this.notify(), 800);
     }).on("error", error => { this.state.error = error.message; });

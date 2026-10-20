@@ -4,9 +4,10 @@ const channels = {
   snapshot: "snapshot", readFile: "readFile", writeFile: "writeFile",
   moveFile: "moveFile", trashFile: "trashFile", mkdir: "mkdir", rmdir: "rmdir",
   getManifest: "getManifest", saveManifest: "saveManifest", setState: "setState",
-  notify: "notify",
+  notify: "notify", publishSyncStatus: "publishSyncStatus",
   getUpdateStatus: "getUpdateStatus", checkForUpdates: "checkForUpdates",
   downloadUpdate: "downloadUpdate", installUpdate: "installUpdate",
+  launchInstaller: "launchInstaller", verifyUpdateSignature: "verifyUpdateSignature",
 };
 const api = { isDesktop: true };
 for (const [method, channel] of Object.entries(channels)) {
