@@ -174,4 +174,22 @@ app.whenReady().then(async () => {
 });
 app.on("activate", () => mainWindow?.show());
 app.on("window-all-closed", () => {});
-app.on("before-quit", () => { app.isQuitting = true; syncEngine?.stop(); });
+let installingOnExit = false;
+// Encerramento da sessão do Windows: fecha sem tentar instalar a atualização.
+app.on("session-end", () => { app.isQuitting = true; installingOnExit = true; });
+app.on("before-quit", event => {
+  app.isQuitting = true;
+  // Fechar o aplicativo com uma atualização já baixada aplica a nova versão
+  // sozinho, pelo mesmo caminho com permissão de administrador do botão
+  // "Reiniciar e instalar".
+  if (installingOnExit || !updater?.hasPendingUpdate()) { syncEngine?.stop(); return; }
+  event.preventDefault();
+  installingOnExit = true;
+  notify("FortesDrive — Atualizando", "Aplicando a nova versão. Autorize a permissão do Windows se ela for solicitada.");
+  updater.install()
+    .catch(error => console.error("Falha ao aplicar a atualização ao sair:", error.message))
+    .finally(() => {
+      // Se o instalador não assumiu o encerramento, o aplicativo fecha de qualquer forma.
+      if (updater.getStatus().status !== "installing") setTimeout(() => app.quit(), 500).unref?.();
+    });
+});

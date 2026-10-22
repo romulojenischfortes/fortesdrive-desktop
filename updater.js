@@ -22,6 +22,8 @@ class DesktopUpdater {
       installerPath: null,
       installerExists: false,
       signature: "unknown",
+      // A atualização baixada é aplicada sozinha quando o aplicativo é fechado.
+      autoInstallOnExit: true,
     };
     updater.autoDownload = false;
     updater.autoInstallOnAppQuit = false;
@@ -29,7 +31,15 @@ class DesktopUpdater {
     updater.logger = console;
 
     updater.on("checking-for-update", () => this.patch({ status: "checking", error: "", errorKind: "", detail: "" }));
-    updater.on("update-available", info => this.patch({ status: "available", version: info.version, percent: 0, error: "", errorKind: "", detail: "" }));
+    updater.on("update-available", info => {
+      this.patch({ status: "available", version: info.version, percent: 0, error: "", errorKind: "", detail: "" });
+      notify("FortesDrive — Nova versão disponível", `A versão ${info.version} está sendo baixada automaticamente. Você será avisado quando estiver pronta.`);
+      // Baixa sem depender de clique. Se falhar, volta para "disponível" para
+      // tentar novamente na próxima verificação automática.
+      this.download()
+        .then(status => { if (status.status === "error") this.patch({ status: "available" }); })
+        .catch(() => {});
+    });
     updater.on("update-not-available", () => this.patch({ status: "current", error: "", errorKind: "", detail: "" }));
     updater.on("download-progress", progress => this.patch({ status: "downloading", percent: Math.round(progress.percent || 0) }));
     updater.on("update-downloaded", info => {
@@ -45,13 +55,16 @@ class DesktopUpdater {
         installerExists: !!installerPath,
       });
       this.verifyUpdateSignature().catch(() => {});
-      notify("FortesDrive", "Atualização pronta. Abra o aplicativo e clique em Reiniciar e instalar.");
+      notify("FortesDrive — Atualização pronta", `A versão ${info.version} será instalada automaticamente quando você fechar o aplicativo.`);
     });
     updater.on("error", error => this.patch(this.classify(error)));
   }
 
   patch(change) { Object.assign(this.state, change); }
   getStatus() { return { ...this.state }; }
+
+  /** true quando há uma atualização baixada aguardando ser aplicada. */
+  hasPendingUpdate() { return this.state.status === "downloaded"; }
 
   classify(error) {
     const raw = String((error && error.message) || error || "Falha desconhecida");
@@ -136,19 +149,75 @@ class DesktopUpdater {
     return this.getStatus();
   }
 
-  /** Inicia a instalação mostrando o instalador do Windows. */
+  /**
+   * Abre o instalador pelo Windows com elevação (UAC).
+   *
+   * O instalador do FortesDrive é instalado "para todos os usuários" porque
+   * precisa registrar as marcas do Explorador de Arquivos. Sem essa elevação, o
+   * Windows bloqueava a abertura — o download terminava e nada aparecia na tela.
+   * Pedir a permissão explicitamente faz a janela do instalador abrir de fato.
+   */
+  launchElevated(file) {
+    if (process.platform !== "win32") {
+      return shell.openPath(file).then(result => (result ? { ok: false, detail: result } : { ok: true }));
+    }
+    return new Promise((resolve) => {
+      execFile(
+        "powershell",
+        ["-NoProfile", "-Command", "Start-Process -FilePath $env:FD_UPD_FILE -Verb RunAs"],
+        { env: { ...process.env, FD_UPD_FILE: file }, windowsHide: true, timeout: 60000 },
+        (error, stdout, stderr) => {
+          if (!error) return resolve({ ok: true });
+          resolve({ ok: false, detail: String(stderr || error.message || "").trim() });
+        }
+      );
+    });
+  }
+
+  /** Inicia a instalação abrindo o instalador do Windows (com permissão de administrador). */
   async install() {
     if (this.state.status !== "downloaded") throw new Error("A atualização ainda não está pronta.");
     if (this.engine.state.syncing) throw new Error("Aguarde a sincronização terminar antes de reiniciar.");
+
+    const file = this.state.installerPath || this.findInstaller();
     this.patch({ status: "installing", error: "", errorKind: "" });
-    this.app.isQuitting = true;
+
+    if (file && fs.existsSync(file)) {
+      const sig = await this.verifyUpdateSignature();
+      if (sig.signature === "invalid") {
+        this.patch({
+          status: "downloaded",
+          errorKind: "signature",
+          error: "A assinatura digital deste instalador não é válida. Por segurança ele não será aberto: baixe novamente pela página oficial do FortesDrive.",
+        });
+        return this.getStatus();
+      }
+
+      const launched = await this.launchElevated(file);
+      if (launched.ok) {
+        this.notify("FortesDrive", "Instalador aberto. Autorize a permissão do Windows para concluir a atualização.");
+        // O aplicativo precisa liberar os arquivos para o instalador substituí-los.
+        this.app.isQuitting = true;
+        setTimeout(() => this.app.quit(), 2000).unref?.();
+        return this.getStatus();
+      }
+
+      // A elevação falhou (permissão cancelada, por exemplo): volta ao estado
+      // anterior e abre o caminho manual em vez de deixar a tela presa.
+      this.app.isQuitting = false;
+      this.patch(this.launchFailedState(launched.detail));
+      return this.getStatus();
+    }
+
+    // Sem instalador localizado: comportamento padrão do electron-updater.
     try {
-      // isSilent = false → o instalador abre visivelmente, evitando o caso em
-      // que a atualização "não abre" por estar configurada como silenciosa.
+      this.app.isQuitting = true;
+      // isSilent = false → o instalador abre visivelmente.
       this.updater.quitAndInstall(false, true);
     } catch (error) {
       this.app.isQuitting = false;
-      return this.launchInstaller();
+      this.patch(this.launchFailedState(error.message));
+      return this.getStatus();
     }
     // Se o aplicativo continuar em execução, o instalador não abriu sozinho:
     // libera o caminho manual em vez de deixar a tela travada em "Reiniciando".
@@ -161,6 +230,19 @@ class DesktopUpdater {
     }, 8000);
     timer.unref?.();
     return this.getStatus();
+  }
+
+  launchFailedState(detail) {
+    const raw = String(detail || "");
+    const cancelled = /cancel|cancelad|negad|denied|1223/i.test(raw);
+    return {
+      status: "downloaded",
+      errorKind: "installer",
+      error: cancelled
+        ? "A permissão de administrador do Windows foi cancelada. Clique em “Abrir instalador” e autorize a permissão para concluir."
+        : "O Windows não permitiu abrir o instalador automaticamente. Clique em “Abrir instalador” ou baixe novamente pela página oficial.",
+      detail: raw,
+    };
   }
 
   /** Abre o instalador baixado diretamente pelo Windows. */
@@ -185,16 +267,12 @@ class DesktopUpdater {
       });
       return this.getStatus();
     }
-    const result = await shell.openPath(file);
-    if (result) {
-      this.patch({
-        errorKind: "installer",
-        error: "O Windows não permitiu abrir o instalador automaticamente. Abra este arquivo manualmente: " + file,
-        detail: result,
-      });
-    } else {
-      this.patch({ error: "", errorKind: "", detail: "" });
+    const launched = await this.launchElevated(file);
+    if (!launched.ok) {
+      this.patch(this.launchFailedState(launched.detail));
+      return this.getStatus();
     }
+    this.patch({ error: "", errorKind: "", detail: "" });
     return this.getStatus();
   }
 
@@ -202,7 +280,11 @@ class DesktopUpdater {
     if (!this.app.isPackaged) return;
     const check = () => this.check().catch(error => this.patch(this.classify(error)));
     check();
-    this.timer = setInterval(check, 60 * 60 * 1000);
+    // Verifica logo depois de abrir e a cada 30 minutos: uma versão publicada
+    // é percebida e baixada sem que ninguém precise clicar em nada.
+    this.soon = setTimeout(check, 2 * 60 * 1000);
+    this.soon.unref?.();
+    this.timer = setInterval(check, 30 * 60 * 1000);
     this.timer.unref?.();
   }
 }
