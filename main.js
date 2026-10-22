@@ -54,7 +54,21 @@ function updateTrayState(state) {
   const icon = makeTrayIcon(state);
   tray.setImage(icon);
   const labels = { synced: "FortesDrive — Sincronizado", syncing: "FortesDrive — Sincronizando...", offline: "FortesDrive — Offline (fila pendente)", conflict: "FortesDrive — Conflito detectado" };
-  tray.setToolTip(labels[state] || "FortesDrive");
+  const detail = syncEngine?.state?.progressLabel;
+  tray.setToolTip((labels[state] || "FortesDrive") + (detail ? " — " + detail : ""));
+}
+
+// Barra de progresso na barra de tarefas do Windows: acompanha a transferência
+// mesmo com a janela minimizada ou atrás de outras. 2 = indeterminado,
+// -1 = limpa a barra.
+function applyWindowsProgress() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  const { progress, progressMode } = syncEngine.state;
+  if (typeof progress !== "number" || progress < 0) {
+    mainWindow.setProgressBar(-1, { mode: "none" });
+    return;
+  }
+  mainWindow.setProgressBar(progress, { mode: progressMode || "normal" });
 }
 app.commandLine.appendSwitch("disable-renderer-backgrounding");
 if (!app.requestSingleInstanceLock()) app.quit();
@@ -93,8 +107,9 @@ function registerHandlers() {
     getManifest: userId => syncEngine.getManifest(userId),
     saveManifest: (userId, manifest) => syncEngine.saveManifest(userId, manifest),
     setState: async state => {
-      const allowed = ["syncing", "queue", "error", "lastSync", "userEmail", "online", "conflicts", "syncedCount", "skipped", "issues"];
+      const allowed = ["syncing", "queue", "error", "lastSync", "userEmail", "online", "conflicts", "syncedCount", "skipped", "issues", "progress", "progressMode", "progressLabel"];
       for (const key of allowed) if (Object.hasOwn(state, key)) syncEngine.state[key] = state[key];
+      applyWindowsProgress();
       // Atualiza o ícone do tray com base no estado
       const current = syncEngine.state;
       if (current.conflicts > 0 || current.error) updateTrayState("conflict");
