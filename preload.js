@@ -5,6 +5,7 @@ const channels = {
   moveFile: "moveFile", trashFile: "trashFile", mkdir: "mkdir", rmdir: "rmdir",
   getManifest: "getManifest", saveManifest: "saveManifest", setState: "setState",
   notify: "notify", publishSyncStatus: "publishSyncStatus",
+  getBadgeSetup: "getBadgeSetup", repairBadges: "repairBadges",
   getUpdateStatus: "getUpdateStatus", checkForUpdates: "checkForUpdates",
   downloadUpdate: "downloadUpdate", installUpdate: "installUpdate",
   launchInstaller: "launchInstaller", verifyUpdateSignature: "verifyUpdateSignature",

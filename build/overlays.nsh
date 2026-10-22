@@ -14,6 +14,12 @@
   !insertmacro RegisterFortesOverlay 1 Synced
   !insertmacro RegisterFortesOverlay 2 Pending
   !insertmacro RegisterFortesOverlay 3 Error
+  ; O Explorador só carrega as marcas de ícones quando inicia. Reiniciá-lo aqui
+  ; faz as marcas aparecerem nas pastas e nos arquivos logo após a instalação,
+  ; sem precisar encerrar a sessão do Windows.
+  nsExec::ExecToLog 'taskkill /F /IM explorer.exe'
+  Sleep 1500
+  Exec '"$WINDIR\explorer.exe"'
 !macroend
 !macro UnregisterFortesOverlay suffix label
   DeleteRegKey HKLM "Software\Classes\CLSID\{9E76E330-7AB7-4AFE-B912-2A305BCD4F0${suffix}}"

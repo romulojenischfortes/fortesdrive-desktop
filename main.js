@@ -4,6 +4,7 @@ const fs = require("fs/promises");
 const { SyncEngine } = require("./sync-engine");
 const native = require("./native-files");
 const { DesktopUpdater } = require("./updater");
+const badgeSetup = require("./badge-setup");
 const WEB_APP_URL = process.env.NODE_ENV === "development" ? "http://localhost:5173" : "https://fortesdrive.base44.app";
 let mainWindow, tray, syncEngine, updater;
 let lastOnlineState = null;
@@ -76,6 +77,8 @@ function registerHandlers() {
     selectFolder: selectFolder,
     getStatus: () => ({ ...syncEngine.getStatus(), updating: updater?.state.status === "installing", appVersion: app.getVersion() }),
     getUpdateStatus: () => updater.getStatus(),
+    getBadgeSetup: () => badgeSetup.readBadgeSetup(),
+    repairBadges: () => badgeSetup.repairBadges({ app }),
     checkForUpdates: () => updater.check(),
     downloadUpdate: () => updater.download(),
     installUpdate: () => updater.install(),
