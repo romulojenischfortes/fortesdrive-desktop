@@ -15,7 +15,7 @@ jobs:
           node-version: 20
       - run: npm install
       - name: Test native transfers and updater
-        run: node --test tests/native.test.cjs tests/updater.test.cjs tests/badge-setup.test.cjs
+        run: node --test tests/native.test.cjs tests/updater.test.cjs tests/badge-setup.test.cjs tests/packaging.test.cjs
       - name: Build and test Explorer badges
         shell: cmd
         run: |

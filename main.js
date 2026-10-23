@@ -4,7 +4,17 @@ const fs = require("fs/promises");
 const { SyncEngine } = require("./sync-engine");
 const native = require("./native-files");
 const { DesktopUpdater } = require("./updater");
-const badgeSetup = require("./badge-setup");
+// As marcas no Explorador são um recurso acessório (extensão registrada pelo
+// instalador). Se o módulo que cuida delas não estiver disponível, o aplicativo
+// inicia normalmente e somente as marcas ficam indisponíveis.
+let badgeSetup;
+try {
+  badgeSetup = require("./badge-setup");
+} catch (error) {
+  console.warn("Marcas do Explorador indisponíveis: " + error.message);
+  const unavailable = async () => ({ supported: false, unavailable: true, reason: error.message });
+  badgeSetup = { readBadgeSetup: unavailable, repairBadges: unavailable };
+}
 const WEB_APP_URL = process.env.NODE_ENV === "development" ? "http://localhost:5173" : "https://fortesdrive.base44.app";
 let mainWindow, tray, syncEngine, updater;
 let lastOnlineState = null;
