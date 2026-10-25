@@ -118,6 +118,31 @@ O build executa testes nativos que verificam as quatro marcas, arquivos alterado
 exclusão de caminhos fora da raiz, recursos de ícone e falhas de leitura.
 A exibição final no Explorador deve ser validada em um Windows com o instalador em execução.
 
+## Instalador unificado (Windows)
+
+O instalador do cliente também prepara o **servidor de armazenamento**: além do
+aplicativo, ele leva o pacote em `server/` e abre o assistente `setup-server.ps1`
+numa janela própria durante a instalação. Um único download resolve o computador
+inteiro:
+
+1. confere/instala o Docker Desktop;
+2. grava o gateway (SeaweedFS + Docker Compose) na pasta de trabalho do servidor;
+3. reaproveita ou cria o segredo de assinatura;
+4. sobe os serviços e espera o gateway responder na porta 8790;
+5. instala o túnel e explica a etapa manual do token (ngrok);
+6. mostra o endereço e o segredo que devem ser colados no app.
+
+A pasta padrão é a mesma do instalador avulso `instalar-servidor.bat`
+(`Desktop\storage-server`), então dados já gravados, versões e o segredo existente
+são reaproveitados — nada é apagado.
+
+O assistente roda de novo pelo atalho **"FortesDrive - configurar servidor"** no
+menu Iniciar. Ele é necessário quando o Docker Desktop pede para reiniciar o
+Windows na primeira instalação: reinicie e use o atalho.
+
+O conteúdo de `server/` é uma cópia do material publicado pelo app em
+`storage-server/`; ao alterar o gateway, atualize os dois lugares.
+
 ## Assinatura digital (Windows)
 
 O instalador é assinado automaticamente quando estes segredos existem no repositório:

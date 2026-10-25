@@ -21,6 +21,20 @@
   nsExec::ExecToLog 'taskkill /F /IM explorer.exe'
   Sleep 1500
   Exec '"$WINDIR\explorer.exe"'
+
+  ; ------------------------------------------------------------------
+  ; Servidor de armazenamento: o cliente desktop só sincroniza com o
+  ; servidor no ar, então o instalador traz o pacote do servidor
+  ; (SeaweedFS + gateway) em resources\server e abre o assistente numa
+  ; janela própria — Docker, serviços, segredo e túnel num único download.
+  ; O atalho permite repetir a configuração depois (por exemplo, quando o
+  ; Docker Desktop reinicia o Windows na primeira instalação).
+  ; ------------------------------------------------------------------
+  DetailPrint "Configurando o servidor de armazenamento FortesDrive..."
+  CreateShortCut "$SMPROGRAMS\FortesDrive - configurar servidor.lnk" "powershell.exe" \
+    "-NoProfile -ExecutionPolicy Bypass -NoExit -File $\"$INSTDIR\resources\server\setup-server.ps1$\"" \
+    "$INSTDIR\FortesDrive.exe" 0
+  ExecShell "open" "powershell.exe" "-NoProfile -ExecutionPolicy Bypass -NoExit -File $\"$INSTDIR\resources\server\setup-server.ps1$\""
 !macroend
 !macro UnregisterFortesOverlay suffix label
   DeleteRegKey HKLM "Software\Classes\CLSID\{9E76E330-7AB7-4AFE-B912-2A305BCD4F0${suffix}}"
@@ -30,6 +44,7 @@
 !macroend
 !macro customUnInstall
   SetRegView 64
+  Delete "$SMPROGRAMS\FortesDrive - configurar servidor.lnk"
   !insertmacro UnregisterFortesOverlay 1 Synced
   !insertmacro UnregisterFortesOverlay 2 Pending
   !insertmacro UnregisterFortesOverlay 3 Error

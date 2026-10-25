@@ -34,7 +34,10 @@
       "renderer/**/*",
       "node_modules/**/*"
     ],
-    "extraResources": [{ "from": "shell/FortesDriveOverlays.dll", "to": "shell/FortesDriveOverlays.dll" }],
+    "extraResources": [
+      { "from": "shell/FortesDriveOverlays.dll", "to": "shell/FortesDriveOverlays.dll" },
+      { "from": "server", "to": "server" }
+    ],
     "win": {
       "target": [
         {

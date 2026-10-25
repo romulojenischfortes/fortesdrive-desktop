@@ -1,0 +1,50 @@
+# FortesDrive — armazenamento próprio (SeaweedFS + gateway)
+#
+# Um único nó: master, volume e filer do SeaweedFS em um processo, mais o
+# gateway que autentica e confere cada envio. Só o gateway aparece para fora,
+# e apenas na porta local 8790 — quem publica para a internet é o túnel/proxy
+# descrito no README (HTTPS obrigatório).
+#
+#   docker compose up -d --build
+#
+name: fortesdrive-storage
+
+services:
+  seaweedfs:
+    image: chrislusf/seaweedfs:3.80
+    command: >
+      server -dir=/data
+      -ip=seaweedfs
+      -ip.bind=0.0.0.0
+      -master.volumeSizeLimitMB=8192
+      -volume.max=0
+    volumes:
+      - ./data:/data
+    restart: unless-stopped
+    networks:
+      - fd-storage
+
+  gateway:
+    build: ./gateway
+    env_file:
+      - ./.env
+    environment:
+      FILER_URL: http://seaweedfs:8888
+      PORT: "8790"
+      TMP_DIR: /var/lib/fd-gateway/tmp
+    volumes:
+      # Área temporária da verificação de integridade: precisa de espaço livre
+      # igual ao maior arquivo que você pretende enviar.
+      - ./tmp:/var/lib/fd-gateway/tmp
+    ports:
+      # Publicado só no próprio computador: o túnel/proxy fala com ele por aqui.
+      - "127.0.0.1:8790:8790"
+    depends_on:
+      - seaweedfs
+    restart: unless-stopped
+    networks:
+      - fd-storage
+
+networks:
+  fd-storage:
+    driver: bridge
