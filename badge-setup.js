@@ -15,6 +15,7 @@ const STATES = [
   { suffix: "1", label: "Synced" },
   { suffix: "2", label: "Pending" },
   { suffix: "3", label: "Error" },
+  { suffix: "4", label: "Locked" },
 ];
 const WINDOWS_SLOT_LIMIT = 15;
 const MARKER = "ShellIconOverlayIdentifiers\\";
@@ -51,7 +52,7 @@ function parseRegValue(stdout) {
   return match ? match[1].trim() : "";
 }
 
-/** Comandos que registram as três marcas apontando para o DLL instalado. */
+/** Comandos que registram as quatro marcas apontando para o DLL instalado. */
 function registerCommands(dllPath) {
   const lines = [];
   for (const { suffix, label } of STATES) {

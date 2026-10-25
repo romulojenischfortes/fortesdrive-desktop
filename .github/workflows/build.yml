@@ -83,7 +83,7 @@ jobs:
           name: FortesDrive Desktop ${{ steps.version.outputs.version }}
           body: |
             Sincronização recursiva de arquivos e subpastas, edição, renomeação, movimentos e exclusões bidirecionais.
-            Marcas no Explorador do Windows: verde = na nuvem, relógio = pendente/alterado, vermelho = erro.
+            Marcas no Explorador do Windows: verde = na nuvem, relógio = pendente/alterado, cadeado = pasta protegida por senha aguardando desbloqueio, vermelho = erro.
             O instalador solicita permissão de administrador para registrar a extensão do Explorador.
             Após instalar, encerre a sessão do Windows e entre novamente para carregar as marcas.
             O Windows possui um limite de marcas compartilhado por todos os aplicativos.

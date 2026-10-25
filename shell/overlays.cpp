@@ -17,7 +17,8 @@ static std::atomic<long> objects{0};
 static const CLSID ids[] = {
   {0x9e76e330,0x7ab7,0x4afe,{0xb9,0x12,0x2a,0x30,0x5b,0xcd,0x4f,0x01}},
   {0x9e76e330,0x7ab7,0x4afe,{0xb9,0x12,0x2a,0x30,0x5b,0xcd,0x4f,0x02}},
-  {0x9e76e330,0x7ab7,0x4afe,{0xb9,0x12,0x2a,0x30,0x5b,0xcd,0x4f,0x03}}
+  {0x9e76e330,0x7ab7,0x4afe,{0xb9,0x12,0x2a,0x30,0x5b,0xcd,0x4f,0x03}},
+  {0x9e76e330,0x7ab7,0x4afe,{0xb9,0x12,0x2a,0x30,0x5b,0xcd,0x4f,0x04}}
 };
 struct Entry { int state = 1; long long size = -1, time = -1; };
 static std::mutex cacheMutex;
@@ -49,7 +50,7 @@ static void load(const std::wstring& root) {
     std::istringstream fields(line); std::string state, size, time, relative;
     if(!std::getline(fields,state,'\t') || !std::getline(fields,size,'\t') || !std::getline(fields,time,'\t')) continue;
     std::getline(fields,relative);
-    try {Entry entry; entry.state=state=="synced"?0:state=="error"?2:1; entry.size=std::stoll(size); entry.time=std::stoll(time); cache[lower(widen(relative))]=entry;} catch(...) {}
+    try {Entry entry; entry.state=state=="synced"?0:state=="error"?2:state=="locked"?3:1; entry.size=std::stoll(size); entry.time=std::stoll(time); cache[lower(widen(relative))]=entry;} catch(...) {}
   }
 }
 class Overlay final : public IShellIconOverlayIdentifier {
@@ -64,7 +65,7 @@ public:
     DWORD n=GetModuleFileNameW(moduleHandle,file,count);if(!n||n>=(DWORD)count)return E_FAIL;
     *index=state;*flags=ISIOI_ICONFILE|ISIOI_ICONINDEX;return S_OK;
   }
-  HRESULT STDMETHODCALLTYPE GetPriority(int* priority) override {if(!priority)return E_POINTER;*priority=state==2?0:state==1?1:2;return S_OK;}
+  HRESULT STDMETHODCALLTYPE GetPriority(int* priority) override {if(!priority)return E_POINTER;*priority=state==2?0:state==3?1:state==1?2:3;return S_OK;}
   HRESULT STDMETHODCALLTYPE IsMemberOf(LPCWSTR filename,DWORD) override {
     if(!filename)return S_FALSE;
     try {
@@ -97,7 +98,7 @@ public:
   HRESULT STDMETHODCALLTYPE LockServer(BOOL lock) override{if(lock)objects++;else objects--;return S_OK;}
 };
 extern "C" HRESULT __stdcall DllGetClassObject(REFCLSID clsid,REFIID iid,void** out) {
-  for(int i=0;i<3;i++)if(clsid==ids[i]){auto factory=new Factory(i);auto hr=factory->QueryInterface(iid,out);factory->Release();return hr;}return CLASS_E_CLASSNOTAVAILABLE;
+  for(int i=0;i<4;i++)if(clsid==ids[i]){auto factory=new Factory(i);auto hr=factory->QueryInterface(iid,out);factory->Release();return hr;}return CLASS_E_CLASSNOTAVAILABLE;
 }
 extern "C" HRESULT __stdcall DllCanUnloadNow(){return objects.load()==0?S_OK:S_FALSE;}
 extern "C" void CALLBACK Refresh(HWND,HINSTANCE,LPSTR,int) {

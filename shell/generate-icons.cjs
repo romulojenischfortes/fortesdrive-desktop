@@ -1,7 +1,8 @@
 const fs = require('fs');
 const path = require('path');
-const colors = [[16,185,129],[34,160,230],[244,63,94]];
-for (let state=0;state<3;state++) {
+const colors = [[16,185,129],[34,160,230],[244,63,94],[245,158,11]];
+const names = ['synced','pending','error','locked'];
+for (let state=0;state<4;state++) {
   const size=32, pixels=Buffer.alloc(size*size*4);
   const put=(x,y,color)=>{if(x<0||x>=size||y<0||y>=size)return;const offset=((size-1-y)*size+x)*4;pixels[offset]=color[2];pixels[offset+1]=color[1];pixels[offset+2]=color[0];pixels[offset+3]=255;};
   for(let y=0;y<size;y++)for(let x=0;x<size;x++)if((x-9)**2+(y-23)**2<64)put(x,y,colors[state]);
@@ -9,10 +10,12 @@ for (let state=0;state<3;state++) {
   if(state===0){line(5,23,8,26);line(8,26,13,20);}
   if(state===1){line(9,18,9,23);line(9,23,13,24);}
   if(state===2){line(8,18,8,24);line(8,27,9,27);}
+  // Cadeado: pasta protegida por senha, aguardando desbloqueio no aplicativo.
+  if(state===3){line(6,25,12,25);line(6,29,12,29);line(6,25,6,29);line(12,25,12,29);line(8,22,8,24);line(10,22,10,24);line(8,22,10,22);line(9,26,9,27);}
   const mask=Buffer.alloc(128,255);
   for(let y=0;y<size;y++)for(let x=0;x<size;x++)if(pixels[(y*size+x)*4+3])mask[y*4+(x>>3)]&=~(128>>(x&7));
   const dib=Buffer.alloc(40);dib.writeUInt32LE(40,0);dib.writeInt32LE(size,4);dib.writeInt32LE(size*2,8);dib.writeUInt16LE(1,12);dib.writeUInt16LE(32,14);dib.writeUInt32LE(pixels.length,20);
   const image=Buffer.concat([dib,pixels,mask]);
   const header=Buffer.alloc(22);header.writeUInt16LE(1,2);header.writeUInt16LE(1,4);header[6]=32;header[7]=32;header.writeUInt16LE(1,10);header.writeUInt16LE(32,12);header.writeUInt32LE(image.length,14);header.writeUInt32LE(22,18);
-  fs.writeFileSync(path.join(__dirname,['synced','pending','error'][state]+'.ico'),Buffer.concat([header,image]));
+  fs.writeFileSync(path.join(__dirname,names[state]+'.ico'),Buffer.concat([header,image]));
 }

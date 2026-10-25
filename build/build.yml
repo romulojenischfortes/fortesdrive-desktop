@@ -1,0 +1,98 @@
+name: Build Installer
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm install
+      - name: Test native transfers and updater
+        run: node --test tests/native.test.cjs tests/updater.test.cjs tests/packaging.test.cjs
+      - name: Build and test Explorer badges
+        shell: cmd
+        run: |
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do call "%%i\VC\Auxiliary\Build\vcvars64.bat"
+          node shell\generate-icons.cjs
+          if errorlevel 1 exit /b 1
+          cd shell
+          rc /nologo /fo overlays.res overlays.rc
+          if errorlevel 1 exit /b 1
+          cl /nologo /std:c++17 /utf-8 /EHsc /MT /LD overlays.cpp /link /DEF:overlays.def /OUT:FortesDriveOverlays.dll overlays.res ole32.lib shell32.lib advapi32.lib uuid.lib user32.lib
+          if errorlevel 1 exit /b 1
+          cl /nologo /std:c++17 /utf-8 /EHsc /MT smoke.cpp /link /OUT:smoke.exe overlays.res ole32.lib shell32.lib advapi32.lib uuid.lib user32.lib
+          if errorlevel 1 exit /b 1
+          smoke.exe
+          if errorlevel 1 exit /b 1
+      - name: Set unique update version
+        id: version
+        shell: pwsh
+        run: |
+          $base = (Get-Content package.json | ConvertFrom-Json).version.Split('.')
+          $version = "$($base[0]).$($base[1]).${{ github.run_number }}"
+          npm version $version --no-git-tag-version
+          "version=$version" >> $env:GITHUB_OUTPUT
+      # Assinatura Authenticode opcional: só acontece quando as credenciais
+      # existem nos segredos do repositório. Sem elas, o instalador é publicado
+      # como NÃO assinado — e o release diz isso claramente.
+      - name: Configure code signing (optional)
+        id: signing
+        shell: pwsh
+        run: |
+          if ("${{ secrets.WINDOWS_CERTIFICATE }}" -ne "") {
+            [IO.File]::WriteAllBytes("$PWD\build\certificate.pfx", [Convert]::FromBase64String("${{ secrets.WINDOWS_CERTIFICATE }}"))
+            "CSC_LINK=$PWD\build\certificate.pfx" >> $env:GITHUB_ENV
+            "CSC_KEY_PASSWORD=${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}" >> $env:GITHUB_ENV
+            "signed=true" >> $env:GITHUB_OUTPUT
+            Write-Host "Credenciais encontradas: o instalador será assinado e com carimbo de tempo."
+          } else {
+            "signed=false" >> $env:GITHUB_OUTPUT
+            Write-Host "Sem credenciais de assinatura: o instalador será publicado sem assinatura digital."
+          }
+      - run: node generate-icon.js
+      - name: Build installer
+        run: npx electron-builder --win nsis --publish never
+      - name: Compute SHA-256
+        id: hash
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem release/*.exe | Select-Object -First 1
+          $hash = (Get-FileHash $exe.FullName -Algorithm SHA256).Hash.ToLower()
+          "sha256=$hash" >> $env:GITHUB_OUTPUT
+          "asset=$($exe.Name)" >> $env:GITHUB_OUTPUT
+      - name: Remove certificate from runner
+        if: always()
+        shell: pwsh
+        run: Remove-Item -Force build/certificate.pfx -ErrorAction SilentlyContinue
+      - name: Publish installer and update feed
+        uses: softprops/action-gh-release@v2
+        with:
+          fail_on_unmatched_files: true
+          files: |
+            release/*.exe
+            release/*.exe.blockmap
+            release/latest.yml
+          tag_name: v${{ steps.version.outputs.version }}
+          name: FortesDrive Desktop ${{ steps.version.outputs.version }}
+          body: |
+            Sincronização recursiva de arquivos e subpastas, edição, renomeação, movimentos e exclusões bidirecionais.
+            Marcas no Explorador do Windows: verde = na nuvem, relógio = pendente/alterado, cadeado = pasta protegida por senha aguardando desbloqueio, vermelho = erro.
+            O instalador solicita permissão de administrador para registrar a extensão do Explorador.
+            Após instalar, encerre a sessão do Windows e entre novamente para carregar as marcas.
+            O Windows possui um limite de marcas compartilhado por todos os aplicativos.
+            Publique também as alterações do aplicativo web para carregar o coordenador de sincronização atualizado.
+
+            ### Verificação do instalador
+            Arquivo: ${{ steps.hash.outputs.asset }}
+            SHA-256: ${{ steps.hash.outputs.sha256 }}
+
+            Assinatura digital: ${{ steps.signing.outputs.signed == 'true' && 'assinado (Authenticode com carimbo de tempo).' || 'NÃO assinado — o Windows pode exibir um aviso ao abrir o arquivo. Baixe apenas nesta página oficial.' }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

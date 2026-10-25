@@ -3,7 +3,9 @@ const path = require('path');
 const {execFile} = require('child_process');
 const {promisify} = require('util');
 const run = promisify(execFile);
-const ranks = {synced: 0, pending: 1, error: 2};
+// `locked` = item dentro de pasta protegida por senha, aguardando desbloqueio:
+// pesa mais que pendente (o item não será baixado sozinho) e menos que erro.
+const ranks = {synced: 0, pending: 1, locked: 2, error: 3};
 
 class ShellStatus {
   constructor() { this.entries = new Map(); this.lastWritten = ''; this.writes = Promise.resolve(); }

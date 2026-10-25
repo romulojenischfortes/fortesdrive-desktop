@@ -24,15 +24,15 @@ test('lê o valor REG_SZ da consulta do registro', () => {
   assert.equal(badge.parseRegValue(output), 'C:\\FortesDrive');
 });
 
-test('monta o registro das três marcas apontando para o DLL instalado', () => {
+test('monta o registro das quatro marcas apontando para o DLL instalado', () => {
   const dll = 'C:\\Program Files\\FortesDrive\\resources\\shell\\FortesDriveOverlays.dll';
   const lines = badge.registerCommands(dll);
-  assert.equal(lines.length, 15);
+  assert.equal(lines.length, 20);
   assert.equal(lines.every(line => line.startsWith('reg add ')), true);
-  for (const label of ['Synced', 'Pending', 'Error']) {
+  for (const label of ['Synced', 'Pending', 'Error', 'Locked']) {
     assert.equal(lines.some(line => line.includes(`ShellIconOverlayIdentifiers\\ FortesDrive ${label}`)), true);
   }
-  assert.equal(lines.filter(line => line.includes(dll)).length, 3);
+  assert.equal(lines.filter(line => line.includes(dll)).length, 4);
 });
 
 test('o registro real é lido no Windows', { skip: process.platform !== 'win32' }, async () => {

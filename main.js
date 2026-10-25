@@ -99,7 +99,10 @@ async function selectFolder() {
 function registerHandlers() {
   const handlers = {
     selectFolder: selectFolder,
-    getStatus: () => ({ ...syncEngine.getStatus(), updating: updater?.state.status === "installing", appVersion: app.getVersion() }),
+    // badgeStates informa ao aplicativo web quais marcas do Explorador este
+    // instalador sabe desenhar, para recursos novos (cadeado) não quebrarem
+    // clientes antigos que ainda não foram atualizados.
+    getStatus: () => ({ ...syncEngine.getStatus(), updating: updater?.state.status === "installing", appVersion: app.getVersion(), badgeStates: ["synced", "pending", "error", "locked"] }),
     getUpdateStatus: () => updater.getStatus(),
     getBadgeSetup: () => badgeSetup.readBadgeSetup(),
     repairBadges: () => badgeSetup.repairBadges({ app }),

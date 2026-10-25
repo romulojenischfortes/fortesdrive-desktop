@@ -1,3 +1,4 @@
 1 ICON "synced.ico"
 2 ICON "pending.ico"
 3 ICON "error.ico"
+4 ICON "locked.ico"

@@ -112,9 +112,9 @@ Nenhuma extensão de outro aplicativo é removida e nenhuma proteção do Window
 O estado é salvo localmente em `.fortesdrive/shell-status.tsv`, que nunca é sincronizado.
 A extensão só lê esse estado e os atributos dos arquivos, sem chamadas à internet.
 O Windows tem um limite global de sobreposições; outros provedores podem ocupar os slots disponíveis.
-A remoção do aplicativo remove somente os três registros FortesDrive.
+A remoção do aplicativo remove somente os registros FortesDrive.
 
-O build executa testes nativos que verificam as três marcas, arquivos alterados, nomes Unicode,
+O build executa testes nativos que verificam as quatro marcas, arquivos alterados, nomes Unicode,
 exclusão de caminhos fora da raiz, recursos de ícone e falhas de leitura.
 A exibição final no Explorador deve ser validada em um Windows com o instalador em execução.
 

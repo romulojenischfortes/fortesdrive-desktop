@@ -14,6 +14,7 @@
   !insertmacro RegisterFortesOverlay 1 Synced
   !insertmacro RegisterFortesOverlay 2 Pending
   !insertmacro RegisterFortesOverlay 3 Error
+  !insertmacro RegisterFortesOverlay 4 Locked
   ; O Explorador só carrega as marcas de ícones quando inicia. Reiniciá-lo aqui
   ; faz as marcas aparecerem nas pastas e nos arquivos logo após a instalação,
   ; sem precisar encerrar a sessão do Windows.
@@ -32,4 +33,5 @@
   !insertmacro UnregisterFortesOverlay 1 Synced
   !insertmacro UnregisterFortesOverlay 2 Pending
   !insertmacro UnregisterFortesOverlay 3 Error
+  !insertmacro UnregisterFortesOverlay 4 Locked
 !macroend

@@ -32,11 +32,16 @@ int wmain() {
     {std::ofstream output(status.c_str(),std::ios::binary);output<<"error\t-1\t-1\tação.txt\nerror\t-1\t-1\t";}
     require(error.IsMemberOf(file.c_str(),0)==S_OK,"error badge");
     require(error.IsMemberOf(root.c_str(),0)==S_OK,"error root");
+    {std::ofstream output(status.c_str(),std::ios::binary);output<<"locked\t-1\t-1\tação.txt\nlocked\t-1\t-1\t";}
+    Overlay locked(3);
+    require(locked.IsMemberOf(file.c_str(),0)==S_OK,"locked badge");
+    require(locked.IsMemberOf(root.c_str(),0)==S_OK,"locked root");
+    require(error.IsMemberOf(file.c_str(),0)==S_FALSE,"apenas uma marca por item");
     moduleHandle=GetModuleHandleW(nullptr);wchar_t exe[MAX_PATH]{};GetModuleFileNameW(nullptr,exe,MAX_PATH);
-    for(int state=0;state<3;state++){Overlay overlay(state);wchar_t iconFile[MAX_PATH]{};int index=-1;DWORD flags=0;require(overlay.GetOverlayInfo(iconFile,MAX_PATH,&index,&flags)==S_OK && index==state && (flags&ISIOI_ICONFILE) && (flags&ISIOI_ICONINDEX) && iconFile[0],"overlay icon reference");}
+    for(int state=0;state<4;state++){Overlay overlay(state);wchar_t iconFile[MAX_PATH]{};int index=-1;DWORD flags=0;require(overlay.GetOverlayInfo(iconFile,MAX_PATH,&index,&flags)==S_OK && index==state && (flags&ISIOI_ICONFILE) && (flags&ISIOI_ICONINDEX) && iconFile[0],"overlay icon reference");}
     std::wstring badges(exe);badges.resize(badges.find_last_of(L'\\')+1);badges+=L"FortesDriveOverlays.dll";
-    require(ExtractIconExW(badges.c_str(),-1,nullptr,nullptr,0)==3,"three embedded badge icons");
-    for(int state=0;state<3;state++){HICON icon=ExtractIconW(nullptr,badges.c_str(),state);require(icon!=nullptr,"badge icon readable by index");DestroyIcon(icon);}
+    require(ExtractIconExW(badges.c_str(),-1,nullptr,nullptr,0)==4,"four embedded badge icons");
+    for(int state=0;state<4;state++){HICON icon=ExtractIconW(nullptr,badges.c_str(),state);require(icon!=nullptr,"badge icon readable by index");DestroyIcon(icon);}
     std::filesystem::remove_all(root);std::cout<<"Explorer badge tests passed\n";return 0;
   } catch(const std::exception& error){std::cerr<<error.what()<<"\n";std::filesystem::remove_all(root);return 1;}
 }

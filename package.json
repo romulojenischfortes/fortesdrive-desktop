@@ -1,6 +1,6 @@
 {
   "name": "fortesdrive-desktop",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "description": "FortesDrive Desktop Client — sincronização local com a nuvem",
   "author": "FortesDrive",
   "license": "MIT",
@@ -34,25 +34,16 @@
       "renderer/**/*",
       "node_modules/**/*"
     ],
-    "extraResources": [
-      {
-        "from": "shell/FortesDriveOverlays.dll",
-        "to": "shell/FortesDriveOverlays.dll"
-      }
-    ],
+    "extraResources": [{ "from": "shell/FortesDriveOverlays.dll", "to": "shell/FortesDriveOverlays.dll" }],
     "win": {
       "target": [
         {
           "target": "nsis",
-          "arch": [
-            "x64"
-          ]
+          "arch": ["x64"]
         }
       ],
       "rfc3161TimeStampServer": "http://timestamp.digicert.com",
-      "signingHashAlgorithms": [
-        "sha256"
-      ],
+      "signingHashAlgorithms": ["sha256"],
       "verifyUpdateCodeSignature": false
     },
     "nsis": {
@@ -73,10 +64,7 @@
       "target": [
         {
           "target": "dmg",
-          "arch": [
-            "x64",
-            "arm64"
-          ]
+          "arch": ["x64", "arm64"]
         }
       ],
       "icon": "build/icon.icns",
@@ -88,30 +76,14 @@
     "dmg": {
       "title": "${productName} ${version}",
       "contents": [
-        {
-          "x": 130,
-          "y": 220
-        },
-        {
-          "x": 410,
-          "y": 220,
-          "type": "link",
-          "path": "/Applications"
-        }
+        { "x": 130, "y": 220 },
+        { "x": 410, "y": 220, "type": "link", "path": "/Applications" }
       ],
-      "window": {
-        "width": 540,
-        "height": 380
-      },
+      "window": { "width": 540, "height": 380 },
       "icon": "build/icon.icns",
       "format": "ULFO"
     },
-    "publish": {
-      "provider": "github",
-      "owner": "romulojenischfortes",
-      "repo": "fortesdrive-desktop",
-      "releaseType": "release"
-    }
+    "publish": { "provider": "github", "owner": "romulojenischfortes", "repo": "fortesdrive-desktop", "releaseType": "release" }
   },
   "devDependencies": {
     "electron": "^31.0.0",
