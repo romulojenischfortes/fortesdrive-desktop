@@ -43,7 +43,7 @@ class DesktopUpdater {
     updater.on("update-not-available", () => this.patch({ status: "current", error: "", errorKind: "", detail: "" }));
     updater.on("download-progress", progress => this.patch({ status: "downloading", percent: Math.round(progress.percent || 0) }));
     updater.on("update-downloaded", info => {
-      const installerPath = this.findInstaller();
+      const installerPath = this.findInstaller(info.downloadedFile);
       this.patch({
         status: "downloaded",
         version: info.version,
@@ -82,27 +82,16 @@ class DesktopUpdater {
     return { status: "error", errorKind: "generic", error: "Não foi possível preparar a atualização: " + raw, detail: raw };
   }
 
-  // Procura o instalador já baixado no cache do electron-updater.
-  findInstaller() {
-    const parent = path.dirname(this.app.getPath("userData"));
-    try {
-      for (const entry of fs.readdirSync(parent)) {
-        if (!entry.toLowerCase().endsWith("-updater")) continue;
-        const pending = path.join(parent, entry, "pending");
-        let files = [];
-        try { files = fs.readdirSync(pending); } catch (e) { continue; }
-        const exe = files.find(file => file.toLowerCase().endsWith(".exe"));
-        if (exe) return path.join(pending, exe);
-      }
-    } catch (error) {
-      console.error("Falha ao localizar o instalador baixado:", error.message);
-    }
-    return null;
+  // Somente o arquivo entregue por este atualizador pode ser executado.
+  // Varrer outras pastas *-updater podia abrir uma versão antiga ou outro app.
+  findInstaller(downloadedFile) {
+    const file = downloadedFile || this.state.installerPath;
+    return typeof file === "string" && path.extname(file).toLowerCase() === ".exe" && fs.existsSync(file) ? file : null;
   }
 
   async check() {
     if (!this.app.isPackaged) return this.getStatus();
-    if (["checking", "downloading", "installing"].includes(this.state.status)) return this.getStatus();
+    if (["checking", "downloading", "downloaded", "installing"].includes(this.state.status)) return this.getStatus();
     try {
       await this.updater.checkForUpdates();
     } catch (error) {
@@ -115,7 +104,9 @@ class DesktopUpdater {
     if (this.state.status !== "available") throw new Error("Verifique as atualizações antes de baixar.");
     this.patch({ status: "downloading", percent: 0, error: "", errorKind: "" });
     try {
-      await this.updater.downloadUpdate();
+      const files = await this.updater.downloadUpdate();
+      const installerPath = (files || []).map(file => this.findInstaller(file)).find(Boolean);
+      if (installerPath) this.patch({ installerPath, installerExists: true });
     } catch (error) {
       this.patch(this.classify(error));
     }
