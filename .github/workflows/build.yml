@@ -36,8 +36,9 @@ jobs:
         shell: pwsh
         run: |
           $base = (Get-Content package.json | ConvertFrom-Json).version.Split('.')
-          $version = "$($base[0]).$($base[1]).${{ github.run_number }}"
-          npm version $version --no-git-tag-version
+          $patch = [Math]::Max([int]$base[2], [int]"${{ github.run_number }}")
+          $version = "$($base[0]).$($base[1]).$patch"
+          npm version $version --no-git-tag-version --allow-same-version
           "version=$version" >> $env:GITHUB_OUTPUT
       # Assinatura Authenticode opcional: só acontece quando as credenciais
       # existem nos segredos do repositório. Sem elas, o instalador é publicado
@@ -63,8 +64,14 @@ jobs:
         id: hash
         shell: pwsh
         run: |
-          $exe = Get-ChildItem release/*.exe | Select-Object -First 1
+          $version = "${{ steps.version.outputs.version }}"
+          $exe = Get-Item "release/FortesDrive-Setup-$version.exe"
+          $feed = Get-Content release/latest.yml -Raw
+          if ($feed -notmatch "(?m)^version: $([regex]::Escape($version))\s*$" -or -not $feed.Contains($exe.Name)) { throw 'Update feed does not match installer version' }
           $hash = (Get-FileHash $exe.FullName -Algorithm SHA256).Hash.ToLower()
+          $sha512 = [Convert]::ToBase64String([Security.Cryptography.SHA512]::Create().ComputeHash([IO.File]::ReadAllBytes($exe.FullName)))
+          if (-not $feed.Contains($sha512)) { throw 'Installer hash does not match update feed' }
+          @{ version = $version; commit = "${{ github.sha }}"; installer = $exe.Name; sha256 = $hash } | ConvertTo-Json | Set-Content release/desktop-release.json -Encoding utf8
           "sha256=$hash" >> $env:GITHUB_OUTPUT
           "asset=$($exe.Name)" >> $env:GITHUB_OUTPUT
       - name: Remove certificate from runner
@@ -79,6 +86,7 @@ jobs:
             release/*.exe
             release/*.exe.blockmap
             release/latest.yml
+            release/desktop-release.json
           tag_name: v${{ steps.version.outputs.version }}
           name: FortesDrive Desktop ${{ steps.version.outputs.version }}
           body: |
@@ -89,7 +97,10 @@ jobs:
             O Windows possui um limite de marcas compartilhado por todos os aplicativos.
             Publique também as alterações do aplicativo web para carregar o coordenador de sincronização atualizado.
 
+            Atualizador corrigido: usa somente o instalador desta atualização e preserva downloads prontos ao verificar novamente.
+
             ### Verificação do instalador
+            Código-fonte: ${{ github.sha }}
             Arquivo: ${{ steps.hash.outputs.asset }}
             SHA-256: ${{ steps.hash.outputs.sha256 }}
 
