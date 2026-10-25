@@ -32,6 +32,8 @@ int wmain() {
     {std::ofstream output(status.c_str(),std::ios::binary);output<<"error\t-1\t-1\tação.txt\nerror\t-1\t-1\t";}
     require(error.IsMemberOf(file.c_str(),0)==S_OK,"error badge");
     require(error.IsMemberOf(root.c_str(),0)==S_OK,"error root");
+    // O Windows agrupa a data de gravação: sem esta pausa o estado novo não é relido.
+    Sleep(20);
     {std::ofstream output(status.c_str(),std::ios::binary);output<<"locked\t-1\t-1\tação.txt\nlocked\t-1\t-1\t";}
     Overlay locked(3);
     require(locked.IsMemberOf(file.c_str(),0)==S_OK,"locked badge");
