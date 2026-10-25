@@ -1,6 +1,8 @@
 const { app, BrowserWindow, ipcMain, dialog, Menu, shell, Tray, Notification, nativeImage, net } = require("electron");
 const path = require("path");
 const fs = require("fs/promises");
+const fsSync = require("fs");
+const Store = require("electron-store");
 const { SyncEngine } = require("./sync-engine");
 const native = require("./native-files");
 const { DesktopUpdater } = require("./updater");
@@ -195,6 +197,18 @@ async function createTray() {
   lastOnlineState = net.isOnline();
 }
 app.whenReady().then(async () => {
+  // Primeira execução: deixa a pasta padrão de sincronização pronta
+  // (Documentos\FortesDrive). Uma pasta já escolhida pelo usuário é preservada.
+  try {
+    const settings = new Store({ name: "fortesdrive-native-v2" });
+    if (!settings.get("watchFolder")) {
+      const folder = path.join(app.getPath("documents"), "FortesDrive");
+      fsSync.mkdirSync(folder, { recursive: true });
+      settings.set("watchFolder", folder);
+    }
+  } catch (error) {
+    console.error("Não foi possível preparar a pasta de sincronização:", error.message);
+  }
   syncEngine = new SyncEngine(requestSync);
   const { autoUpdater } = require("electron-updater");
   updater = new DesktopUpdater(autoUpdater, app, syncEngine, notify);
