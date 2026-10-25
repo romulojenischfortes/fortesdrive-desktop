@@ -26,6 +26,28 @@ function setup({ failDownload = false } = {}) {
 }
 const settle = () => new Promise(resolve => setImmediate(resolve));
 
+test('verificar novamente preserva a atualização já baixada', async () => {
+  const {controller, updater} = setup();
+  await controller.check(); await settle();
+  updater.checkForUpdates = async () => { throw new Error('não deve consultar durante atualização pendente'); };
+  assert.equal((await controller.check()).status, 'downloaded');
+  assert.equal(controller.hasPendingUpdate(), true);
+});
+
+test('usa o caminho entregue pelo download e nunca o cache de outro aplicativo', async () => {
+  const {controller, updater} = setup();
+  const foreign = path.join(root, 'outro-app-updater', 'pending');
+  fs.mkdirSync(foreign, {recursive:true});
+  fs.writeFileSync(path.join(foreign, 'antigo.exe'), 'outro aplicativo');
+  assert.equal(controller.findInstaller(), null);
+  const installer = path.join(root, 'FortesDrive-Setup-1.2.1.exe');
+  fs.writeFileSync(installer, 'meu instalador');
+  updater.emit('update-downloaded', {version:'1.2.1', downloadedFile:installer});
+  assert.equal(controller.getStatus().installerPath, installer);
+  assert.equal(controller.getStatus().installerExists, true);
+  assert.equal(controller.findInstaller(), installer);
+});
+
 test('baixa a nova versão sozinho e avisa o usuário', async () => {
   const {controller, updater, avisos} = setup();
   assert.equal(updater.autoDownload, false); assert.equal(updater.autoInstallOnAppQuit, false);
