@@ -15,7 +15,8 @@
     5. instala o túnel, abre a janela dele na pasta do servidor e explica a
        etapa manual do token;
     6. mostra o endereço e o segredo que devem ser colados no app;
-    7. registra a subida automática com o Windows (servidor + túnel).
+    7. registra a subida automática com o Windows (servidor + túnel), ao ligar
+       o computador e a cada entrada na sessão.
 
   Nada aqui apaga arquivos já gravados: a pasta ./data do SeaweedFS e o .env
   existentes são mantidos.
@@ -376,8 +377,12 @@ if ($ngrok -and $dominio -and (Tem-TokenNgrok)) {
 # ---------------------------------------------------------------------
 #  Inicio automatico com o Windows
 # ---------------------------------------------------------------------
-# Uma tarefa agendada por entrada no Windows sobe o Docker, garante os servicos
-# (SeaweedFS + gateway) e abre o tunel escondido. Nada e apagado por ela. Cada
+# Duas coisas deixam o servidor pronto sem ninguem abrir nada: o Docker Desktop
+# configurado para subir sozinho e a tarefa agendada que garante os servicos
+# (SeaweedFS + gateway) e abre o tunel escondido. A tarefa tem dois gatilhos: ao
+# ligar o Windows e a cada entrada na sessao. O Docker Desktop depende de uma
+# sessao do Windows, entao quando o computador liga sem ninguem entrar, tudo sobe
+# na primeira entrada (StartWhenAvailable). Nada e apagado pela tarefa. Cada
 # execucao deixa uma linha em iniciar-servidor.log, na pasta do servidor — e ali
 # que se descobre o que faltou quando algo nao sobe junto com o Windows.
 $scriptInicio = Join-Path $pasta 'iniciar-servidor.ps1'
@@ -385,9 +390,10 @@ Gravar $scriptInicio @'
 <#
   FortesDrive - subida automatica do servidor de armazenamento.
 
-  Rodado pela tarefa agendada "FortesDrive - servidor de armazenamento" a cada
-  entrada no Windows: sobe o Docker, garante os servicos (SeaweedFS + gateway) e
-  abre o tunel do endereco guardado em ngrok-domain.txt. Nada aqui apaga dados e
+  Rodado pela tarefa agendada "FortesDrive - servidor de armazenamento" ao ligar
+  o Windows e a cada entrada na sessao: sobe o Docker, garante os servicos
+  (SeaweedFS + gateway) e abre o tunel guardado em ngrok-domain.txt. Nada aqui
+  apaga dados e
   nenhum segredo e escrito: o .env existente e usado como esta.
 
   Para conferir depois: iniciar-servidor.log, nesta mesma pasta.
@@ -400,7 +406,7 @@ function Anotar($texto) {
   Add-Content -LiteralPath $log -Value ((Get-Date).ToString('s') + '  ' + $texto) -Encoding UTF8
 }
 
-Anotar '--- entrada no Windows: subindo o servidor ---'
+Anotar '--- Windows ligado / entrada na sessao: subindo o servidor ---'
 
 # 1) Docker no ar (abre o Docker Desktop quando preciso e espera ate 3 minutos).
 $dockerOk = $false
@@ -456,14 +462,55 @@ if (-not $dominio) {
 }
 '@
 
+# O Docker Desktop precisa subir sozinho: sem ele a tarefa nao teria o que
+# iniciar. A opcao fica no arquivo de configuracao do proprio Docker; as outras
+# chaves sao mantidas como estao e uma copia de seguranca fica guardada ao lado.
+function Habilitar-DockerNoInicio {
+  $arquivo = Join-Path $env:APPDATA 'Docker\settings-store.json'
+  if (-not (Test-Path $arquivo)) { $arquivo = Join-Path $env:APPDATA 'Docker\settings.json' }
+  if (-not (Test-Path $arquivo)) {
+    Write-Host '[AVISO] Nao encontrei as configuracoes do Docker Desktop.' -ForegroundColor Yellow
+    Write-Host 'Abra o Docker Desktop, entre em Settings > General e marque para ele subir com o Windows.' -ForegroundColor Yellow
+    return
+  }
+  $texto = Get-Content -Raw -LiteralPath $arquivo
+  if ($texto -match '"(autoStart|AutoStart)"\s*:\s*true') {
+    Write-Host 'O Docker Desktop ja estava configurado para subir sozinho.' -ForegroundColor Green
+    return
+  }
+  Copy-Item -LiteralPath $arquivo -Destination ($arquivo + '.fortesdrive.bak') -Force
+  $novo = $texto
+  if ($texto -match '"(autoStart|AutoStart)"\s*:\s*false') {
+    $novo = $texto -replace '"(autoStart|AutoStart)"\s*:\s*false', '"autoStart": true'
+  } elseif ($texto -match '^\s*\{\s*\}\s*$') {
+    $novo = '{ "autoStart": true }'
+  } elseif ($texto -match '^\s*\{') {
+    $novo = $texto -replace '^\s*\{', "{`r`n  `"autoStart`": true,"
+  }
+  if ($novo -eq $texto) {
+    Write-Host '[AVISO] Nao consegui alterar sozinho a configuracao do Docker Desktop.' -ForegroundColor Yellow
+    Write-Host 'Abra o Docker Desktop, entre em Settings > General e marque para ele subir com o Windows.' -ForegroundColor Yellow
+    return
+  }
+  Gravar $arquivo $novo
+  Write-Host 'Docker Desktop configurado para subir sozinho com o Windows.' -ForegroundColor Green
+}
+
+Habilitar-DockerNoInicio
+
 $nomeTarefa = 'FortesDrive - servidor de armazenamento'
 try {
   Stop-ScheduledTask -TaskName $nomeTarefa -ErrorAction SilentlyContinue
   $acao = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ('-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "' + $scriptInicio + '"')
-  $gatilho = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
-  $ajustes = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero)
-  Register-ScheduledTask -TaskName $nomeTarefa -Action $acao -Trigger $gatilho -Settings $ajustes -Description 'Sobe o servidor de armazenamento FortesDrive e o tunel a cada entrada no Windows.' -Force | Out-Null
-  Write-Host 'Inicio automatico registrado: o servidor e o tunel sobem a cada entrada no Windows.' -ForegroundColor Green
+  # Os dois gatilhos cobrem os dois jeitos de o computador ser ligado: ao iniciar
+  # o Windows e a cada entrada na sessao.
+  $gatilhos = @(
+    (New-ScheduledTaskTrigger -AtStartup),
+    (New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME)
+  )
+  $ajustes = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
+  Register-ScheduledTask -TaskName $nomeTarefa -Action $acao -Trigger $gatilhos -Settings $ajustes -Description 'Sobe o servidor de armazenamento FortesDrive e o tunel ao ligar o Windows e a cada entrada na sessao.' -Force | Out-Null
+  Write-Host 'Inicio automatico registrado: o servidor sobe sozinho quando o Windows liga.' -ForegroundColor Green
 } catch {
   Write-Host ('[AVISO] Nao consegui registrar o inicio automatico: ' + $_.Exception.Message) -ForegroundColor Yellow
   Write-Host 'Rode de novo este atalho com "Executar como administrador" para registrar.' -ForegroundColor Yellow
@@ -503,7 +550,8 @@ Write-Host ''
 Write-Host 'Pasta de trabalho do servidor:' -ForegroundColor Cyan
 Write-Host ('  ' + $pasta)
 Write-Host 'Inicio automatico com o Windows:' -ForegroundColor Cyan
-Write-Host ('  tarefa "' + $nomeTarefa + '", registro de cada subida em ' + (Join-Path $pasta 'iniciar-servidor.log'))
+Write-Host ('  tarefa "' + $nomeTarefa + '" — sobe ao ligar o Windows e a cada entrada na sessao.')
+Write-Host ('  registro de cada subida em ' + (Join-Path $pasta 'iniciar-servidor.log'))
 Write-Host ''
 
 exit 0
