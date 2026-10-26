@@ -12,8 +12,10 @@
     3. reaproveita ou cria o segredo de assinatura (.env);
     4. libera a porta 8790 (encerrando servidor anterior) e sobe os serviços,
        esperando o gateway responder;
-    5. instala o túnel e explica a etapa manual do token;
-    6. mostra o endereço e o segredo que devem ser colados no app.
+    5. instala o túnel, abre a janela dele na pasta do servidor e explica a
+       etapa manual do token;
+    6. mostra o endereço e o segredo que devem ser colados no app;
+    7. registra a subida automática com o Windows (servidor + túnel).
 
   Nada aqui apaga arquivos já gravados: a pasta ./data do SeaweedFS e o .env
   existentes são mantidos.
@@ -234,7 +236,7 @@ if (-not $subiu) {
 # ---------------------------------------------------------------------
 #  5/6 Teste de saude + tunel para a internet
 # ---------------------------------------------------------------------
-Passo '5/6 Conferindo o servidor e tratando o tunel'
+Passo '5/6 Conferindo o servidor, o tunel e o inicio automatico'
 $versao = ''
 $localOk = $false
 for ($i = 1; $i -le 30; $i++) {
@@ -320,12 +322,28 @@ function Tem-TokenNgrok {
   return (Test-Path $config) -and ((Get-Content -Raw -LiteralPath $config) -match 'authtoken\s*:')
 }
 
+# A janela do tunel e aberta VISIVEL, na pasta do servidor: e ali que se confere
+# o endereco publicado e se acompanha o trafego. O arquivo abrir-tunel.cmd guarda
+# o comando exato, para subir o tunel de novo com dois cliques quando precisar.
+$arquivoTunel = Join-Path $pasta 'abrir-tunel.cmd'
+if ($ngrok -and $dominio) {
+  Gravar $arquivoTunel ((@(
+    '@echo off',
+    'title FortesDrive - tunel do servidor',
+    'cd /d "%~dp0"',
+    'echo Endereco publico: https://' + $dominio,
+    'echo Deixe esta janela aberta enquanto quiser o servidor na internet.',
+    'echo.',
+    '"' + $ngrok + '" http --domain=' + $dominio + ' 8790'
+  )) -join "`r`n")
+}
+
 $publicoOk = $false
 if ($ngrok -and $dominio -and (Tem-TokenNgrok)) {
   Get-Process ngrok -ErrorAction SilentlyContinue | Stop-Process -Force
   Start-Sleep -Seconds 2
-  Write-Host ('Abrindo o tunel (porta 8790 -> ' + $dominio + ') ...')
-  Start-Process -FilePath $ngrok -ArgumentList @('http', ('--domain=' + $dominio), '8790') -WindowStyle Minimized
+  Write-Host ('Abrindo o tunel (porta 8790 -> ' + $dominio + ') numa janela de comando em ' + $pasta + ' ...')
+  Start-Process -FilePath 'cmd.exe' -WorkingDirectory $pasta -ArgumentList @('/k', 'abrir-tunel.cmd')
   for ($i = 1; $i -le 18; $i++) {
     try {
       $r = Invoke-RestMethod ('https://' + $dominio + '/health') -Headers @{ 'ngrok-skip-browser-warning' = '1' } -TimeoutSec 15
@@ -353,6 +371,102 @@ if ($ngrok -and $dominio -and (Tem-TokenNgrok)) {
   Write-Host '  4) Copie o endereco https que o ngrok mostrar para o segredo STORAGE_SERVER_URL'
   Write-Host '     no app (pagina Secrets) e clique em "Verificar conexao".'
   Write-Host ('  5) Para reaproveitar nas proximas execucoes, grave o endereco em ' + (Join-Path $pasta 'ngrok-domain.txt'))
+}
+
+# ---------------------------------------------------------------------
+#  Inicio automatico com o Windows
+# ---------------------------------------------------------------------
+# Uma tarefa agendada por entrada no Windows sobe o Docker, garante os servicos
+# (SeaweedFS + gateway) e abre o tunel escondido. Nada e apagado por ela. Cada
+# execucao deixa uma linha em iniciar-servidor.log, na pasta do servidor — e ali
+# que se descobre o que faltou quando algo nao sobe junto com o Windows.
+$scriptInicio = Join-Path $pasta 'iniciar-servidor.ps1'
+Gravar $scriptInicio @'
+<#
+  FortesDrive - subida automatica do servidor de armazenamento.
+
+  Rodado pela tarefa agendada "FortesDrive - servidor de armazenamento" a cada
+  entrada no Windows: sobe o Docker, garante os servicos (SeaweedFS + gateway) e
+  abre o tunel do endereco guardado em ngrok-domain.txt. Nada aqui apaga dados e
+  nenhum segredo e escrito: o .env existente e usado como esta.
+
+  Para conferir depois: iniciar-servidor.log, nesta mesma pasta.
+#>
+$ErrorActionPreference = 'Continue'
+$pasta = $PSScriptRoot
+$log = Join-Path $pasta 'iniciar-servidor.log'
+
+function Anotar($texto) {
+  Add-Content -LiteralPath $log -Value ((Get-Date).ToString('s') + '  ' + $texto) -Encoding UTF8
+}
+
+Anotar '--- entrada no Windows: subindo o servidor ---'
+
+# 1) Docker no ar (abre o Docker Desktop quando preciso e espera ate 3 minutos).
+$dockerOk = $false
+for ($i = 1; $i -le 36; $i++) {
+  & docker info 2>&1 | Out-Null
+  if ($LASTEXITCODE -eq 0) { $dockerOk = $true; break }
+  if ($i -eq 1) {
+    $atalho = Join-Path $env:ProgramFiles 'Docker\Docker\Docker Desktop.exe'
+    if (Test-Path $atalho) { Start-Process $atalho; Anotar 'Docker Desktop foi aberto.' }
+  }
+  Start-Sleep -Seconds 5
+}
+
+# 2) Servicos do servidor (os containers voltam sozinhos; isto garante).
+if ($dockerOk) {
+  Anotar 'Docker respondendo.'
+  Push-Location $pasta
+  & docker compose up -d 2>&1 | Out-Null
+  $subiu = ($LASTEXITCODE -eq 0)
+  Pop-Location
+  if ($subiu) { Anotar 'Servidor de armazenamento no ar (SeaweedFS + gateway).' }
+  else { Anotar 'docker compose up falhou: veja docker compose logs gateway.' }
+} else {
+  Anotar 'O Docker nao ficou pronto a tempo; tentando o tunel mesmo assim.'
+}
+
+# 3) Tunel para a internet.
+$arquivoDominio = Join-Path $pasta 'ngrok-domain.txt'
+$dominio = if (Test-Path $arquivoDominio) { (Get-Content -Raw -LiteralPath $arquivoDominio).Trim() } else { '' }
+$arquivoExe = Join-Path $pasta 'ngrok-path.txt'
+$exeNgrok = if (Test-Path $arquivoExe) { (Get-Content -Raw -LiteralPath $arquivoExe).Trim() } else { '' }
+if (-not $exeNgrok -or -not (Test-Path $exeNgrok)) {
+  $cmdNgrok = Get-Command ngrok -ErrorAction SilentlyContinue
+  $exeNgrok = if ($cmdNgrok) { $cmdNgrok.Source } else { Join-Path $env:LOCALAPPDATA 'ngrok\ngrok.exe' }
+}
+$configNgrok = Join-Path $env:LOCALAPPDATA 'ngrok\ngrok.yml'
+$temToken = (Test-Path $configNgrok) -and ((Get-Content -Raw -LiteralPath $configNgrok) -match 'authtoken\s*:')
+
+if (-not $dominio) {
+  Anotar 'Sem ngrok-domain.txt: tunel nao iniciado.'
+} elseif (-not (Test-Path $exeNgrok)) {
+  Anotar 'ngrok.exe nao encontrado: tunel nao iniciado.'
+} elseif (-not $temToken) {
+  Anotar 'Token do ngrok nao configurado: tunel nao iniciado.'
+} else {
+  Get-Process ngrok -ErrorAction SilentlyContinue | Stop-Process -Force
+  Start-Sleep -Seconds 2
+  $tunel = Start-Process -FilePath $exeNgrok -ArgumentList @('http', ('--domain=' + $dominio), '8790') -WindowStyle Hidden -PassThru
+  Anotar ('Tunel aberto: https://' + $dominio + ' -> porta 8790')
+  # Fica vivo junto com o tunel: assim o Windows nao encerra o processo.
+  $tunel.WaitForExit()
+  Anotar 'Tunel encerrado.'
+}
+'@
+
+$nomeTarefa = 'FortesDrive - servidor de armazenamento'
+try {
+  Stop-ScheduledTask -TaskName $nomeTarefa -ErrorAction SilentlyContinue
+  $acao = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ('-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "' + $scriptInicio + '"')
+  $gatilho = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+  $ajustes = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero)
+  Register-ScheduledTask -TaskName $nomeTarefa -Action $acao -Trigger $gatilho -Settings $ajustes -Description 'Sobe o servidor de armazenamento FortesDrive e o tunel a cada entrada no Windows.' -Force | Out-Null
+  Write-Host 'Inicio automatico registrado: o servidor e o tunel sobem a cada entrada no Windows.' -ForegroundColor Green
+} catch {
+  Write-Host ('[AVISO] Nao consegui registrar o inicio automatico: ' + $_.Exception.Message) -ForegroundColor Yellow
+  Write-Host 'Rode de novo este atalho com "Executar como administrador" para registrar.' -ForegroundColor Yellow
 }
 
 # ---------------------------------------------------------------------
@@ -388,6 +502,8 @@ Write-Host 'atualize-os na pagina Secrets e clique em "Verificar conexao" de nov
 Write-Host ''
 Write-Host 'Pasta de trabalho do servidor:' -ForegroundColor Cyan
 Write-Host ('  ' + $pasta)
+Write-Host 'Inicio automatico com o Windows:' -ForegroundColor Cyan
+Write-Host ('  tarefa "' + $nomeTarefa + '", registro de cada subida em ' + (Join-Path $pasta 'iniciar-servidor.log'))
 Write-Host ''
 
 exit 0

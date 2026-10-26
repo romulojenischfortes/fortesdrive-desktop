@@ -45,6 +45,9 @@
 !macro customUnInstall
   SetRegView 64
   Delete "$SMPROGRAMS\FortesDrive - configurar servidor.lnk"
+  ; A tarefa de inicio automatico sai junto: sem isso o Windows continuaria
+  ; subindo o servidor de armazenamento de um aplicativo ja removido.
+  nsExec::ExecToLog 'schtasks /Delete /TN "FortesDrive - servidor de armazenamento" /F'
   !insertmacro UnregisterFortesOverlay 1 Synced
   !insertmacro UnregisterFortesOverlay 2 Pending
   !insertmacro UnregisterFortesOverlay 3 Error
