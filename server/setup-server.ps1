@@ -79,16 +79,27 @@ if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
   exit 2
 }
 
-docker info *> $null
-if ($LASTEXITCODE -ne 0) {
+# O Docker escreve o progresso dele no canal de erro do PowerShell. Quando esse
+# texto e redirecionado, o PowerShell o transforma em erro de verdade e, com
+# $ErrorActionPreference = 'Stop' (usado aqui para parar em falhas reais), isso
+# encerraria o assistente no meio da instalacao. Por isso os comandos
+# silenciosos do Docker passam por este atalho, com a preferencia local em
+# 'Continue': quem decide se falhou e o codigo de saida.
+function Invoke-DockerSilencioso {
+  $antes = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  try { & docker @args 2>&1 | Out-Null } finally { $ErrorActionPreference = $antes }
+  return $LASTEXITCODE
+}
+
+if ((Invoke-DockerSilencioso info) -ne 0) {
   Write-Host 'Abrindo o Docker Desktop e esperando ele ficar pronto...'
   $atalho = Join-Path $env:ProgramFiles 'Docker\Docker\Docker Desktop.exe'
   if (Test-Path $atalho) { Start-Process $atalho }
   $pronto = $false
   for ($i = 1; $i -le 36; $i++) {
     Start-Sleep -Seconds 5
-    docker info *> $null
-    if ($LASTEXITCODE -eq 0) { $pronto = $true; break }
+    if ((Invoke-DockerSilencioso info) -eq 0) { $pronto = $true; break }
     Write-Host ('  aguardando o Docker... (' + ($i * 5) + 's)')
   }
   if (-not $pronto) {
@@ -153,17 +164,17 @@ Passo '4/6 Subindo o servidor (a primeira vez leva alguns minutos)'
 # subir o novo. Nada e apagado: os dados continuam em ./data e o segredo no .env.
 function Liberar-Porta8790 {
   Push-Location $pasta
-  docker compose down --remove-orphans *> $null
+  Invoke-DockerSilencioso compose down --remove-orphans | Out-Null
   Pop-Location
 
   # Nomes usados por instalacoes antigas do servidor.
   foreach ($nome in @('master', 'volume1', 'volume2', 'filer', 'gateway', 'caddy', 'seaweedfs')) {
-    docker rm -f $nome *> $null
+    Invoke-DockerSilencioso rm -f $nome | Out-Null
   }
 
   $encerrados = 0
   foreach ($id in @(docker ps -aq --filter 'publish=8790')) {
-    docker rm -f $id *> $null
+    Invoke-DockerSilencioso rm -f $id | Out-Null
     $encerrados += 1
   }
 
