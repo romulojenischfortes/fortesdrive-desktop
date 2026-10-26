@@ -16,7 +16,9 @@
        etapa manual do token;
     6. mostra o endereço e o segredo que devem ser colados no app;
     7. registra a subida automática com o Windows (servidor + túnel), ao ligar
-       o computador e a cada entrada na sessão.
+       o computador e a cada entrada na sessão;
+    8. guarda o endereço do túnel (ngrok-domain.txt), que é o que a subida
+       automática usa — ninguém precisa digitar o endereço de novo.
 
   Nada aqui apaga arquivos já gravados: a pasta ./data do SeaweedFS e o .env
   existentes são mantidos.
@@ -36,7 +38,14 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
 $pacote = $PSScriptRoot
+# Pasta de trabalho do servidor: no Windows do dono isto resolve para
+# C:\Users\<seu usuario>\Desktop\storage-server — a mesma pasta usada por todas
+# as execuções, para reaproveitar dados, segredo e o endereço do túnel.
 $pasta = if ($Folder) { $Folder } else { Join-Path $env:USERPROFILE 'Desktop\storage-server' }
+
+# Endereço do túnel deste servidor. Fica gravado em ngrok-domain.txt e é ele que
+# a subida automática usa ao ligar o Windows: ninguém digita o endereço de novo.
+$dominioPadrao = 'uranometrical-nonequatorial-kiley.ngrok-free.dev'
 
 function Passo($texto) {
   Write-Host ''
@@ -253,11 +262,15 @@ if ($localOk) {
   Write-Host '[AVISO] O gateway ainda nao respondeu. Detalhes: docker compose logs gateway' -ForegroundColor Yellow
 }
 
+$arquivoDominio = Join-Path $pasta 'ngrok-domain.txt'
 $dominio = [string]$env:FD_DOMAIN
-if (-not $dominio) {
-  $arquivoDominio = Join-Path $pasta 'ngrok-domain.txt'
-  if (Test-Path $arquivoDominio) { $dominio = (Get-Content -Raw -LiteralPath $arquivoDominio).Trim() }
+if (-not $dominio -and (Test-Path $arquivoDominio)) {
+  $dominio = (Get-Content -Raw -LiteralPath $arquivoDominio).Trim()
 }
+if (-not $dominio) { $dominio = $dominioPadrao }
+# Grava o endereco: e este arquivo que a subida automatica le ao ligar o Windows.
+Gravar $arquivoDominio $dominio
+Write-Host ('Endereco do tunel guardado para as proximas subidas: ' + $dominio) -ForegroundColor Green
 
 function Achar-Ngrok {
   $cmd = Get-Command ngrok -ErrorAction SilentlyContinue
@@ -365,13 +378,14 @@ if ($ngrok -and $dominio -and (Tem-TokenNgrok)) {
   Write-Host '  1) Crie a conta em https://dashboard.ngrok.com e copie o seu token.'
   Write-Host '  2) Registre o token:'
   Write-Host ('       ' + $exeNgrok + ' config add-authtoken SEU_TOKEN')
-  Write-Host '  3) Reserve um endereco fixo (Dominios) e suba o tunel para o GATEWAY:'
-  Write-Host ('       ' + $exeNgrok + ' http --domain=SEU-ENDERECO.ngrok-free.dev 8790')
+  Write-Host ('  3) O endereco deste servidor ja esta guardado: ' + $dominio)
+  Write-Host '     Para subir o tunel para o GATEWAY, o comando e:'
+  Write-Host ('       ' + $exeNgrok + ' http --domain=' + $dominio + ' 8790')
   Write-Host '     O tunel deve apontar sempre para a porta 8790 (gateway).'
   Write-Host '     A porta 8888 (SeaweedFS direto) nao pede autenticacao e nao deve ser exposta.'
   Write-Host '  4) Copie o endereco https que o ngrok mostrar para o segredo STORAGE_SERVER_URL'
   Write-Host '     no app (pagina Secrets) e clique em "Verificar conexao".'
-  Write-Host ('  5) Para reaproveitar nas proximas execucoes, grave o endereco em ' + (Join-Path $pasta 'ngrok-domain.txt'))
+  Write-Host ('     O endereco ja ficou guardado em ' + (Join-Path $pasta 'ngrok-domain.txt') + ' e a subida automatica usa esse arquivo.')
 }
 
 # ---------------------------------------------------------------------
@@ -499,21 +513,33 @@ function Habilitar-DockerNoInicio {
 Habilitar-DockerNoInicio
 
 $nomeTarefa = 'FortesDrive - servidor de armazenamento'
-try {
-  Stop-ScheduledTask -TaskName $nomeTarefa -ErrorAction SilentlyContinue
+
+# Registra a tarefa que sobe o servidor e o tunel sozinha. Os dois gatilhos
+# cobrem os dois jeitos de o computador ser ligado: ao iniciar o Windows e a
+# cada entrada na sessao. O gatilho de inicio do Windows exige administrador;
+# quando ele nao pode ser criado, a tarefa fica com a entrada na sessao, que e
+# o momento em que existe alguem usando o computador (o Docker Desktop depende
+# de uma sessao aberta).
+function Registrar-Tarefa($gatilhos, $descricao) {
   $acao = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument ('-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "' + $scriptInicio + '"')
-  # Os dois gatilhos cobrem os dois jeitos de o computador ser ligado: ao iniciar
-  # o Windows e a cada entrada na sessao.
-  $gatilhos = @(
-    (New-ScheduledTaskTrigger -AtStartup),
-    (New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME)
-  )
   $ajustes = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
-  Register-ScheduledTask -TaskName $nomeTarefa -Action $acao -Trigger $gatilhos -Settings $ajustes -Description 'Sobe o servidor de armazenamento FortesDrive e o tunel ao ligar o Windows e a cada entrada na sessao.' -Force | Out-Null
-  Write-Host 'Inicio automatico registrado: o servidor sobe sozinho quando o Windows liga.' -ForegroundColor Green
+  Register-ScheduledTask -TaskName $nomeTarefa -Action $acao -Trigger $gatilhos -Settings $ajustes -Description $descricao -Force | Out-Null
+}
+
+Stop-ScheduledTask -TaskName $nomeTarefa -ErrorAction SilentlyContinue
+try {
+  Registrar-Tarefa @((New-ScheduledTaskTrigger -AtStartup), (New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME)) 'Sobe o servidor de armazenamento FortesDrive e o tunel ao ligar o Windows e a cada entrada na sessao.'
+  Write-Host 'Inicio automatico registrado: ao ligar o Windows e a cada entrada na sessao.' -ForegroundColor Green
 } catch {
-  Write-Host ('[AVISO] Nao consegui registrar o inicio automatico: ' + $_.Exception.Message) -ForegroundColor Yellow
-  Write-Host 'Rode de novo este atalho com "Executar como administrador" para registrar.' -ForegroundColor Yellow
+  Write-Host ('[AVISO] Nao consegui registrar o gatilho de ligar o Windows: ' + $_.Exception.Message) -ForegroundColor Yellow
+  try {
+    Registrar-Tarefa @((New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME)) 'Sobe o servidor de armazenamento FortesDrive e o tunel a cada entrada na sessao.'
+    Write-Host 'Inicio automatico registrado ao entrar na sessao do Windows.' -ForegroundColor Green
+    Write-Host 'Para subir tambem quando o computador liga, rode de novo este atalho como administrador.' -ForegroundColor Yellow
+  } catch {
+    Write-Host ('[AVISO] Nao consegui registrar o inicio automatico: ' + $_.Exception.Message) -ForegroundColor Yellow
+    Write-Host 'Rode de novo este atalho com "Executar como administrador" para registrar.' -ForegroundColor Yellow
+  }
 }
 
 # ---------------------------------------------------------------------
