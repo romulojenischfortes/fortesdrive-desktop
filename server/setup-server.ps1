@@ -10,7 +10,8 @@
     1. confere se o Docker Desktop está instalado e funcionando;
     2. grava os arquivos do servidor (SeaweedFS + gateway) na pasta de trabalho;
     3. reaproveita ou cria o segredo de assinatura (.env);
-    4. sobe os serviços e espera o gateway responder;
+    4. libera a porta 8790 (encerrando servidor anterior) e sobe os serviços,
+       esperando o gateway responder;
     5. instala o túnel e explica a etapa manual do token;
     6. mostra o endereço e o segredo que devem ser colados no app.
 
@@ -145,16 +146,77 @@ if ($atual -and $atual.Length -ge 16) {
 #  4/6 Sobe os servicos
 # ---------------------------------------------------------------------
 Passo '4/6 Subindo o servidor (a primeira vez leva alguns minutos)'
+
+# Um servidor anterior — de outra pasta, de uma versao antiga ou aberto a mao —
+# pode estar preso na porta 8790, e ai o Docker recusa a subida com
+# "port is already allocated". Este passo encerra o servidor antigo antes de
+# subir o novo. Nada e apagado: os dados continuam em ./data e o segredo no .env.
+function Liberar-Porta8790 {
+  Push-Location $pasta
+  docker compose down --remove-orphans *> $null
+  Pop-Location
+
+  # Nomes usados por instalacoes antigas do servidor.
+  foreach ($nome in @('master', 'volume1', 'volume2', 'filer', 'gateway', 'caddy', 'seaweedfs')) {
+    docker rm -f $nome *> $null
+  }
+
+  $encerrados = 0
+  foreach ($id in @(docker ps -aq --filter 'publish=8790')) {
+    docker rm -f $id *> $null
+    $encerrados += 1
+  }
+
+  # Gateway antigo aberto fora do Docker (mesmo programa, mesma porta).
+  foreach ($id in @(Get-NetTCPConnection -LocalPort 8790 -State Listen -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess -Unique)) {
+    $proc = Get-CimInstance Win32_Process -Filter ('ProcessId=' + $id) -ErrorAction SilentlyContinue
+    if ($proc -and $proc.Name -match '^node' -and $proc.CommandLine -match 'server\.js') {
+      Stop-Process -Id $id -Force -ErrorAction SilentlyContinue
+      Write-Host 'Encerrando um servidor FortesDrive antigo que estava aberto fora do Docker.' -ForegroundColor Yellow
+      $encerrados += 1
+    }
+  }
+
+  return $encerrados
+}
+
+$encerrados = Liberar-Porta8790
+if ($encerrados -gt 0) {
+  Write-Host ('Servidor anterior encerrado para liberar a porta 8790 (' + $encerrados + ' item(ns)).') -ForegroundColor Green
+}
+
 Push-Location $pasta
-docker compose down --remove-orphans *> $null
 docker compose up -d --build
 $subiu = ($LASTEXITCODE -eq 0)
 Pop-Location
+
+# Se a porta estava presa por algo que so apareceu agora, libera de novo e
+# tenta uma segunda vez, em vez de desistir na primeira tentativa.
+if (-not $subiu) {
+  Write-Host ''
+  Write-Host 'A subida falhou. Liberando a porta 8790 de novo e tentando uma segunda vez...' -ForegroundColor Yellow
+  Liberar-Porta8790 | Out-Null
+  Start-Sleep -Seconds 3
+  Push-Location $pasta
+  docker compose up -d --build
+  $subiu = ($LASTEXITCODE -eq 0)
+  Pop-Location
+}
+
 if (-not $subiu) {
   Write-Host '[ERRO] O docker compose falhou. Ultimas mensagens do gateway:' -ForegroundColor Red
   Push-Location $pasta
   docker compose logs --tail 40 gateway
   Pop-Location
+  $dono = Get-NetTCPConnection -LocalPort 8790 -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
+  if ($dono) {
+    $proc = Get-Process -Id $dono.OwningProcess -ErrorAction SilentlyContinue
+    $nomeProc = if ($proc) { $proc.ProcessName } else { 'desconhecido' }
+    Write-Host ''
+    Write-Host ('A porta 8790 continua ocupada por: ' + $nomeProc + ' (id ' + $dono.OwningProcess + ').') -ForegroundColor Red
+    Write-Host 'Feche esse programa e use de novo o atalho "FortesDrive - configurar servidor"' -ForegroundColor Red
+    Write-Host 'no menu Iniciar.' -ForegroundColor Red
+  }
   exit 1
 }
 
