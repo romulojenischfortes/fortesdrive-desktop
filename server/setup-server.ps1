@@ -328,12 +328,42 @@ if ($ngrok) {
   Write-Host 'Baixe em https://ngrok.com/download e use o caminho do ngrok.exe nos passos abaixo.'
 }
 
-# O token do ngrok e pessoal e nunca fica guardado neste assistente. Se a
-# configuracao ja existir, o tunel sobe agora; se ainda nao existir, o script
-# explica exatamente o que falta.
+# O token do ngrok e pessoal e nunca fica guardado neste assistente: ele e
+# pedido uma vez (digitacao oculta) e registrado na configuracao do proprio
+# ngrok. Se a configuracao ja existir, o tunel sobe sem perguntar nada.
 function Tem-TokenNgrok {
   $config = Join-Path $env:LOCALAPPDATA 'ngrok\ngrok.yml'
   return (Test-Path $config) -and ((Get-Content -Raw -LiteralPath $config) -match 'authtoken\s*:')
+}
+
+# O token do ngrok e pessoal: fica ligado a conta de quem criou o tunel e por
+# isso nunca vem dentro do instalador. Ele e pedido UMA vez aqui, no proprio
+# assistente, e registrado na configuracao do ngrok (que passa a subir o tunel
+# sozinho com o Windows). A digitacao e oculta e o token nao e gravado em log,
+# nem mostrado no resumo final.
+function Registrar-TokenNgrok($exe) {
+  Write-Host ''
+  Write-Host 'O tunel precisa do token da SUA conta ngrok (o cadastro e gratuito).' -ForegroundColor Cyan
+  Write-Host 'Abri a pagina do token no navegador. Copie o token que aparece la e cole aqui.'
+  Write-Host 'A digitacao fica oculta e o token nao e guardado por este assistente'
+  Write-Host 'nem aparece no resumo final.'
+  Write-Host ''
+  try { Start-Process 'https://dashboard.ngrok.com/get-started/your-authtoken' } catch { }
+  $oculto = Read-Host 'Token do ngrok (Enter vazio = deixar para depois)' -AsSecureString
+  $ponteiro = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($oculto)
+  try { $token = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($ponteiro) }
+  finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ponteiro) }
+  if (-not $token) { return $false }
+
+  $antes = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  try { & $exe config add-authtoken $token 2>&1 | Out-Null } finally { $ErrorActionPreference = $antes }
+  $token = $null
+  if (Tem-TokenNgrok) {
+    return $true
+  }
+  Write-Host '[AVISO] O token nao foi aceito. Confira se copiou o token inteiro.' -ForegroundColor Yellow
+  return $false
 }
 
 # A janela do tunel e aberta VISIVEL, na pasta do servidor: e ali que se confere
@@ -353,6 +383,21 @@ if ($ngrok -and $dominio) {
 }
 
 $publicoOk = $false
+
+# Faltando o token, o assistente pede agora — uma unica vez. Depois disso o
+# endereco e a credencial ficam guardados e a subida automatica do Windows
+# levanta o tunel sem ninguem digitar nada de novo.
+if ($ngrok -and $dominio -and -not (Tem-TokenNgrok)) {
+  if (Registrar-TokenNgrok $ngrok) {
+    Write-Host 'Token registrado: o tunel entra no ar agora.' -ForegroundColor Green
+  } else {
+    Write-Host ''
+    Write-Host '[AVISO] Sem o token o tunel nao sobe.' -ForegroundColor Yellow
+    Write-Host 'Quando tiver o token em maos, use outra vez o atalho' -ForegroundColor Yellow
+    Write-Host '"FortesDrive - configurar servidor" no menu Iniciar: ele pede o token e sobe o tunel.' -ForegroundColor Yellow
+  }
+}
+
 if ($ngrok -and $dominio -and (Tem-TokenNgrok)) {
   Get-Process ngrok -ErrorAction SilentlyContinue | Stop-Process -Force
   Start-Sleep -Seconds 2
@@ -550,7 +595,7 @@ Write-Host '=====================================================' -ForegroundCo
 if ($localOk -and $publicoOk) {
   Write-Host '  TUDO PRONTO: o servidor responde no computador e na internet.' -ForegroundColor Green
 } elseif ($localOk) {
-  Write-Host '  Servidor local OK. Falta a etapa manual do ngrok (instrucoes acima).' -ForegroundColor Yellow
+  Write-Host '  Servidor local OK. Falta registrar o token do ngrok (acima) para o tunel subir.' -ForegroundColor Yellow
 } else {
   Write-Host '  O servidor ainda nao respondeu. Detalhes:' -ForegroundColor Red
   Write-Host ('  cd ' + $pasta)
