@@ -19,7 +19,9 @@ services:
       -master.volumeSizeLimitMB=8192
       -volume.max=0
     volumes:
-      - ./data:/data
+      # Pasta dos dados no disco escolhido no instalador (variavel FD_DATA_DIR do
+      # arquivo .env). Pode ser trocada a mao por qualquer caminho, ex: D:\MeuDrive.
+      - ${FD_DATA_DIR:-./data}:/data
     restart: unless-stopped
     networks:
       - fd-storage

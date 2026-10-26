@@ -146,8 +146,52 @@ Gravar (Join-Path $pasta 'gateway\Dockerfile') (Get-Content -Raw -LiteralPath $o
 Write-Host 'Arquivos gravados.' -ForegroundColor Green
 
 # ---------------------------------------------------------------------
-#  3/6 Segredo de assinatura (.env)
+#  3/6 Pasta raiz e segredo de assinatura (.env)
 # ---------------------------------------------------------------------
+# A unica escolha do instalador: onde ficam os seus arquivos neste computador.
+# Portas (9333/8888/8790), token interno (STORAGE_SIGNING_SECRET) e servicos ja
+# vem prontos de fabrica.
+$configClienteRaiz = Join-Path $env:APPDATA 'FortesDrive\fortesdrive-native-v2.json'
+$raiz = ''
+if (Test-Path $configClienteRaiz) {
+  try { $raiz = [string]((Get-Content -Raw -LiteralPath $configClienteRaiz) | ConvertFrom-Json).watchFolder } catch { $raiz = '' }
+}
+if (-not $raiz) { $raiz = Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'FortesDrive' }
+Write-Host ''
+Write-Host ('Pasta raiz neste computador: ' + $raiz) -ForegroundColor Cyan
+Write-Host 'Pressione Enter para manter, ou digite outro caminho (ex: D:\MeuDrive).'
+$respostaRaiz = Read-Host 'Pasta raiz (Enter = manter)'
+if ($respostaRaiz) { $raiz = $respostaRaiz.Trim().Trim('"') }
+New-Item -ItemType Directory -Force $raiz | Out-Null
+Write-Host ('Pasta raiz definida: ' + $raiz) -ForegroundColor Green
+
+# O cliente de sincronizacao le essa pasta do proprio arquivo de configuracao:
+# gravando aqui, o agente ja sobe sincronizando o lugar escolhido (as demais
+# chaves do arquivo sao mantidas).
+$dadosCliente = @{}
+if (Test-Path $configClienteRaiz) {
+  try {
+    $lido = (Get-Content -Raw -LiteralPath $configClienteRaiz) | ConvertFrom-Json
+    foreach ($prop in $lido.PSObject.Properties) { $dadosCliente[$prop.Name] = $prop.Value }
+  } catch { $dadosCliente = @{} }
+}
+$dadosCliente['watchFolder'] = $raiz
+New-Item -ItemType Directory -Force (Split-Path $configClienteRaiz) | Out-Null
+Gravar $configClienteRaiz ($dadosCliente | ConvertTo-Json -Compress)
+Write-Host 'Pasta gravada na configuracao do cliente de sincronizacao.' -ForegroundColor Green
+
+# Os dados do SeaweedFS ficam no MESMO DISCO escolhido, em uma pasta propria —
+# nunca dentro da pasta sincronizada, para o agente nao enviar os blocos
+# internos do servidor para a nuvem.
+$pastaDados = Join-Path $pasta 'data'
+$discoRaiz = ''
+if ($raiz -match '^([A-Za-z]):') { $discoRaiz = $Matches[1] + ':' }
+$discoServidor = ''
+if ($pasta -match '^([A-Za-z]):') { $discoServidor = $Matches[1] + ':' }
+if ($discoRaiz -and $discoServidor -and ($discoRaiz -ne $discoServidor)) {
+  $pastaDados = $discoRaiz + '\FortesDriveServer\data'
+}
+
 Passo '3/6 Segredo de assinatura'
 $envFile = Join-Path $pasta '.env'
 $linhas = @()
@@ -164,6 +208,13 @@ if ($atual -and $atual.Length -ge 16) {
   Gravar $envFile ((@('STORAGE_SIGNING_SECRET=' + $segredo) + $outras) -join "`r`n")
   Write-Host 'Segredo novo criado no arquivo .env.' -ForegroundColor Green
 }
+
+# A pasta de dados do servidor fica registrada no .env, e ela que o Docker monta
+# (variavel FD_DATA_DIR do docker-compose.yml). Pode ser trocada a mao, no
+# proprio .env, por qualquer caminho — inclusive outro disco.
+$linhasEnv = @(Get-Content -LiteralPath $envFile | Where-Object { $_ -match '\S' -and $_ -notmatch '^\s*FD_DATA_DIR\s*=' })
+Gravar $envFile ((@('FD_DATA_DIR=' + $pastaDados) + $linhasEnv) -join "`r`n")
+Write-Host ('Pasta dos dados do armazenamento: ' + $pastaDados) -ForegroundColor Green
 
 # ---------------------------------------------------------------------
 #  4/6 Sobe os servicos
@@ -366,6 +417,63 @@ function Registrar-TokenNgrok($exe) {
   return $false
 }
 
+# --- ngrok como Servico do Windows -----------------------------------
+# O ngrok.yml e o arquivo de configuracao do proprio ngrok: guarda o authtoken
+# (pessoal, colocado acima com "ngrok config add-authtoken") e o tunel fixo
+# deste servidor. E esse arquivo que o Servico do Windows usa.
+function Arquivo-ConfigNgrok {
+  return (Join-Path $env:LOCALAPPDATA 'ngrok\ngrok.yml')
+}
+
+# Garante, no ngrok.yml, o tunel fixo do FortesDrive: http -> porta 8790 no
+# dominio reservado, sem depender de nenhum comando na linha de comando.
+function Garantir-ConfigNgrok($dominio) {
+  $arquivo = Arquivo-ConfigNgrok
+  New-Item -ItemType Directory -Force (Split-Path $arquivo) | Out-Null
+  if (-not (Test-Path $arquivo)) { Gravar $arquivo ("version: `"3`"" + "`r`n") }
+  $texto = Get-Content -Raw -LiteralPath $arquivo
+  if ($texto -match '(?m)^tunnels:') {
+    Write-Host 'O ngrok.yml ja tinha tuneis definidos; mantidos como estao.' -ForegroundColor Green
+    return $true
+  }
+  $bloco = @(
+    'tunnels:',
+    '  fortesdrive:',
+    '    proto: http',
+    '    addr: 8790',
+    ('    domain: ' + $dominio)
+  ) -join "`r`n"
+  Gravar $arquivo (($texto.TrimEnd() + "`r`n") + $bloco + "`r`n")
+  Write-Host 'Tunel fixo gravado no ngrok.yml: http -> porta 8790 no dominio reservado.' -ForegroundColor Green
+  return $true
+}
+
+function ServicoNgrok {
+  return (Get-Service -ErrorAction SilentlyContinue | Where-Object { $_.Name -match 'ngrok' -or $_.DisplayName -match 'ngrok' } | Select-Object -First 1)
+}
+
+# Registra o tunel como Servico do Windows: roda em segundo plano, sem janela
+# nenhuma, e sobe junto com o computador. O install/uninstall precisa de
+# administrador; quando nao der, quem chamou cai no atalho antigo.
+function Instalar-ServicoNgrok($exe) {
+  $config = Arquivo-ConfigNgrok
+  $antes = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  try {
+    & $exe service stop 2>&1 | Out-Null
+    & $exe service uninstall 2>&1 | Out-Null
+    & $exe service install ('--config=' + $config) 2>&1 | Out-Null
+    & $exe service start 2>&1 | Out-Null
+  } finally { $ErrorActionPreference = $antes }
+
+  for ($i = 1; $i -le 10; $i++) {
+    $servico = ServicoNgrok
+    if ($servico -and $servico.Status -eq 'Running') { return $true }
+    Start-Sleep -Seconds 2
+  }
+  return $false
+}
+
 # A janela do tunel e aberta VISIVEL, na pasta do servidor: e ali que se confere
 # o endereco publicado e se acompanha o trafego. O arquivo abrir-tunel.cmd guarda
 # o comando exato, para subir o tunel de novo com dois cliques quando precisar.
@@ -399,10 +507,18 @@ if ($ngrok -and $dominio -and -not (Tem-TokenNgrok)) {
 }
 
 if ($ngrok -and $dominio -and (Tem-TokenNgrok)) {
+  Garantir-ConfigNgrok $dominio | Out-Null
   Get-Process ngrok -ErrorAction SilentlyContinue | Stop-Process -Force
   Start-Sleep -Seconds 2
-  Write-Host ('Abrindo o tunel (porta 8790 -> ' + $dominio + ') numa janela de comando em ' + $pasta + ' ...')
-  Start-Process -FilePath 'cmd.exe' -WorkingDirectory $pasta -ArgumentList @('/k', 'abrir-tunel.cmd')
+  Write-Host ('Registrando o tunel como Servico do Windows (porta 8790 -> ' + $dominio + ') ...')
+  if (Instalar-ServicoNgrok $ngrok) {
+    Write-Host 'Servico do Windows no ar: o tunel roda em segundo plano e sobe junto com o Windows.' -ForegroundColor Green
+  } else {
+    Write-Host '[AVISO] O Servico do Windows nao pode ser registrado (ele exige administrador).' -ForegroundColor Yellow
+    Write-Host 'O tunel continua subindo com o Windows pela tarefa agendada, numa janela escondida.' -ForegroundColor Yellow
+    Write-Host 'Para usar o servico nativo, rode este instalador como administrador.' -ForegroundColor Yellow
+    Start-Process -FilePath 'cmd.exe' -WorkingDirectory $pasta -ArgumentList @('/k', 'abrir-tunel.cmd')
+  }
   for ($i = 1; $i -le 18; $i++) {
     try {
       $r = Invoke-RestMethod ('https://' + $dominio + '/health') -Headers @{ 'ngrok-skip-browser-warning' = '1' } -TimeoutSec 15
@@ -504,7 +620,11 @@ if (-not $exeNgrok -or -not (Test-Path $exeNgrok)) {
 $configNgrok = Join-Path $env:LOCALAPPDATA 'ngrok\ngrok.yml'
 $temToken = (Test-Path $configNgrok) -and ((Get-Content -Raw -LiteralPath $configNgrok) -match 'authtoken\s*:')
 
-if (-not $dominio) {
+$servicoNgrokWindows = Get-Service -ErrorAction SilentlyContinue | Where-Object { $_.Name -match 'ngrok' -or $_.DisplayName -match 'ngrok' } | Select-Object -First 1
+if ($servicoNgrokWindows) {
+  # O tunel agora e um Servico do Windows: ele sobe sozinho com o computador.
+  Anotar ('Tunel entregue ao Servico do Windows "' + $servicoNgrokWindows.Name + '" (' + $servicoNgrokWindows.Status + ').')
+} elseif (-not $dominio) {
   Anotar 'Sem ngrok-domain.txt: tunel nao iniciado.'
 } elseif (-not (Test-Path $exeNgrok)) {
   Anotar 'ngrok.exe nao encontrado: tunel nao iniciado.'
@@ -620,6 +740,10 @@ Write-Host 'atualize-os na pagina Secrets e clique em "Verificar conexao" de nov
 Write-Host ''
 Write-Host 'Pasta de trabalho do servidor:' -ForegroundColor Cyan
 Write-Host ('  ' + $pasta)
+Write-Host 'Pasta raiz dos seus arquivos neste computador:' -ForegroundColor Cyan
+Write-Host ('  ' + $raiz)
+Write-Host 'Pasta dos dados do armazenamento (trocavel no .env):' -ForegroundColor Cyan
+Write-Host ('  ' + $pastaDados)
 Write-Host 'Inicio automatico com o Windows:' -ForegroundColor Cyan
 Write-Host ('  tarefa "' + $nomeTarefa + '" — sobe ao ligar o Windows e a cada entrada na sessao.')
 Write-Host ('  registro de cada subida em ' + (Join-Path $pasta 'iniciar-servidor.log'))

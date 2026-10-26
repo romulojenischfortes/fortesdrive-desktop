@@ -39,8 +39,10 @@ const FILER_PREFIX = (process.env.FILER_PREFIX || 'fortesdrive').replace(/^\/+|\
 const SECRET = process.env.STORAGE_SIGNING_SECRET || '';
 const TMP_DIR = process.env.TMP_DIR || '/var/lib/fd-gateway/tmp';
 const MAX_UPLOAD_BYTES = Number(process.env.MAX_UPLOAD_BYTES || 10737418240);
-const MAX_CONCURRENT_UPLOADS = Number(process.env.MAX_CONCURRENT_UPLOADS || 4);
-const RATE_LIMIT_PER_MINUTE = Number(process.env.RATE_LIMIT_PER_MINUTE || 120);
+const MAX_CONCURRENT_UPLOADS = Number(process.env.MAX_CONCURRENT_UPLOADS || 8);
+// Sincronizacao em lote (varios arquivos de uma vez) faz muitas chamadas por
+// minuto: o limite existe para barrar abuso, nao para atrapalhar o uso normal.
+const RATE_LIMIT_PER_MINUTE = Number(process.env.RATE_LIMIT_PER_MINUTE || 600);
 const VERSION = '1.0.0';
 const STARTED_AT = Date.now();
 const MAX_SIGNATURE_LIFETIME_MS = 25 * 3600 * 1000;
@@ -274,13 +276,16 @@ async function handleDownload(req, res, key) {
   res.writeHead(upstream.status, outHeaders);
   if (req.method === 'HEAD' || !upstream.body) return res.end();
 
-  const reader = upstream.body.getReader();
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    res.write(Buffer.from(value));
-  }
-  res.end();
+  // Repasse em fluxo com contrapressao: arquivos grandes vao direto do
+  // SeaweedFS para o navegador sem acumular na memoria do gateway.
+  const { Readable } = require('node:stream');
+  const corpo = Readable.fromWeb(upstream.body);
+  await new Promise((resolve, reject) => {
+    corpo.on('error', reject);
+    res.on('error', reject);
+    res.on('close', resolve);
+    corpo.pipe(res);
+  });
 }
 
 async function handleDelete(res, key) {
