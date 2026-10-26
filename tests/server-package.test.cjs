@@ -51,3 +51,18 @@ test("a instalacao do cliente abre o assistente do servidor", () => {
   assert.match(include, /configurar servidor\.lnk/, "o atalho de reconfiguracao precisa ser criado");
   assert.match(include, /Delete .*configurar servidor\.lnk/, "o atalho precisa ser removido na desinstalacao");
 });
+
+test("o servidor e o tunel sobem sozinhos com o Windows, no mesmo endereco", () => {
+  const script = read("server/setup-server.ps1");
+  assert.match(
+    script,
+    /uranometrical-nonequatorial-kiley\.ngrok-free\.dev/,
+    "o endereco do tunel precisa ir junto do assistente"
+  );
+  assert.match(script, /ngrok-domain\.txt/, "o endereco usado precisa ficar guardado para a subida automatica");
+  assert.match(script, /New-ScheduledTaskTrigger -AtStartup/, "a tarefa precisa subir ao ligar o Windows");
+  assert.match(script, /New-ScheduledTaskTrigger -AtLogOn/, "a tarefa precisa subir tambem na entrada da sessao");
+  assert.match(script, /Register-ScheduledTask/, "a tarefa precisa ser registrada pelo instalador");
+  assert.match(script, /iniciar-servidor\.ps1/, "a subida automatica precisa ficar num script proprio");
+  assert.match(script, /iniciar-servidor\.log/, "a subida automatica precisa deixar registro para diagnostico");
+});
