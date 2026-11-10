@@ -2,9 +2,12 @@
 !include "LogicLib.nsh"
 !include "nsDialogs.nsh"
 
-Var FortesSyncDir
-Var FortesSyncDirInput
-Var FortesSyncDirBrowse
+; O desinstalador e compilado com este mesmo arquivo e nao usa estas variaveis.
+!ifndef BUILD_UNINSTALLER
+  Var FortesSyncDir
+  Var FortesSyncDirInput
+  Var FortesSyncDirBrowse
+!endif
 
 ; Pagina extra do instalador (depois da pasta de instalacao): aqui o usuario
 ; escolhe onde os arquivos serao salvos e sincronizados entre este computador e
