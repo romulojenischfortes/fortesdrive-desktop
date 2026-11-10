@@ -27,6 +27,7 @@
       "main.js",
       "preload.js",
       "sync-engine.js",
+      "setup-handoff.js",
       "native-files.js",
       "shell-status.js",
       "updater.js",

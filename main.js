@@ -4,6 +4,7 @@ const fs = require("fs/promises");
 const fsSync = require("fs");
 const Store = require("electron-store");
 const { SyncEngine } = require("./sync-engine");
+const { applySetupConfiguration } = require("./setup-handoff");
 const native = require("./native-files");
 const { DesktopUpdater } = require("./updater");
 // As marcas no Explorador são um recurso acessório (extensão registrada pelo
@@ -84,7 +85,21 @@ function applyWindowsProgress() {
 }
 app.commandLine.appendSwitch("disable-renderer-backgrounding");
 if (!app.requestSingleInstanceLock()) app.quit();
-app.on("second-instance", () => { mainWindow?.show(); mainWindow?.focus(); });
+app.on("second-instance", async () => {
+  if (mainWindow?.isMinimized()) mainWindow.restore();
+  mainWindow?.show(); mainWindow?.focus();
+  if (!syncEngine) return;
+  await refreshSetupConfiguration();
+  requestSync();
+});
+
+async function refreshSetupConfiguration() {
+  try {
+    await applySetupConfiguration(syncEngine, path.join(app.getPath("userData"), "fortesdrive-setup.json"));
+  } catch (error) {
+    syncEngine.state.error = "Não foi possível aplicar a pasta do configurador: " + error.message;
+  }
+}
 
 function trusted(event) {
   if (event.sender !== mainWindow?.webContents || event.senderFrame?.parent || new URL(event.senderFrame.url).origin !== new URL(WEB_APP_URL).origin) throw new Error("Solicitação não autorizada");
@@ -104,7 +119,10 @@ function registerHandlers() {
     // badgeStates informa ao aplicativo web quais marcas do Explorador este
     // instalador sabe desenhar, para recursos novos (cadeado) não quebrarem
     // clientes antigos que ainda não foram atualizados.
-    getStatus: () => ({ ...syncEngine.getStatus(), updating: updater?.state.status === "installing", appVersion: app.getVersion(), badgeStates: ["synced", "pending", "error", "locked"] }),
+    getStatus: async () => {
+      await refreshSetupConfiguration();
+      return { ...syncEngine.getStatus(), updating: updater?.state.status === "installing", appVersion: app.getVersion(), badgeStates: ["synced", "pending", "error", "locked"] };
+    },
     getUpdateStatus: () => updater.getStatus(),
     getBadgeSetup: () => badgeSetup.readBadgeSetup(),
     repairBadges: () => badgeSetup.repairBadges({ app }),
@@ -210,6 +228,7 @@ app.whenReady().then(async () => {
     console.error("Não foi possível preparar a pasta de sincronização:", error.message);
   }
   syncEngine = new SyncEngine(requestSync);
+  await refreshSetupConfiguration();
   const { autoUpdater } = require("electron-updater");
   updater = new DesktopUpdater(autoUpdater, app, syncEngine, notify);
   registerHandlers(); createWindow();

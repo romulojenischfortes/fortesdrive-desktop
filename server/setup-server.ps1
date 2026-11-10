@@ -163,7 +163,9 @@ function Ler-JsonUtf8($caminho) {
 }
 
 $raiz = ''
-$configLida = Ler-JsonUtf8 $configClienteRaiz
+$configPendente = Join-Path (Split-Path $configClienteRaiz) 'fortesdrive-setup.json'
+$configLida = Ler-JsonUtf8 $configPendente
+if (-not $configLida) { $configLida = Ler-JsonUtf8 $configClienteRaiz }
 if ($configLida -and $configLida.watchFolder) { $raiz = [string]$configLida.watchFolder }
 
 # Conserta a pasta que uma instalação anterior deixou com o nome do usuário
@@ -188,18 +190,12 @@ try {
 }
 Write-Host ('Pasta raiz definida: ' + $raiz) -ForegroundColor Green
 
-# O cliente de sincronizacao le essa pasta do proprio arquivo de configuracao:
-# gravando aqui, o agente ja sobe sincronizando o lugar escolhido (as demais
-# chaves do arquivo sao mantidas).
-$dadosCliente = @{}
-$configAtual = Ler-JsonUtf8 $configClienteRaiz
-if ($configAtual) {
-  foreach ($prop in $configAtual.PSObject.Properties) { $dadosCliente[$prop.Name] = $prop.Value }
-}
-$dadosCliente['watchFolder'] = $raiz
-New-Item -ItemType Directory -Force (Split-Path $configClienteRaiz) | Out-Null
-Gravar $configClienteRaiz ($dadosCliente | ConvertTo-Json -Compress)
-Write-Host 'Pasta gravada na configuracao do cliente de sincronizacao.' -ForegroundColor Green
+# Entrega separada: nunca regrava o banco de manifestos de um cliente aberto.
+# O cliente aplica a raiz em memoria e reinicia o monitoramento, mesmo se ja
+# estiver na bandeja. O pedido so e removido depois de aplicado com sucesso.
+New-Item -ItemType Directory -Force (Split-Path $configPendente) | Out-Null
+Gravar $configPendente (@{ watchFolder = $raiz } | ConvertTo-Json -Compress)
+Write-Host 'Pasta entregue ao cliente de sincronizacao.' -ForegroundColor Green
 
 # Os arquivos ficam no MESMO DISCO escolhido, em uma pasta propria — nunca
 # dentro da pasta sincronizada, para o agente nao reenviar para a nuvem o que o
@@ -833,5 +829,34 @@ Write-Host 'Inicio automatico com o Windows:' -ForegroundColor Cyan
 Write-Host ('  tarefa "' + $nomeTarefa + '" — sobe ao ligar o Windows e a cada entrada na sessao.')
 Write-Host ('  registro de cada subida em ' + (Join-Path $pasta 'iniciar-servidor.log'))
 Write-Host ''
+
+# Arquivo opcional na raiz real: passa pelo mesmo sincronizador dos documentos.
+# Um envio de teste do gateway nao comprova a sincronizacao da conta.
+$criarVerificacao = Read-Host 'Criar um arquivo de verificacao na pasta raiz e sincronizar? [s/N]'
+if ($criarVerificacao -match '^(s|sim)$') {
+  $nomeVerificacao = 'FortesDrive-verificacao-' + [guid]::NewGuid().ToString() + '.txt'
+  $arquivoVerificacao = Join-Path $raiz $nomeVerificacao
+  Gravar $arquivoVerificacao ('Verificacao da sincronizacao FortesDrive. Criado em ' + (Get-Date).ToString('s'))
+  Write-Host ('Arquivo criado no computador: ' + $arquivoVerificacao) -ForegroundColor Green
+  Write-Host 'Aguardando o cliente enviar e confirmar este arquivo na sua conta.' -ForegroundColor Cyan
+}
+
+# Abre sempre, inclusive se houver uma instancia na bandeja: o evento de
+# segunda instancia aplica a pasta escolhida e solicita uma reconciliacao.
+$exeCliente = $null
+$candidatosCliente = @(
+  (Join-Path $pacote '..\..\FortesDrive.exe'),
+  (Join-Path $env:LOCALAPPDATA 'Programs\FortesDrive\FortesDrive.exe'),
+  (Join-Path $env:ProgramFiles 'FortesDrive\FortesDrive.exe')
+)
+foreach ($candidato in $candidatosCliente) {
+  if (Test-Path -LiteralPath $candidato) { $exeCliente = (Resolve-Path -LiteralPath $candidato).Path; break }
+}
+if ($exeCliente) {
+  Start-Process -FilePath $exeCliente -ArgumentList '--configuration-complete'
+  Write-Host 'FortesDrive aberto. Entre na sua conta para iniciar a sincronizacao bilateral.' -ForegroundColor Green
+} else {
+  Write-Host '[AVISO] Cliente nao encontrado. Abra o FortesDrive pelo menu Iniciar.' -ForegroundColor Yellow
+}
 
 exit 0
