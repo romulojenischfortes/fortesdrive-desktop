@@ -8,7 +8,7 @@
 
   O que ele faz, em ordem:
     1. confere se o Docker Desktop está instalado e funcionando;
-    2. grava os arquivos do servidor (SeaweedFS + gateway) na pasta de trabalho;
+    2. grava os arquivos do servidor (gateway) na pasta de trabalho;
     3. reaproveita ou cria o segredo de assinatura (.env);
     4. libera a porta 8790 (encerrando servidor anterior) e sobe os serviços,
        esperando o gateway responder;
@@ -20,7 +20,7 @@
     8. guarda o endereço do túnel (ngrok-domain.txt), que é o que a subida
        automática usa — ninguém precisa digitar o endereço de novo.
 
-  Nada aqui apaga arquivos já gravados: a pasta ./data do SeaweedFS e o .env
+  Nada aqui apaga arquivos já gravados: a pasta ./data e o .env
   existentes são mantidos.
 
   Para rodar de novo depois (por exemplo, depois de instalar o Docker e
@@ -180,9 +180,9 @@ New-Item -ItemType Directory -Force (Split-Path $configClienteRaiz) | Out-Null
 Gravar $configClienteRaiz ($dadosCliente | ConvertTo-Json -Compress)
 Write-Host 'Pasta gravada na configuracao do cliente de sincronizacao.' -ForegroundColor Green
 
-# Os dados do SeaweedFS ficam no MESMO DISCO escolhido, em uma pasta propria —
-# nunca dentro da pasta sincronizada, para o agente nao enviar os blocos
-# internos do servidor para a nuvem.
+# Os arquivos ficam no MESMO DISCO escolhido, em uma pasta propria — nunca
+# dentro da pasta sincronizada, para o agente nao reenviar para a nuvem o que o
+# servidor ja guarda.
 $pastaDados = Join-Path $pasta 'data'
 $discoRaiz = ''
 if ($raiz -match '^([A-Za-z]):') { $discoRaiz = $Matches[1] + ':' }
@@ -312,13 +312,12 @@ if ($localOk) {
 } else {
   Write-Host '[AVISO] O gateway ainda nao respondeu. Detalhes: docker compose logs gateway' -ForegroundColor Yellow
 }
+
 # --- O armazenamento grava de verdade? ---------------------------------
-# Responder em /health só diz que o gateway está de pé. Quem guarda os bytes é
-# o SeaweedFS, no mesmo Docker: se ele não subiu, o servidor parece no ar e
-# nenhum envio passa (o app fica dizendo "armazenamento fora do ar"). Aqui o
-# teste é um envio real de poucos bytes, assinado do mesmo jeito que o app
-# assina — e, se o armazenamento não responder, o serviço é recriado antes de
-# o assistente seguir.
+# Responder em /health só diz que o gateway está de pé. Aqui o teste é um envio
+# real de poucos bytes, assinado do mesmo jeito que o app assina: é isso que
+# prova que o arquivo chega ao disco deste computador. Se não gravar, o serviço
+# é recriado antes de o assistente seguir.
 function Testar-Armazenamento {
   $chave = 'u/teste-instalador/' + [guid]::NewGuid().ToString() + '.txt'
   $conteudo = [System.Text.Encoding]::UTF8.GetBytes('teste ' + (Get-Date).ToString('s'))
@@ -326,8 +325,8 @@ function Testar-Armazenamento {
   $digest = ([System.BitConverter]::ToString($sha.ComputeHash($conteudo))).Replace('-', '').ToLower()
   $expira = [int]([DateTimeOffset]::UtcNow.ToUnixTimeSeconds()) + 300
   $hmac = [System.Security.Cryptography.HMACSHA256]::new([System.Text.Encoding]::UTF8.GetBytes($segredo))
-  $alvoAssinado = 'put' + "`n" + $chave + "`n" + $expira
-  $assinatura = ([System.BitConverter]::ToString($hmac.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($alvoAssinado)))).Replace('-', '').ToLower()
+  $alvo = 'put' + "`n" + $chave + "`n" + $expira
+  $assinatura = ([System.BitConverter]::ToString($hmac.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($alvo)))).Replace('-', '').ToLower()
   $caminho = ($chave.Split('/') | ForEach-Object { [uri]::EscapeDataString($_) }) -join '/'
   $url = 'http://127.0.0.1:8790/v1/objects/' + $caminho + '?op=put&expires=' + $expira + '&sig=' + $assinatura
   try {
@@ -343,9 +342,9 @@ if ($localOk) {
   Write-Host 'Conferindo o armazenamento com um envio de teste...'
   $armazenaOk = Testar-Armazenamento
   if (-not $armazenaOk) {
-    Write-Host '[AVISO] O gateway respondeu, mas o armazenamento (SeaweedFS) nao gravou. Recriando o servico...' -ForegroundColor Yellow
+    Write-Host '[AVISO] O gateway respondeu, mas a pasta de dados nao aceitou a gravacao. Recriando o servico...' -ForegroundColor Yellow
     Push-Location $pasta
-    Invoke-DockerSilencioso compose up -d --force-recreate seaweedfs | Out-Null
+    Invoke-DockerSilencioso compose up -d --force-recreate gateway | Out-Null
     Invoke-DockerSilencioso compose up -d | Out-Null
     Pop-Location
     for ($i = 1; $i -le 18; $i++) {
@@ -357,15 +356,14 @@ if ($localOk) {
   if ($armazenaOk) {
     Write-Host 'Armazenamento respondendo: um arquivo de teste foi gravado e conferido.' -ForegroundColor Green
   } else {
-    Write-Host '[ERRO] O armazenamento continua sem gravar. Ultimas mensagens do SeaweedFS:' -ForegroundColor Red
+    Write-Host '[ERRO] O armazenamento continua sem gravar. Ultimas mensagens do gateway:' -ForegroundColor Red
     Push-Location $pasta
-    docker compose logs --tail 40 seaweedfs
+    docker compose logs --tail 60 gateway
     Pop-Location
     Write-Host 'Se a pasta de dados (FD_DATA_DIR no .env) estiver em outro disco, confira se ele esta ligado' -ForegroundColor Yellow
     Write-Host 'e compartilhado no Docker Desktop (Settings > Resources > File sharing).' -ForegroundColor Yellow
   }
 }
-
 
 $arquivoDominio = Join-Path $pasta 'ngrok-domain.txt'
 $dominio = [string]$env:FD_DOMAIN
@@ -597,7 +595,7 @@ if ($ngrok -and $dominio -and (Tem-TokenNgrok)) {
   Write-Host '     Para subir o tunel para o GATEWAY, o comando e:'
   Write-Host ('       ' + $exeNgrok + ' http --domain=' + $dominio + ' 8790')
   Write-Host '     O tunel deve apontar sempre para a porta 8790 (gateway).'
-  Write-Host '     A porta 8888 (SeaweedFS direto) nao pede autenticacao e nao deve ser exposta.'
+  Write-Host '     A porta 8790 e a unica que deve ser publicada; as demais ficam so no computador.'
   Write-Host '  4) Copie o endereco https que o ngrok mostrar para o segredo STORAGE_SERVER_URL'
   Write-Host '     no app (pagina Secrets) e clique em "Verificar conexao".'
   Write-Host ('     O endereco ja ficou guardado em ' + (Join-Path $pasta 'ngrok-domain.txt') + ' e a subida automatica usa esse arquivo.')
@@ -608,7 +606,7 @@ if ($ngrok -and $dominio -and (Tem-TokenNgrok)) {
 # ---------------------------------------------------------------------
 # Duas coisas deixam o servidor pronto sem ninguem abrir nada: o Docker Desktop
 # configurado para subir sozinho e a tarefa agendada que garante os servicos
-# (SeaweedFS + gateway) e abre o tunel escondido. A tarefa tem dois gatilhos: ao
+# (gateway) e abre o tunel escondido. A tarefa tem dois gatilhos: ao
 # ligar o Windows e a cada entrada na sessao. O Docker Desktop depende de uma
 # sessao do Windows, entao quando o computador liga sem ninguem entrar, tudo sobe
 # na primeira entrada (StartWhenAvailable). Nada e apagado pela tarefa. Cada
@@ -621,7 +619,7 @@ Gravar $scriptInicio @'
 
   Rodado pela tarefa agendada "FortesDrive - servidor de armazenamento" ao ligar
   o Windows e a cada entrada na sessao: sobe o Docker, garante os servicos
-  (SeaweedFS + gateway) e abre o tunel guardado em ngrok-domain.txt. Nada aqui
+  (gateway) e abre o tunel guardado em ngrok-domain.txt. Nada aqui
   apaga dados e
   nenhum segredo e escrito: o .env existente e usado como esta.
 
@@ -657,15 +655,14 @@ if ($dockerOk) {
   $subiu = ($LASTEXITCODE -eq 0)
   Pop-Location
   if ($subiu) {
-    Anotar 'Servidor de armazenamento no ar (SeaweedFS + gateway).'
-    # "Subiu" nao garante que os dois servicos estao rodando: se o SeaweedFS
-    # tiver parado sozinho (disco, permissao, reinicio do Docker), o gateway
-    # continua respondendo e nenhum arquivo entra. Aqui ele e recriado quando
-    # nao estiver entre os servicos em execucao.
+    Anotar 'Servidor de armazenamento no ar (gateway).'
+    # "Subiu" nao garante que o servico esta rodando: se ele tiver parado
+    # (disco, permissao, reinicio do Docker), nada e gravado. Aqui ele e
+    # recriado quando nao estiver entre os servicos em execucao.
     $rodando = @(& docker compose ps --services --filter 'status=running' 2>$null)
-    if ($rodando -notcontains 'seaweedfs') {
-      Anotar 'O armazenamento (SeaweedFS) nao estava rodando: recriando.'
-      & docker compose up -d --force-recreate seaweedfs 2>&1 | Out-Null
+    if ($rodando -notcontains 'gateway') {
+      Anotar 'O gateway nao estava rodando: recriando.'
+      & docker compose up -d --force-recreate gateway 2>&1 | Out-Null
     }
   }
   else { Anotar 'docker compose up falhou: veja docker compose logs gateway.' }
@@ -780,7 +777,7 @@ Write-Host '=====================================================' -ForegroundCo
 if ($localOk -and $publicoOk -and $armazenaOk) {
   Write-Host '  TUDO PRONTO: o servidor responde no computador e na internet.' -ForegroundColor Green
 } elseif ($localOk -and -not $armazenaOk) {
-  Write-Host '  O gateway responde, mas o armazenamento (SeaweedFS) nao grava: veja as mensagens acima.' -ForegroundColor Red
+  Write-Host '  O gateway responde, mas a pasta de dados nao aceita gravacao: veja as mensagens acima.' -ForegroundColor Red
 } elseif ($localOk) {
   Write-Host '  Servidor local OK. Falta registrar o token do ngrok (acima) para o tunel subir.' -ForegroundColor Yellow
 } else {

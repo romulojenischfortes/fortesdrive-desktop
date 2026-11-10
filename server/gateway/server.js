@@ -1,26 +1,24 @@
 'use strict';
 
 /**
- * FortesDrive — gateway do armazenamento próprio (fica ao lado do SeaweedFS).
+ * FortesDrive — gateway do servidor de armazenamento próprio.
  *
- * O que ele faz:
- *   • recebe o arquivo por HTTP em fluxo contínuo (sem carregar tudo na memória);
- *   • confere o SHA-256 e o tamanho antes de gravar de verdade no SeaweedFS
- *     (se o conteúdo não confere, nada é gravado — não sobra arquivo pela metade);
- *   • entrega o arquivo de volta (com suporte a Range) e permite apagar;
- *   • informa capacidade e disponibilidade do disco;
- *   • só aceita requisições assinadas com o segredo compartilhado (HMAC-SHA256
- *     com validade curta). O FortesDrive assina no servidor dele e entrega ao
- *     navegador apenas um endereço já assinado e temporário.
+ * Guarda os arquivos direto na pasta de dados deste computador, sem nenhum
+ * serviço intermediário para cair: recebe o envio em fluxo contínuo, confere o
+ * SHA-256 e o tamanho e só então publica o arquivo (se o conteúdo não confere,
+ * nada é gravado — não sobra arquivo pela metade). Também entrega o arquivo de
+ * volta (com suporte a Range), apaga e informa capacidade e disponibilidade da
+ * pasta de dados.
  *
- * Não existe senha fixa guardada no navegador: sem assinatura válida, o gateway
- * responde 401 e nada é lido nem gravado.
+ * Só aceita requisições assinadas com o segredo compartilhado (HMAC-SHA256 com
+ * validade curta). O FortesDrive assina no servidor dele e entrega ao navegador
+ * apenas um endereço já assinado e temporário.
  *
  * Rotas:
- *   GET    /health                                  → vivo? (sem assinatura)
- *   GET    /v1/status?expires=&sig=                 → disco, versão, filer
- *   PUT    /v1/objects/<chave>?op=put&expires=&sig= → envia conteúdo (header x-fd-sha256)
- *   GET    /v1/objects/<chave>?op=get&expires=&sig= → baixa (aceita Range)
+ *   GET    /health                                    → vivo? (sem assinatura)
+ *   GET    /v1/status?expires=&sig=                   → disco, versão, gravação
+ *   PUT    /v1/objects/<chave>?op=put&expires=&sig=   → envia conteúdo (header x-fd-sha256)
+ *   GET    /v1/objects/<chave>?op=get&expires=&sig=   → baixa (aceita Range)
  *   DELETE /v1/objects/<chave>?op=delete&expires=&sig= → apaga
  *
  * A assinatura cobre exatamente "op\nchave\nexpires" (mesmo cálculo usado no
@@ -34,35 +32,74 @@ const fsp = require('node:fs/promises');
 const path = require('node:path');
 
 const PORT = Number(process.env.PORT || 8790);
-const FILER_URL = new URL((process.env.FILER_URL || 'http://seaweedfs:8888').replace(/\/+$/, ''));
-const FILER_PREFIX = (process.env.FILER_PREFIX || 'fortesdrive').replace(/^\/+|\/+$/g, '');
+// Pasta onde os arquivos moram (o volume do Docker aponta para a pasta de dados
+// escolhida no assistente — pode ser outro disco).
+const DATA_DIR = process.env.DATA_DIR || '/data';
 const SECRET = process.env.STORAGE_SIGNING_SECRET || '';
-const TMP_DIR = process.env.TMP_DIR || '/var/lib/fd-gateway/tmp';
 const MAX_UPLOAD_BYTES = Number(process.env.MAX_UPLOAD_BYTES || 10737418240);
 const MAX_CONCURRENT_UPLOADS = Number(process.env.MAX_CONCURRENT_UPLOADS || 8);
-// Sincronizacao em lote (varios arquivos de uma vez) faz muitas chamadas por
-// minuto: o limite existe para barrar abuso, nao para atrapalhar o uso normal.
+// Sincronização em lote faz muitas chamadas por minuto: o limite existe para
+// barrar abuso, não para atrapalhar o uso normal.
 const RATE_LIMIT_PER_MINUTE = Number(process.env.RATE_LIMIT_PER_MINUTE || 600);
-const VERSION = '1.0.0';
+const VERSION = '2.0.0';
 const STARTED_AT = Date.now();
 const MAX_SIGNATURE_LIFETIME_MS = 25 * 3600 * 1000;
 
+// Área de preparo dentro da própria pasta de dados: o arquivo só é publicado
+// quando o checksum confere, e o rename fica no mesmo disco (nunca falha).
+const TMP_DIR = path.join(DATA_DIR, '.tmp');
+
 // Chaves aceitas: u/<dono>/<arquivo>[.ext] — sem barras extras, sem ".."
 const KEY_PATTERN = /^u\/[A-Za-z0-9_-]+\/[A-Za-z0-9_-]+(\.[A-Za-z0-9]{1,8})?$/;
+
+const CONTENT_TYPES = {
+  jpg: 'image/jpeg',
+  jpeg: 'image/jpeg',
+  png: 'image/png',
+  gif: 'image/gif',
+  webp: 'image/webp',
+  avif: 'image/avif',
+  bmp: 'image/bmp',
+  heic: 'image/heic',
+  svg: 'image/svg+xml',
+  pdf: 'application/pdf',
+  mp4: 'video/mp4',
+  webm: 'video/webm',
+  mov: 'video/quicktime',
+  mp3: 'audio/mpeg',
+  ogg: 'audio/ogg',
+  wav: 'audio/wav',
+  m4a: 'audio/mp4',
+  flac: 'audio/flac',
+  zip: 'application/zip',
+  '7z': 'application/x-7z-compressed',
+  rar: 'application/x-rar-compressed',
+  json: 'application/json',
+  txt: 'text/plain',
+  csv: 'text/csv',
+  md: 'text/markdown',
+  doc: 'application/msword',
+  docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  xls: 'application/vnd.ms-excel',
+  xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  ppt: 'application/vnd.ms-powerpoint',
+  pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+};
 
 if (!SECRET) {
   console.error('[gateway] STORAGE_SIGNING_SECRET não definido — encerrando.');
   process.exit(1);
 }
+
 fs.mkdirSync(TMP_DIR, { recursive: true });
 
 let activeUploads = 0;
 const rateBuckets = new Map();
 
-// O app publicado e o cliente desktop falam com este servidor de outro
-// domínio, então o navegador exige CORS. A segurança não vem daqui e sim da
-// assinatura de cada pedido — por isso, sem cookies, qualquer origem é aceita
-// por padrão (restrinja em CORS_ALLOWED_ORIGINS se quiser).
+// O app publicado e o cliente desktop falam com este servidor de outro domínio,
+// então o navegador exige CORS. A segurança não vem daqui e sim da assinatura
+// de cada pedido — por isso, sem cookies, qualquer origem é aceita por padrão
+// (restrinja em CORS_ALLOWED_ORIGINS se quiser).
 const ALLOWED_ORIGINS = (process.env.CORS_ALLOWED_ORIGINS || '*')
   .split(',')
   .map((value) => value.trim())
@@ -121,6 +158,29 @@ function keyFromPath(pathname) {
   return decoded;
 }
 
+/** Onde o objeto mora no disco. A chave já foi validada contra KEY_PATTERN. */
+function objectPath(key) {
+  return path.join(DATA_DIR, ...key.split('/'));
+}
+
+function contentTypeFor(key) {
+  const extension = String(key.split('.').pop() || '').toLowerCase();
+  return CONTENT_TYPES[extension] || 'application/octet-stream';
+}
+
+/** A pasta de dados aceita gravação agora? (teste real, arquivo minúsculo) */
+async function storageWritable() {
+  const probe = path.join(TMP_DIR, 'probe-' + crypto.randomUUID());
+  try {
+    await fsp.writeFile(probe, 'ok');
+    await fsp.unlink(probe);
+    return true;
+  } catch (error) {
+    console.error('[gateway] pasta de dados não aceita gravação: ' + error.message);
+    return false;
+  }
+}
+
 /** Confere a assinatura da requisição. Devolve a mensagem de erro ou null. */
 function signatureError(url, op, key) {
   const expires = Number(url.searchParams.get('expires'));
@@ -149,54 +209,6 @@ function rateLimited(ip) {
   return false;
 }
 
-/** Envia o arquivo temporário ao SeaweedFS em uma requisição multipart, em fluxo. */
-function uploadToFiler(key, filePath, size, contentType) {
-  return new Promise((resolve, reject) => {
-    const boundary = '----fd' + crypto.randomUUID().replace(/-/g, '');
-    const filename = path.basename(key);
-    const head = Buffer.from(
-      '--' + boundary + '\r\n' +
-      'Content-Disposition: form-data; name="file"; filename="' + filename + '"\r\n' +
-      'Content-Type: ' + (contentType || 'application/octet-stream') + '\r\n\r\n'
-    );
-    const tail = Buffer.from('\r\n--' + boundary + '--\r\n');
-    const targetPath = '/' + FILER_PREFIX + '/' + key;
-
-    const request = http.request(
-      {
-        hostname: FILER_URL.hostname,
-        port: FILER_URL.port || 80,
-        path: targetPath,
-        method: 'POST',
-        headers: {
-          'Content-Type': 'multipart/form-data; boundary=' + boundary,
-          'Content-Length': String(head.length + size + tail.length),
-        },
-      },
-      (response) => {
-        let detail = '';
-        response.setEncoding('utf8');
-        response.on('data', (chunk) => {
-          if (detail.length < 4096) detail += chunk;
-        });
-        response.on('end', () => {
-          if (response.statusCode >= 200 && response.statusCode < 300) return resolve();
-          reject(new Error('SeaweedFS recusou o arquivo (' + response.statusCode + '): ' + (detail.trim() || 'sem detalhe')));
-        });
-      }
-    );
-
-    request.on('error', reject);
-    request.setTimeout(30 * 60 * 1000, () => request.destroy(new Error('Tempo esgotado ao enviar para o SeaweedFS.')));
-    request.write(head);
-
-    const stream = fs.createReadStream(filePath, { highWaterMark: 1024 * 1024 });
-    stream.on('error', (error) => request.destroy(error));
-    stream.on('end', () => request.end(tail));
-    stream.pipe(request, { end: false });
-  });
-}
-
 async function handleUpload(req, res, key) {
   const declared = String(req.headers['x-fd-sha256'] || '').toLowerCase();
   const contentLength = Number(req.headers['content-length']);
@@ -216,8 +228,11 @@ async function handleUpload(req, res, key) {
 
   activeUploads += 1;
   const tempPath = path.join(TMP_DIR, crypto.randomUUID() + '.part');
+  const finalPath = objectPath(key);
 
   try {
+    await fsp.mkdir(path.dirname(finalPath), { recursive: true });
+
     const hash = crypto.createHash('sha256');
     let written = 0;
     const output = fs.createWriteStream(tempPath);
@@ -241,84 +256,108 @@ async function handleUpload(req, res, key) {
       throw new Error('Checksum divergente: o arquivo chegou corrompido e não foi gravado.');
     }
 
-    await uploadToFiler(key, tempPath, contentLength, req.headers['content-type']);
+    await fsp.rename(tempPath, finalPath);
     sendJson(res, 200, { ok: true, key, size: written, checksum: digest });
   } catch (error) {
     console.error('[gateway] falha no envio de ' + key + ': ' + error.message);
-    sendJson(res, 502, { error: error.message });
+    sendJson(res, 500, { error: error.message });
   } finally {
     activeUploads -= 1;
     fsp.rm(tempPath, { force: true }).catch(() => {});
   }
 }
 
-async function handleDownload(req, res, key) {
-  const target = new URL(FILER_URL.origin + '/' + FILER_PREFIX + '/' + key);
-  const headers = {};
-  if (req.headers.range) headers.range = req.headers.range;
-
-  const upstream = await fetch(target, { headers, signal: AbortSignal.timeout(10 * 60 * 1000) });
-  if (upstream.status === 404) return sendJson(res, 404, { error: 'Objeto não encontrado.' });
-  if (!upstream.ok && upstream.status !== 206) {
-    return sendJson(res, 502, { error: 'SeaweedFS respondeu ' + upstream.status + '.' });
-  }
-
-  const outHeaders = {
-    'Content-Type': upstream.headers.get('content-type') || 'application/octet-stream',
-    'Accept-Ranges': 'bytes',
-    'Cache-Control': 'private, max-age=300',
-  };
-  const length = upstream.headers.get('content-length');
-  const range = upstream.headers.get('content-range');
-  if (length) outHeaders['Content-Length'] = length;
-  if (range) outHeaders['Content-Range'] = range;
-
-  res.writeHead(upstream.status, outHeaders);
-  if (req.method === 'HEAD' || !upstream.body) return res.end();
-
-  // Repasse em fluxo com contrapressao: arquivos grandes vao direto do
-  // SeaweedFS para o navegador sem acumular na memoria do gateway.
-  const { Readable } = require('node:stream');
-  const corpo = Readable.fromWeb(upstream.body);
-  await new Promise((resolve, reject) => {
-    corpo.on('error', reject);
-    res.on('error', reject);
-    res.on('close', resolve);
-    corpo.pipe(res);
+function streamFile(filePath, res, options) {
+  return new Promise((resolve) => {
+    const stream = fs.createReadStream(filePath, options);
+    stream.on('error', () => {
+      if (!res.headersSent) sendJson(res, 500, { error: 'Falha ao ler o arquivo no disco.' });
+      else res.destroy();
+      resolve();
+    });
+    stream.on('end', resolve);
+    stream.pipe(res);
   });
 }
 
-async function handleDelete(res, key) {
-  const target = new URL(FILER_URL.origin + '/' + FILER_PREFIX + '/' + key);
-  const upstream = await fetch(target, { method: 'DELETE', signal: AbortSignal.timeout(60000) });
-  if (!upstream.ok && upstream.status !== 404) {
-    return sendJson(res, 502, { error: 'SeaweedFS respondeu ' + upstream.status + ' ao apagar.' });
+async function handleDownload(req, res, key) {
+  const finalPath = objectPath(key);
+
+  let stats;
+  try {
+    stats = await fsp.stat(finalPath);
+  } catch {
+    return sendJson(res, 404, { error: 'Objeto não encontrado.' });
   }
-  sendJson(res, 200, { ok: true, key, existed: upstream.status !== 404 });
+  if (!stats.isFile()) return sendJson(res, 404, { error: 'Objeto não encontrado.' });
+
+  const total = stats.size;
+  const type = contentTypeFor(key);
+  const header = {
+    'Content-Type': type,
+    'Accept-Ranges': 'bytes',
+    'Cache-Control': 'private, max-age=300',
+  };
+
+  const range = req.headers.range ? /^bytes=(\d*)-(\d*)$/.exec(String(req.headers.range).trim()) : null;
+  if (range) {
+    const startText = range[1];
+    const endText = range[2];
+    let start = startText === '' ? total - Number(endText) : Number(startText);
+    let end = startText === '' || endText === '' ? total - 1 : Number(endText);
+    if (!Number.isFinite(start) || !Number.isFinite(end) || start < 0 || start > end || start >= total) {
+      res.writeHead(416, { 'Content-Range': 'bytes */' + total });
+      return res.end();
+    }
+    end = Math.min(end, total - 1);
+    res.writeHead(206, {
+      ...header,
+      'Content-Length': end - start + 1,
+      'Content-Range': 'bytes ' + start + '-' + end + '/' + total,
+    });
+    if (req.method === 'HEAD') return res.end();
+    return streamFile(finalPath, res, { start, end });
+  }
+
+  res.writeHead(200, { ...header, 'Content-Length': total });
+  if (req.method === 'HEAD') return res.end();
+  return streamFile(finalPath, res, {});
+}
+
+async function handleDelete(res, key) {
+  const finalPath = objectPath(key);
+  let existed = true;
+  try {
+    await fsp.unlink(finalPath);
+  } catch (error) {
+    if (error.code === 'ENOENT') existed = false;
+    else {
+      console.error('[gateway] falha ao apagar ' + key + ': ' + error.message);
+      return sendJson(res, 500, { error: 'Não foi possível apagar o arquivo: ' + error.message });
+    }
+  }
+  sendJson(res, 200, { ok: true, key, existed });
 }
 
 async function handleStatus(res) {
   let disk = { freeBytes: null, totalBytes: null };
   try {
-    const stats = await fsp.statfs(TMP_DIR);
+    const stats = await fsp.statfs(DATA_DIR);
     disk = { freeBytes: stats.bavail * stats.bsize, totalBytes: stats.blocks * stats.bsize };
   } catch (error) {
     console.error('[gateway] não foi possível ler o disco: ' + error.message);
   }
 
-  let filerReachable = false;
-  try {
-    const probe = await fetch(new URL(FILER_URL.origin + '/'), { signal: AbortSignal.timeout(5000) });
-    filerReachable = probe.status < 500;
-  } catch {
-    filerReachable = false;
-  }
+  const writable = await storageWritable();
 
   sendJson(res, 200, {
     ok: true,
     version: VERSION,
     uptimeSec: Math.round((Date.now() - STARTED_AT) / 1000),
-    filer: { reachable: filerReachable },
+    // O app consulta "filer.reachable" para saber se há onde gravar. Aqui a
+    // gravação acontece na própria pasta de dados: é ela que responde.
+    filer: { reachable: writable, backend: 'disk' },
+    storage: { writable, backend: 'disk', dataDir: DATA_DIR },
     disk,
     limits: {
       maxUploadBytes: MAX_UPLOAD_BYTES,
@@ -396,7 +435,7 @@ server.keepAliveTimeout = 65000;
 
 server.listen(PORT, '0.0.0.0', () => {
   console.log('[gateway] FortesDrive storage gateway ' + VERSION + ' na porta ' + PORT);
-  console.log('[gateway] SeaweedFS em ' + FILER_URL.origin + ', prefixo /' + FILER_PREFIX);
+  console.log('[gateway] arquivos guardados em ' + DATA_DIR);
 });
 
 for (const signal of ['SIGTERM', 'SIGINT']) {

@@ -5,9 +5,11 @@ COPY server.js ./
 
 ENV NODE_ENV=production \
     PORT=8790 \
-    TMP_DIR=/var/lib/fd-gateway/tmp
+    DATA_DIR=/data
 
-RUN mkdir -p /var/lib/fd-gateway/tmp
+# A pasta de dados é o volume montado pelo docker-compose; a área de preparo
+# (.tmp) é criada pelo próprio gateway, dentro dela.
+RUN mkdir -p /data/.tmp
 
 EXPOSE 8790
 
