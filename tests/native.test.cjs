@@ -21,6 +21,21 @@ test('arquivos vazios e bytes IPC preservam o conteúdo nos dois sentidos', asyn
     assert.equal(Buffer.from(await native.read(root, 'outra/movido.txt', hash('editado'))).toString(), 'editado');
   } finally { await fs.rm(root, {recursive:true, force:true}); }
 });
+test('a varredura reaproveita o resumo sem deixar conteudo antigo passar', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'fortesdrive-'));
+  try {
+    await fs.writeFile(path.join(root, 'a.txt'), 'AAAA');
+    await native.write(root, 'c.txt', new Uint8Array(Buffer.from('DDDD')), hash('DDDD'), null);
+    const first = await native.scan(root);
+    assert.equal(first.files.find(f => f.path === 'a.txt').checksum, hash('AAAA'));
+    assert.equal(first.files.find(f => f.path === 'c.txt').checksum, hash('DDDD'));
+    // Mesmo tamanho e conteudo novo: o resumo guardado nao pode ser reaproveitado.
+    await new Promise(resolve => setTimeout(resolve, 20));
+    await fs.writeFile(path.join(root, 'a.txt'), 'ZZZZ');
+    const second = await native.scan(root);
+    assert.equal(second.files.find(f => f.path === 'a.txt').checksum, hash('ZZZZ'));
+  } finally { await fs.rm(root, {recursive:true, force:true}); }
+});
 test('arquivo acima do limite não interrompe os demais arquivos', async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'fortesdrive-'));
   try {

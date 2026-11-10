@@ -1,7 +1,8 @@
-// O instalador do cliente também prepara o servidor de armazenamento.
-// Se o pacote do servidor sair do instalador, o cliente instala sem ter com o
-// que sincronizar — por isso estes arquivos são verificados aqui, e não apenas
-// na máquina de quem instala.
+// O instalador do cliente instala APENAS o aplicativo. Docker, gateway e túnel
+// pertencem ao servidor de armazenamento, que roda em um único computador e tem
+// instalador próprio (public/instalar-servidor.bat). Estes testes garantem que o
+// cliente continue simples — e que o pacote do servidor continue pronto para o
+// instalador dele.
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
@@ -11,20 +12,41 @@ const root = path.join(__dirname, "..");
 const pkg = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"));
 const read = (relative) => fs.readFileSync(path.join(root, relative), "utf8");
 
-const PAYLOAD = [
+const SERVER_PAYLOAD = [
   "server/docker-compose.yml",
   "server/gateway/server.js",
   "server/gateway/Dockerfile",
   "server/setup-server.ps1",
 ];
 
-test("o pacote do servidor acompanha o instalador", () => {
+test("o instalador do cliente nao leva Docker, ngrok nem servidor", () => {
   const resources = pkg.build?.extraResources ?? [];
-  const shipsServer = resources.some((entry) => String(entry.to ?? "") === "server");
-  assert.ok(shipsServer, "a pasta server precisa ser publicada junto do aplicativo");
-  for (const relative of PAYLOAD) {
+  assert.equal(
+    resources.some((entry) => String(entry.to ?? "") === "server"),
+    false,
+    "a pasta server nao deve ser publicada junto do cliente"
+  );
+  const include = read("build/overlays.nsh");
+  assert.doesNotMatch(include, /setup-server\.ps1/, "o cliente nao abre o assistente do servidor");
+  assert.doesNotMatch(include, /schtasks/i, "o cliente nao registra tarefas do servidor");
+  assert.doesNotMatch(include, /docker/i, "Docker nao e instalado com o cliente");
+  assert.doesNotMatch(include, /ngrok/i, "o tunel pertence ao servidor, nao ao cliente");
+});
+
+test("o cliente instala o aplicativo e as marcas do Explorador", () => {
+  const include = read("build/overlays.nsh");
+  assert.match(include, /RegisterFortesOverlay 1 Synced/, "as marcas de sincronizacao continuam sendo registradas");
+  assert.match(include, /FortesDriveOverlays\.dll/, "a DLL das marcas precisa ser registrada");
+  assert.equal(pkg.build?.nsis?.runAfterFinish, true, "o aplicativo abre ao final da instalacao");
+});
+
+test("o pacote do servidor segue pronto para o instalador proprio do servidor", () => {
+  for (const relative of SERVER_PAYLOAD) {
     assert.ok(fs.existsSync(path.join(root, relative)), `arquivo do servidor ausente: ${relative}`);
   }
+  const servidor = fs.readFileSync(path.join(root, "..", "public", "instalar-servidor.bat"), "utf8");
+  assert.match(servidor, /docker/i, "o instalador do servidor e quem instala o Docker");
+  assert.match(servidor, /ngrok/i, "o instalador do servidor e quem configura o tunel");
 });
 
 test("o servidor sobe o gateway na porta local do tunel", () => {
@@ -40,37 +62,4 @@ test("o gateway grava direto na pasta de dados, sem servico intermediario", () =
   assert.match(gateway, /x-fd-sha256/, "o gateway precisa conferir o checksum de cada envio");
   assert.match(gateway, /\/v1\/status/, "o gateway precisa informar o estado da gravacao");
   assert.doesNotMatch(gateway, /seaweedfs/i, "o gateway nao pode depender de outro servico para gravar");
-});
-
-test("o assistente usa o proprio pacote e reaproveita o segredo existente", () => {
-  const script = read("server/setup-server.ps1");
-  assert.match(script, /PSScriptRoot/, "o assistente deve ler os arquivos do proprio pacote");
-  assert.match(script, /STORAGE_SIGNING_SECRET/, "o assistente precisa tratar o segredo de assinatura");
-  assert.match(script, /docker compose up -d --build/, "o assistente precisa subir os servicos");
-});
-
-test("a instalacao do cliente abre o assistente do servidor", () => {
-  const include = read("build/overlays.nsh");
-  assert.match(
-    include,
-    /resources\\server\\setup-server\.ps1/,
-    "o instalador precisa executar o assistente do servidor"
-  );
-  assert.match(include, /configurar servidor\.lnk/, "o atalho de reconfiguracao precisa ser criado");
-  assert.match(include, /Delete .*configurar servidor\.lnk/, "o atalho precisa ser removido na desinstalacao");
-});
-
-test("o servidor e o tunel sobem sozinhos com o Windows, no mesmo endereco", () => {
-  const script = read("server/setup-server.ps1");
-  assert.match(
-    script,
-    /uranometrical-nonequatorial-kiley\.ngrok-free\.dev/,
-    "o endereco do tunel precisa ir junto do assistente"
-  );
-  assert.match(script, /ngrok-domain\.txt/, "o endereco usado precisa ficar guardado para a subida automatica");
-  assert.match(script, /New-ScheduledTaskTrigger -AtStartup/, "a tarefa precisa subir ao ligar o Windows");
-  assert.match(script, /New-ScheduledTaskTrigger -AtLogOn/, "a tarefa precisa subir tambem na entrada da sessao");
-  assert.match(script, /Register-ScheduledTask/, "a tarefa precisa ser registrada pelo instalador");
-  assert.match(script, /iniciar-servidor\.ps1/, "a subida automatica precisa ficar num script proprio");
-  assert.match(script, /iniciar-servidor\.log/, "a subida automatica precisa deixar registro para diagnostico");
 });

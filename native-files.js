@@ -9,6 +9,20 @@ async function checksum(file) {
   for await (const chunk of createReadStream(file)) hash.update(chunk);
   return hash.digest("hex");
 }
+// Resumo (SHA-256) reaproveitado entre varreduras. Sem isso, cada ciclo de
+// sincronização relia e resumia a árvore inteira — o maior gasto de tempo do
+// envio, porque a árvore é varrida de novo a cada lote. A entrada só vale para
+// o mesmo dono do arquivo, tamanho e data de modificação; qualquer mudança
+// obriga a resumir outra vez.
+let cacheRoot = null;
+const checksums = new Map();
+
+function remember(root, relative, entry) {
+  if (root !== cacheRoot) return;
+  if (entry) checksums.set(relative, entry);
+  else checksums.delete(relative);
+}
+
 async function safePath(root, relative, createParents = false) {
   if (typeof relative !== "string" || !relative || relative.includes("\\") || relative.includes("\0")) throw new Error("Caminho inválido");
   const parts = relative.split("/");
@@ -25,6 +39,8 @@ async function safePath(root, relative, createParents = false) {
   return current;
 }
 async function scan(root) {
+  if (cacheRoot !== root) { cacheRoot = root; checksums.clear(); }
+  const seen = new Set();
   const files = [], directories = [], skipped = [];
   async function visit(folder, prefix = "") {
     let entries;
@@ -45,11 +61,15 @@ async function scan(root) {
         if (stat.isDirectory()) { directories.push({ path: relative, identity }); await visit(absolute, relative + "/"); }
         else if (stat.isFile()) {
           if (stat.size > MAX_BYTES) { skipped.push({ path: relative, reason: "Acima de 100 MB" }); continue; }
+          seen.add(relative);
           let hash;
           try {
-            hash = await checksum(absolute);
+            const known = checksums.get(relative);
+            const reuse = known && known.size === stat.size && known.mtimeMs === stat.mtimeMs && known.identity === identity;
+            hash = reuse ? known.checksum : await checksum(absolute);
             const after = await fs.stat(absolute);
-            if (stat.size !== after.size || stat.mtimeMs !== after.mtimeMs) { skipped.push({ path: relative, reason: "Arquivo em edição ou download" }); continue; }
+            if (stat.size !== after.size || stat.mtimeMs !== after.mtimeMs) { remember(root, relative, null); skipped.push({ path: relative, reason: "Arquivo em edição ou download" }); continue; }
+            remember(root, relative, { size: after.size, mtimeMs: after.mtimeMs, identity, checksum: hash });
           } catch (e) { skipped.push({ path: relative, reason: "Não foi possível ler: " + e.message }); continue; }
           files.push({ path: relative, name: entry.name, size: stat.size, mtimeMs: stat.mtimeMs, checksum: hash, identity });
         }
@@ -57,6 +77,8 @@ async function scan(root) {
     }
   }
   await visit(root);
+  // Arquivos que sumiram saem do cache: ele não cresce sem limite.
+  for (const key of [...checksums.keys()]) if (!seen.has(key)) checksums.delete(key);
   return { files, directories, skipped };
 }
 async function assertExpected(absolute, expected) {
@@ -68,11 +90,14 @@ async function assertExpected(absolute, expected) {
 }
 async function read(root, relative, expected) {
   const absolute = await safePath(root, relative);
-  await assertExpected(absolute, expected);
-  const stat = await fs.stat(absolute);
+  const stat = await fs.lstat(absolute).catch(e => { if (e.code !== "ENOENT") throw e; });
+  if (stat?.isSymbolicLink()) throw new Error("Link simbólico bloqueado");
+  if (!stat?.isFile()) throw new Error("Arquivo não encontrado; nenhum conteúdo foi enviado");
   if (stat.size > MAX_BYTES) throw new Error("Este cliente transfere arquivos de até 100 MB por arquivo");
   const buf = await fs.readFile(absolute);
-  if (crypto.createHash("sha256").update(buf).digest("hex") !== expected) throw new Error("Arquivo alterado durante a leitura");
+  // Uma única passagem de resumo por arquivo: este mesmo SHA-256 confere o
+  // conteúdo — antes o arquivo era resumido duas vezes antes de cada envio.
+  if (expected && crypto.createHash("sha256").update(buf).digest("hex") !== expected) throw new Error("Arquivo alterado durante a leitura");
   // Retorna Uint8Array explícito para transferência IPC segura (sandbox mode)
   return new Uint8Array(buf);
 }
@@ -93,6 +118,8 @@ async function write(root, relative, bytes, hash, expected) {
     await fs.rename(temp, absolute);
   } finally { await fs.rm(temp, { force: true }); }
   const saved = await fs.stat(absolute);
+  // Quem acabou de gravar já conhece o resumo: a próxima varredura não relê o arquivo.
+  remember(root, relative, { size: saved.size, mtimeMs: saved.mtimeMs, identity: `${saved.dev}:${saved.ino}`, checksum: hash });
   return { size: saved.size, mtimeMs: saved.mtimeMs, identity: `${saved.dev}:${saved.ino}` };
 }
 async function move(root, from, to, expected) {
@@ -101,6 +128,8 @@ async function move(root, from, to, expected) {
   await assertExpected(destination, null);
   await fs.rename(source, destination);
   const saved = await fs.stat(destination);
+  remember(root, from, null);
+  remember(root, to, { size: saved.size, mtimeMs: saved.mtimeMs, identity: `${saved.dev}:${saved.ino}`, checksum: expected });
   return { size: saved.size, mtimeMs: saved.mtimeMs, identity: `${saved.dev}:${saved.ino}` };
 }
 module.exports = { safePath, scan, read, write, move, checksum, assertExpected, MAX_BYTES };
