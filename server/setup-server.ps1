@@ -152,28 +152,49 @@ Write-Host 'Arquivos gravados.' -ForegroundColor Green
 # Portas (9333/8888/8790), token interno (STORAGE_SIGNING_SECRET) e servicos ja
 # vem prontos de fabrica.
 $configClienteRaiz = Join-Path $env:APPDATA 'FortesDrive\fortesdrive-native-v2.json'
-$raiz = ''
-if (Test-Path $configClienteRaiz) {
-  try { $raiz = [string]((Get-Content -Raw -LiteralPath $configClienteRaiz) | ConvertFrom-Json).watchFolder } catch { $raiz = '' }
+$pastaPadrao = Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'FortesDrive'
+
+# O arquivo do cliente é UTF-8. Lido com Get-Content -Raw (que no Windows
+# PowerShell decodifica como ANSI), "Rômulo" voltaria como "RÃ´mulo" e a pasta
+# apontaria para um usuário que não existe — por isso a leitura explícita.
+function Ler-JsonUtf8($caminho) {
+  if (-not (Test-Path $caminho)) { return $null }
+  try { return ([System.IO.File]::ReadAllText($caminho, [System.Text.Encoding]::UTF8)) | ConvertFrom-Json } catch { return $null }
 }
-if (-not $raiz) { $raiz = Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'FortesDrive' }
+
+$raiz = ''
+$configLida = Ler-JsonUtf8 $configClienteRaiz
+if ($configLida -and $configLida.watchFolder) { $raiz = [string]$configLida.watchFolder }
+
+# Conserta a pasta que uma instalação anterior deixou com o nome do usuário
+# corrompido (C:\Users\RÃ´mulo\... -> C:\Users\Rômulo\...).
+if ($raiz -match '^[A-Za-z]:\\Users\\[^\\]+') { $raiz = $raiz -replace '^[A-Za-z]:\\Users\\[^\\]+', $env:USERPROFILE }
+
+if (-not $raiz) { $raiz = $pastaPadrao }
 Write-Host ''
 Write-Host ('Pasta raiz neste computador: ' + $raiz) -ForegroundColor Cyan
 Write-Host 'Pressione Enter para manter, ou digite outro caminho (ex: D:\MeuDrive).'
 $respostaRaiz = Read-Host 'Pasta raiz (Enter = manter)'
-if ($respostaRaiz) { $raiz = $respostaRaiz.Trim().Trim('"') }
-New-Item -ItemType Directory -Force $raiz | Out-Null
+if ($respostaRaiz) { $raiz = $respostaRaiz.Trim().Trim('"').TrimEnd('\') }
+
+# Caminho que não pode ser usado (usuário inexistente, disco removido) não
+# interrompe a instalação: cai na pasta padrão e segue.
+try {
+  New-Item -ItemType Directory -Force $raiz | Out-Null
+} catch {
+  Write-Host ('[AVISO] Nao consegui usar a pasta "' + $raiz + '". Usando ' + $pastaPadrao) -ForegroundColor Yellow
+  $raiz = $pastaPadrao
+  New-Item -ItemType Directory -Force $raiz | Out-Null
+}
 Write-Host ('Pasta raiz definida: ' + $raiz) -ForegroundColor Green
 
 # O cliente de sincronizacao le essa pasta do proprio arquivo de configuracao:
 # gravando aqui, o agente ja sobe sincronizando o lugar escolhido (as demais
 # chaves do arquivo sao mantidas).
 $dadosCliente = @{}
-if (Test-Path $configClienteRaiz) {
-  try {
-    $lido = (Get-Content -Raw -LiteralPath $configClienteRaiz) | ConvertFrom-Json
-    foreach ($prop in $lido.PSObject.Properties) { $dadosCliente[$prop.Name] = $prop.Value }
-  } catch { $dadosCliente = @{} }
+$configAtual = Ler-JsonUtf8 $configClienteRaiz
+if ($configAtual) {
+  foreach ($prop in $configAtual.PSObject.Properties) { $dadosCliente[$prop.Name] = $prop.Value }
 }
 $dadosCliente['watchFolder'] = $raiz
 New-Item -ItemType Directory -Force (Split-Path $configClienteRaiz) | Out-Null
