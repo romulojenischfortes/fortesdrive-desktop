@@ -30,8 +30,16 @@ test("o pacote do servidor acompanha o instalador", () => {
 test("o servidor sobe o gateway na porta local do tunel", () => {
   const compose = read("server/docker-compose.yml");
   assert.match(compose, /gateway:/, "o compose precisa declarar o servico gateway");
-  assert.match(compose, /seaweedfs:/, "o compose precisa declarar o SeaweedFS");
   assert.match(compose, /127\.0\.0\.1:8790:8790/, "o gateway deve ser publicado apenas na porta local 8790");
+  assert.match(compose, /FD_DATA_DIR/, "a pasta de dados precisa vir do arquivo .env");
+});
+
+test("o gateway grava direto na pasta de dados, sem servico intermediario", () => {
+  const gateway = read("server/gateway/server.js");
+  assert.match(gateway, /DATA_DIR/, "o gateway precisa gravar na pasta de dados (DATA_DIR)");
+  assert.match(gateway, /x-fd-sha256/, "o gateway precisa conferir o checksum de cada envio");
+  assert.match(gateway, /\/v1\/status/, "o gateway precisa informar o estado da gravacao");
+  assert.doesNotMatch(gateway, /seaweedfs/i, "o gateway nao pode depender de outro servico para gravar");
 });
 
 test("o assistente usa o proprio pacote e reaproveita o segredo existente", () => {
