@@ -9,10 +9,15 @@ Var FortesSyncDirBrowse
 ; Pagina extra do instalador (depois da pasta de instalacao): aqui o usuario
 ; escolhe onde os arquivos serao salvos e sincronizados entre este computador e
 ; a nuvem. A pasta e criada na instalacao e entregue ao aplicativo.
-!macro customPageAfterChangeDir
-  Page custom FortesSyncPageCreate FortesSyncPageLeave
-!macroend
+; O desinstalador e compilado com este mesmo arquivo e nao tem paginas: sem
+; esta condicao o NSIS acusaria as funcoes abaixo como nao usadas.
+!ifndef BUILD_UNINSTALLER
+  !macro customPageAfterChangeDir
+    Page custom FortesSyncPageCreate FortesSyncPageLeave
+  !macroend
+!endif
 
+!ifndef BUILD_UNINSTALLER
 Function FortesSyncPageCreate
   ; Ja existe uma pasta escolhida (atualizacao ou reinstalacao): mantem a do
   ; usuario e nao mostra a pergunta de novo.
@@ -54,6 +59,7 @@ Function FortesSyncPageLeave
     Abort
   ${EndIf}
 FunctionEnd
+!endif
 
 ; Cria a pasta escolhida e deixa o pedido pronto para o aplicativo aplicar
 ; (na primeira abertura e, se ele ja estiver na bandeja do Windows, na hora).
