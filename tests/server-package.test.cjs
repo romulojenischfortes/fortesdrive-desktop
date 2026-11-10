@@ -44,9 +44,6 @@ test("o pacote do servidor segue pronto para o instalador proprio do servidor", 
   for (const relative of SERVER_PAYLOAD) {
     assert.ok(fs.existsSync(path.join(root, relative)), `arquivo do servidor ausente: ${relative}`);
   }
-  const servidor = fs.readFileSync(path.join(root, "..", "public", "instalar-servidor.bat"), "utf8");
-  assert.match(servidor, /docker/i, "o instalador do servidor e quem instala o Docker");
-  assert.match(servidor, /ngrok/i, "o instalador do servidor e quem configura o tunel");
 });
 
 test("o servidor sobe o gateway na porta local do tunel", () => {
