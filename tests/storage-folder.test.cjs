@@ -67,7 +67,7 @@ test('o reparo executa de verdade com pasta padrão, acentos, colchetes e volume
       for (let repeat = 0; repeat < 2; repeat++) runPowerShell(`$ErrorActionPreference='Stop'; $folder=$env:FD_TEST_FOLDER; ${block}`, folder);
       assert.equal(fs.readFileSync(path.join(data, 'preservado.txt'), 'utf8'), 'nao apagar');
       assert.match(fs.readFileSync(path.join(folder, '.env'), 'utf8'), new RegExp(secret));
-      assert.equal(fs.readFileSync(path.join(folder, 'data-dir.txt'), 'utf8').toLowerCase(), data.toLowerCase());
+      assert.equal(path.normalize(fs.readFileSync(path.join(folder, 'data-dir.txt'), 'utf8')).toLowerCase(), path.normalize(data).toLowerCase());
       const mounted = fs.readFileSync(path.join(folder, 'docker-compose.yml'), 'utf8');
       assert.ok(mounted.includes(`- '${data.replaceAll('\\', '/')}:/data'`));
       assert.doesNotMatch(mounted, /":\/data/);
