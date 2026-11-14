@@ -32,6 +32,10 @@
 ; cliente, as configuracoes basicas (pasta de sincronizacao e papel da maquina)
 ; sao aplicadas nos passos seguintes.
 Function FortesRolePageCreate
+  ${If} ${isUpdated}
+    Abort
+  ${EndIf}
+  !insertmacro MUI_HEADER_TEXT "Tipo de instalação" "Escolha Cliente ou Servidor."
   SetShellVarContext current
   ReadRegStr $FortesMachineRole HKLM "Software\FortesDrive" "MachineRole"
   ${If} "$FortesMachineRole" != "server"
@@ -70,37 +74,44 @@ Function FortesRolePageLeave
 FunctionEnd
 
 Function FortesSyncPageCreate
-  SetShellVarContext current
-
-  ; Ja existe uma pasta escolhida (atualizacao ou reinstalacao): mantem a do
-  ; usuario e nao mostra a pergunta de novo.
-  IfFileExists "$APPDATA\FortesDrive\fortesdrive-native-v2.json" 0 fortes_criar_pagina
+  ; Somente atualizacoes automaticas e o modo servidor pulam esta pagina.
+  ; Um arquivo antigo de configuracao NAO comprova que a pasta foi escolhida.
+  ${If} ${isUpdated}
     Abort
-  fortes_criar_pagina:
-
-  StrCpy $FortesSyncDir "$DOCUMENTS\FortesDrive"
+  ${EndIf}
+  ${If} "$FortesMachineRole" == "server"
+    Abort
+  ${EndIf}
+  SetShellVarContext current
+  !insertmacro MUI_HEADER_TEXT "Pasta de download e sincronização" "Escolha onde os arquivos da sua conta serão salvos neste computador."
   nsDialogs::Create 1018
   Pop $0
   ${If} "$0" == "error"
-    Abort
+    MessageBox MB_ICONSTOP "Não foi possível abrir a escolha da pasta. Execute o instalador novamente."
+    Quit
   ${EndIf}
 
-  ${NSD_CreateLabel} 0 0 100% 26u "Escolha a pasta onde seus arquivos serão salvos e sincronizados entre este computador e a nuvem. Ela será criada se ainda não existir."
+  ${NSD_CreateLabel} 0 0 100% 28u "Escolha uma pasta para baixar e sincronizar seus arquivos. Esta escolha é obrigatória e é diferente da pasta de instalação do programa."
   Pop $0
-  ${NSD_CreateText} 0 32u -56u 12u "$FortesSyncDir"
+  ${NSD_CreateText} 0 36u -84u 14u "$FortesSyncDir"
   Pop $FortesSyncDirInput
-  ${NSD_CreateButton} -52u 31u 52u 14u "Escolher pasta..."
+  ${NSD_CreateButton} -80u 35u 80u 16u "Escolher pasta..."
   Pop $FortesSyncDirBrowse
   ${NSD_OnClick} $FortesSyncDirBrowse FortesSyncBrowse
-
+  ${NSD_CreateLabel} 0 62u 100% 42u "Arquivos baixados da nuvem serão salvos aqui. Alterações feitas nesta pasta serão sincronizadas com a sua conta depois do login. A pasta será criada se não existir."
+  Pop $0
   nsDialogs::Show
 FunctionEnd
 
 Function FortesSyncBrowse
   ${NSD_GetText} $FortesSyncDirInput $R0
-  nsDialogs::SelectFolderDialog "Escolha a pasta dos seus arquivos" "$R0"
+  ${If} "$R0" == ""
+    StrCpy $R0 "$DOCUMENTS"
+  ${EndIf}
+  nsDialogs::SelectFolderDialog "Escolha a pasta de download e sincronização" "$R0"
   Pop $0
   ${If} "$0" != "error"
+  ${AndIf} "$0" != ""
     ${NSD_SetText} $FortesSyncDirInput "$0"
   ${EndIf}
 FunctionEnd
@@ -108,26 +119,61 @@ FunctionEnd
 Function FortesSyncPageLeave
   ${NSD_GetText} $FortesSyncDirInput $FortesSyncDir
   ${If} "$FortesSyncDir" == ""
-    MessageBox MB_ICONEXCLAMATION "Escolha a pasta onde seus arquivos serão salvos."
+    MessageBox MB_ICONEXCLAMATION "Escolha a pasta de download e sincronização para continuar."
     Abort
   ${EndIf}
+  System::Call 'shlwapi::PathIsRelativeW(w "$FortesSyncDir") i .r0'
+  ${If} $0 != 0
+    MessageBox MB_ICONEXCLAMATION "Informe o caminho completo da pasta ou use Escolher pasta."
+    Abort
+  ${EndIf}
+  ClearErrors
+  CreateDirectory "$FortesSyncDir"
+  ${If} ${Errors}
+    MessageBox MB_ICONSTOP "Não foi possível criar ou acessar a pasta escolhida. Escolha outra pasta."
+    Abort
+  ${EndIf}
+  ; Verifica gravacao antes de permitir que a instalacao prossiga.
+  ClearErrors
+  GetTempFileName $R1 "$FortesSyncDir"
+  ${If} ${Errors}
+    MessageBox MB_ICONSTOP "Não foi possível gravar na pasta escolhida. Escolha uma pasta com permissão de gravação."
+    Abort
+  ${EndIf}
+  Delete "$R1"
 FunctionEnd
 !endif
 
-; Cria a pasta escolhida e deixa o pedido pronto para o aplicativo aplicar
-; (na primeira abertura e, se ele ja estiver na bandeja do Windows, na hora).
-; O arquivo e gravado em UTF-8 pelo PowerShell, porque o caminho leva o nome do
-; usuario deste computador e pode ter acentos.
+; Entrega a escolha ao cliente usando somente o Windows/NSIS, sem PowerShell.
+; O INI UTF-16 preserva acentos e e consumido antes de abrir o aplicativo web.
 !macro FortesWriteSyncFolder
-  ; Atualizacao silenciosa nao troca papel nem pasta e nao abre assistentes.
+  ; Atualizacao automatica preserva a pasta e nao reconfigura o servidor.
   ${IfNot} ${Silent}
+  ${AndIfNot} ${isUpdated}
     SetShellVarContext current
-    System::Call 'Kernel32::SetEnvironmentVariable(t "FD_SYNC", t "$FortesSyncDir")'
-    System::Call 'Kernel32::SetEnvironmentVariable(t "FD_ROLE", t "$FortesMachineRole")'
-    nsExec::ExecToLog `powershell -NoProfile -ExecutionPolicy Bypass -Command "$$pasta = Join-Path $$env:APPDATA $\'FortesDrive$\'; New-Item -ItemType Directory -Force -Path $$pasta | Out-Null; $$config = @{ machineRole = $$env:FD_ROLE }; if ($$env:FD_SYNC) { New-Item -ItemType Directory -Force -Path $$env:FD_SYNC | Out-Null; $$config.watchFolder = $$env:FD_SYNC }; $$config | ConvertTo-Json -Compress | Set-Content -LiteralPath (Join-Path $$pasta $\'fortesdrive-setup.json$\') -Encoding UTF8"`
-    Pop $0
-    ${If} $0 != 0
-      MessageBox MB_ICONSTOP "Nao foi possivel salvar a configuracao de instalacao."
+    ${If} "$FortesMachineRole" == "client"
+    ${AndIf} "$FortesSyncDir" == ""
+      MessageBox MB_ICONSTOP "A instalação do cliente exige uma pasta de download e sincronização."
+      Abort
+    ${EndIf}
+    ClearErrors
+    CreateDirectory "$APPDATA\FortesDrive"
+    FileOpen $0 "$APPDATA\FortesDrive\fortesdrive-setup.ini" w
+    ${If} ${Errors}
+      MessageBox MB_ICONSTOP "Não foi possível salvar a pasta escolhida. Execute o instalador novamente."
+      Abort
+    ${EndIf}
+    ; BOM UTF-16LE: WriteINIStr passa a gravar Unicode pelo Windows.
+    FileWriteByte $0 255
+    FileWriteByte $0 254
+    FileClose $0
+    ClearErrors
+    WriteINIStr "$APPDATA\FortesDrive\fortesdrive-setup.ini" "Sync" "machineRole" "$FortesMachineRole"
+    ${If} "$FortesMachineRole" == "client"
+      WriteINIStr "$APPDATA\FortesDrive\fortesdrive-setup.ini" "Sync" "watchFolder" "$FortesSyncDir"
+    ${EndIf}
+    ${If} ${Errors}
+      MessageBox MB_ICONSTOP "Não foi possível salvar a configuração de sincronização. Execute o instalador novamente."
       Abort
     ${EndIf}
     WriteRegStr HKLM "Software\FortesDrive" "MachineRole" "$FortesMachineRole"

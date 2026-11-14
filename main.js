@@ -1,8 +1,6 @@
 const { app, BrowserWindow, ipcMain, dialog, Menu, shell, Tray, Notification, nativeImage, net } = require("electron");
 const path = require("path");
 const fs = require("fs/promises");
-const fsSync = require("fs");
-const Store = require("electron-store");
 const { SyncEngine } = require("./sync-engine");
 const { applySetupConfiguration } = require("./setup-handoff");
 const native = require("./native-files");
@@ -96,7 +94,9 @@ app.on("second-instance", async () => {
 
 async function refreshSetupConfiguration() {
   try {
-    await applySetupConfiguration(syncEngine, path.join(app.getPath("userData"), "fortesdrive-setup.json"));
+    const directory = app.getPath("userData");
+    await applySetupConfiguration(syncEngine, path.join(directory, "fortesdrive-setup.json"));
+    await applySetupConfiguration(syncEngine, path.join(directory, "fortesdrive-setup.ini"));
   } catch (error) {
     syncEngine.state.error = "Não foi possível aplicar a pasta do configurador: " + error.message;
   }
@@ -109,7 +109,8 @@ function requestSync() {
   if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send("sync:requested");
 }
 async function selectFolder() {
-  const result = await dialog.showOpenDialog(mainWindow, { properties: ["openDirectory", "createDirectory"], title: "Escolha o diretório raiz do FortesDrive" });
+  const options = { properties: ["openDirectory", "createDirectory"], title: "Escolha a pasta de download e sincronização do FortesDrive" };
+  const result = await (mainWindow ? dialog.showOpenDialog(mainWindow, options) : dialog.showOpenDialog(options));
   if (result.canceled) return null;
   await syncEngine.setWatchFolder(result.filePaths[0]);
   return syncEngine.watchFolder;
@@ -218,20 +219,14 @@ async function createTray() {
   lastOnlineState = net.isOnline();
 }
 app.whenReady().then(async () => {
-  // Primeira execução: deixa a pasta padrão de sincronização pronta
-  // (Documentos\FortesDrive). Uma pasta já escolhida pelo usuário é preservada.
-  try {
-    const settings = new Store({ name: "fortesdrive-native-v2" });
-    if (!settings.get("watchFolder")) {
-      const folder = path.join(app.getPath("documents"), "FortesDrive");
-      fsSync.mkdirSync(folder, { recursive: true });
-      settings.set("watchFolder", folder);
-    }
-  } catch (error) {
-    console.error("Não foi possível preparar a pasta de sincronização:", error.message);
-  }
+  // Primeiro aplica a escolha feita no instalador, sem criar uma pasta padrao.
   syncEngine = new SyncEngine(requestSync);
   await refreshSetupConfiguration();
+  // Se outro perfil do Windows abrir o app, exige a propria escolha nativa
+  // antes da janela web, do login e de qualquer transferencia.
+  if (!syncEngine.folderConfigured) {
+    if (!await selectFolder()) { app.quit(); return; }
+  }
   const { autoUpdater } = require("electron-updater");
   updater = new DesktopUpdater(autoUpdater, app, syncEngine, notify);
   registerHandlers(); createWindow();

@@ -9,6 +9,8 @@ class SyncEngine {
   constructor(notify) {
     this.store = new Store({ name: "fortesdrive-native-v2" });
     this.watchFolder = this.store.get("watchFolder", null);
+    if (this.store.has("folderConfigured")) this.folderConfigured = !!this.store.get("folderConfigured");
+    else { this.folderConfigured = !!this.watchFolder; this.store.set("folderConfigured", this.folderConfigured); }
     this.deviceId = this.store.get("deviceId", crypto.randomUUID());
     this.store.set("deviceId", this.deviceId);
     this.notify = notify;
@@ -22,10 +24,12 @@ class SyncEngine {
     await this.stop();
     this.watchFolder = canonical;
     this.store.set("watchFolder", canonical);
+    this.folderConfigured = true;
+    this.store.set("folderConfigured", true);
     await this.start();
   }
   async start() {
-    if (!this.watchFolder || this.state.running) return;
+    if (!this.watchFolder || !this.folderConfigured || this.state.running) return;
     await fs.access(this.watchFolder);
     await this.badges.start(this.watchFolder).catch(error => { this.state.badgeError = error.message; });
     this.state.running = true;
@@ -47,7 +51,7 @@ class SyncEngine {
     clearInterval(this.timer); clearTimeout(this.debounce);
     await this.watcher?.close();
   }
-  getStatus() { return { ...this.state, machineRole: this.store.get("machineRole", "client"), nativeStreaming: true, watchFolder: this.watchFolder, deviceId: this.deviceId }; }
+  getStatus() { return { ...this.state, machineRole: this.store.get("machineRole", "client"), nativeStreaming: true, watchFolder: this.watchFolder, folderConfigured: this.folderConfigured, deviceId: this.deviceId }; }
   manifestKey(userId) {
     if (typeof userId !== "string" || !userId || userId.length > 100 || !this.watchFolder) throw new Error("Conta e pasta são obrigatórias");
     return "manifest_" + crypto.createHash("sha256").update(userId + "\0" + this.watchFolder).digest("hex");
