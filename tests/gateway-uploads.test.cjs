@@ -126,6 +126,8 @@ test('repair payload matches every distributed gateway upload handler', async ()
     assert.equal(source.match(handlerPattern)?.[0].trim(), payload, file);
   }
   assert.match(repair, /compose build --no-cache gateway/);
-  assert.match(repair, /compose up -d --no-deps --force-recreate gateway/);
+  assert.match(repair, /compose config --quiet/);
+  assert.match(repair, /compose up -d --force-recreate gateway/);
+  assert.doesNotMatch(repair, /compose up[^\n]*--no-deps/);
   assert.doesNotMatch(repair, /compose down|remove-orphans|STORAGE_SIGNING_SECRET=/);
 });

@@ -298,30 +298,27 @@ if ($atual -and $atual.Length -ge 16) {
   Write-Host 'Segredo novo criado no arquivo .env.' -ForegroundColor Green
 }
 
-# A pasta de dados e a que o Docker monta (variavel FD_DATA_DIR do compose).
-# Ela NAO fica mais no .env: o Docker le esse arquivo com a codificacao do
-# Windows, entao "C:\Users\Rômulo\..." chegava como "C:\Users\RÃ´mulo\..." — o
-# daemon tentava criar essa pasta e recusava com "Access is denied", o servidor
-# nao subia e o tunel respondia 502. Agora o caminho fica escrito no proprio
-# docker-compose.yml (UTF-8) e a pasta e criada aqui antes de o Docker usar.
+# Preserva a pasta ja escolhida e o segredo, inclusive na primeira instalacao.
 $dadosExistentes = ($linhas | Where-Object { $_ -match '^\s*FD_DATA_DIR\s*=\s*\S' } | ForEach-Object { ($_ -split '=', 2)[1] } | Select-Object -First 1)
+if (-not $dadosExistentes) { $dadosExistentes = (Ler-TextoUtf8 (Join-Path $pasta 'data-dir.txt')).Trim() }
 $pastaDados = Resolver-CaminhoPasta $dadosExistentes $pastaDados
-New-Item -ItemType Directory -Force -LiteralPath $pastaDados | Out-Null
-$linhasEnv = @($linhas | Where-Object { $_ -match '\S' -and $_ -notmatch '^\s*(FD_DATA_DIR|MAX_UPLOAD_BYTES|MAX_CONCURRENT_UPLOADS|RATE_LIMIT_PER_MINUTE)\s*=' })
-$linhasEnv = @('MAX_CONCURRENT_UPLOADS=30', 'RATE_LIMIT_PER_MINUTE=1800') + $linhasEnv
+# New-Item nao tem parametro LiteralPath. A API cria sem interpretar curingas.
+[IO.Directory]::CreateDirectory($pastaDados) | Out-Null
+$linhasEnv = @($linhas | Where-Object { $_ -match '\S' -and $_ -notmatch '^\s*(STORAGE_SIGNING_SECRET|FD_DATA_DIR|MAX_UPLOAD_BYTES|MAX_CONCURRENT_UPLOADS|RATE_LIMIT_PER_MINUTE)\s*=' })
+$linhasEnv = @(('STORAGE_SIGNING_SECRET=' + $segredo), 'MAX_CONCURRENT_UPLOADS=30', 'RATE_LIMIT_PER_MINUTE=1800') + $linhasEnv
 Gravar (Join-Path $pasta 'data-dir.txt') $pastaDados
-# Sem FD_DATA_DIR no .env, o compose monta a pasta ./data (ou seja, esta pasta
-# do servidor) — caminho relativo, sem acento e sem codificacao no meio. Uma
-# pasta de dados fora daqui e gravada no proprio compose, em UTF-8.
-$marcadorDados = '${FD_DATA_DIR:-./data}'
+$marcadorDados = '${FD_DATA_DIR:-./data}:/data'
 $pastaDadosPadrao = Join-Path $pasta 'data'
 if ($pastaDados -ne $pastaDadosPadrao) {
   $composeTexto = Ler-TextoUtf8 $composeAtual
   if ($composeTexto.Contains($marcadorDados)) {
-    Gravar $composeAtual $composeTexto.Replace($marcadorDados, ('"' + ($pastaDados -replace '\\', '/').TrimEnd('/') + '"'))
-  } else {
+    $volumeDados = "'" + ($pastaDados -replace '\\', '/').TrimEnd('/').Replace("'", "''") + ":/data'"
+    Gravar $composeAtual $composeTexto.Replace($marcadorDados, $volumeDados)
+  } elseif ($legado) {
+    # Nao troca volumes de um backend antigo durante a atualizacao.
     $linhasEnv = @('FD_DATA_DIR=' + $pastaDados) + $linhasEnv
-    Write-Host '[AVISO] Este docker-compose.yml so aceita a pasta de dados personalizada pelo .env.' -ForegroundColor Yellow
+  } else {
+    throw 'A pasta de dados nao foi localizada no Compose. Nenhum arquivo foi apagado.'
   }
 }
 Gravar $envFile ($linhasEnv -join "`r`n")
@@ -422,7 +419,10 @@ for ($i = 1; $i -le 30; $i++) {
 if ($localOk) {
   Write-Host ('Gateway ' + $versao + ' respondendo no computador (porta 8790).') -ForegroundColor Green
 } else {
-  Write-Host '[AVISO] O gateway ainda nao respondeu. Detalhes: docker compose logs gateway' -ForegroundColor Yellow
+  Write-Host '[ERRO] O servidor local nao iniciou. O tunel nao sera tratado como servidor pronto.' -ForegroundColor Red
+  Push-Location $pasta
+  try { docker compose ps -a; docker compose logs --tail 60 gateway } finally { Pop-Location }
+  exit 1
 }
 
 # --- O armazenamento grava de verdade? ---------------------------------
@@ -792,9 +792,8 @@ if ($dockerOk) {
   Push-Location $pasta
   & docker compose up -d 2>&1 | Out-Null
   $subiu = ($LASTEXITCODE -eq 0)
-  Pop-Location
   if ($subiu) {
-    Anotar 'Servidor de armazenamento no ar (gateway).'
+    Anotar 'Inicializacao solicitada; verificando o gateway.'
     # "Subiu" nao garante que o servico esta rodando: se ele tiver parado
     # (disco, permissao, reinicio do Docker), nada e gravado. Aqui ele e
     # recriado quando nao estiver entre os servicos em execucao.
@@ -805,9 +804,23 @@ if ($dockerOk) {
     }
   }
   else { Anotar 'docker compose up falhou: veja docker compose logs gateway.' }
+  Pop-Location
 } else {
-  Anotar 'O Docker nao ficou pronto a tempo; tentando o tunel mesmo assim.'
+  Anotar 'O Docker nao ficou pronto a tempo; servidor indisponivel.'
 }
+
+$localOk = $false
+if ($dockerOk) {
+  for ($i = 1; $i -le 24; $i++) {
+    try {
+      $health = Invoke-RestMethod 'http://127.0.0.1:8790/health' -TimeoutSec 5
+      if ($health.ok) { $localOk = $true; break }
+    } catch { }
+    Start-Sleep -Seconds 5
+  }
+}
+if (-not $localOk) { Anotar 'Gateway sem resposta na porta 8790. Tunel nao iniciado por esta tarefa.'; exit 1 }
+Anotar 'Gateway confirmado na porta 8790.'
 
 # 3) Tunel para a internet.
 $arquivoDominio = Join-Path $pasta 'ngrok-domain.txt'

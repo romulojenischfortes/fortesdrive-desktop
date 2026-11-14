@@ -1,7 +1,7 @@
 @echo off
 chcp 65001 >nul 2>nul
 setlocal
-title FortesDrive - corrigir uploads 411
+title FortesDrive - recuperar servidor e uploads
 set "FD_REPAIR_SELF=%~f0"
 set "FD_REPAIR_DIR=%~1"
 set "FD_REPAIR_MODE=%~2"
@@ -31,7 +31,7 @@ try {
     if (-not (Get-Command docker -ErrorAction SilentlyContinue)) { throw 'Abra o Docker Desktop antes de executar a atualizacao.' }
     Invoke-DockerRepair info
     if (-not $folder) {
-      $ids = @(& docker ps -q --filter 'publish=8790' --filter 'label=com.docker.compose.service=gateway')
+      $ids = @(& docker ps -aq --filter 'label=com.docker.compose.service=gateway')
       if ($LASTEXITCODE -ne 0) { throw 'Nao foi possivel identificar o servidor em execucao.' }
       if ($ids.Count -eq 1) {
         $detected = (& docker inspect --format '{{ index .Config.Labels "com.docker.compose.project.working_dir" }}' $ids[0])
@@ -68,37 +68,45 @@ try {
     if ($confirm -notmatch '^(s|sim)$') { Write-Host 'Cancelado. Nada foi alterado.'; exit 0 }
   }
   # --- Pasta de dados do Docker -----------------------------------------
-  # O caminho era gravado no .env, e o Docker le esse arquivo com a codificacao
-  # do Windows: "C:\Users\Rômulo\..." chegava como "C:\Users\RÃ´mulo\...". O
-  # daemon tentava criar essa pasta, recusava com "Access is denied", o servidor
-  # nao subia e o tunel respondia 502. Aqui o caminho e consertado, a pasta e
-  # criada agora e ele passa a ficar no proprio docker-compose.yml (UTF-8).
+  # New-Item nao aceita -LiteralPath: esse comando interrompia o reparo
+  # antes de iniciar o gateway. CreateDirectory trata o caminho literalmente.
   $envFile = Join-Path $folder '.env'
   $composeFile = Join-Path $folder 'docker-compose.yml'
   $textoEnv = if (Test-Path -LiteralPath $envFile) { [IO.File]::ReadAllText($envFile, [Text.Encoding]::UTF8) } else { '' }
   $linhasEnv = @($textoEnv -split "\r?\n")
   $valorDados = ($linhasEnv | Where-Object { $_ -match '^\s*FD_DATA_DIR\s*=\s*\S' } | ForEach-Object { ($_ -split '=', 2)[1] } | Select-Object -First 1)
+  $composeTexto = [IO.File]::ReadAllText($composeFile, [Text.Encoding]::UTF8)
+  $padraoDados = [regex]::new('(?m)^(?<indent>[ \t]*)-[ \t]+(?<source>.+?):/data["'']?[ \t]*\r?$')
+  $montagens = $padraoDados.Matches($composeTexto)
+  if ($montagens.Count -gt 1) { throw 'Mais de uma pasta /data foi encontrada. Os dados foram preservados.' }
+  $origemDados = if ($montagens.Count -eq 1) { $montagens[0].Groups['source'].Value.Trim().Trim('"').Trim("'") } else { '' }
   $pastaDados = Join-Path $folder 'data'
-  if ($valorDados) {
-    $base = ([string]$valorDados).Trim().Trim('"')
-    $corrigido = if ($base) { [Text.Encoding]::UTF8.GetString([Text.Encoding]::GetEncoding(28591).GetBytes($base)) } else { '' }
-    if ($base -and (Test-Path -LiteralPath $base)) { $pastaDados = $base }
-    elseif ($corrigido -and (Test-Path -LiteralPath $corrigido)) { $pastaDados = $corrigido }
-    elseif ($base -and (Test-Path -LiteralPath (Split-Path -Parent $base))) { $pastaDados = $base }
+  $arquivoDados = Join-Path $folder 'data-dir.txt'
+  $salvo = if (Test-Path -LiteralPath $arquivoDados) { [IO.File]::ReadAllText($arquivoDados, [Text.Encoding]::UTF8).Trim() } else { '' }
+  if ($origemDados -and $origemDados -notmatch '^\$\{' -and $origemDados -ne './data') { $pastaDados = $origemDados }
+  elseif ($valorDados) { $pastaDados = $valorDados }
+  elseif ($salvo) { $pastaDados = $salvo }
+  $pastaDados = ([string]$pastaDados).Trim().Trim('"').Trim("'")
+  if (-not [IO.Path]::IsPathRooted($pastaDados)) { $pastaDados = Join-Path $folder $pastaDados }
+  if (-not (Test-Path -LiteralPath $pastaDados)) {
+    $corrigido = [Text.Encoding]::UTF8.GetString([Text.Encoding]::GetEncoding(28591).GetBytes($pastaDados))
+    if (Test-Path -LiteralPath $corrigido) { $pastaDados = $corrigido }
   }
-  New-Item -ItemType Directory -Force -LiteralPath $pastaDados | Out-Null
-  # Pasta padrao: o proprio compose monta ./data, sem passar caminho nenhum
-  # pelo .env. Pasta fora daqui: vai escrita no compose, que e UTF-8.
-  if ($pastaDados -ne (Join-Path $folder 'data')) {
-    $composeTexto = [IO.File]::ReadAllText($composeFile, [Text.Encoding]::UTF8)
-    $marcadorDados = '${FD_DATA_DIR:-./data}'
-    if ($composeTexto.Contains($marcadorDados)) {
-      [IO.File]::WriteAllText($composeFile, $composeTexto.Replace($marcadorDados, ('"' + ($pastaDados -replace '\\', '/').TrimEnd('/') + '"')), (New-Object Text.UTF8Encoding($false)))
+  [IO.Directory]::CreateDirectory($pastaDados) | Out-Null
+  $utf8 = New-Object Text.UTF8Encoding($false)
+  if ($montagens.Count -eq 1) {
+    # As aspas envolvem o volume INTEIRO, nunca so a origem antes de :/data.
+    $caminhoDocker = ($pastaDados -replace '\\', '/').TrimEnd('/').Replace("'", "''")
+    $composeNovo = $padraoDados.Replace($composeTexto, [Text.RegularExpressions.MatchEvaluator]{ param($m)
+      $m.Groups['indent'].Value + "- '" + $caminhoDocker + ":/data'"
+    })
+    if ($composeNovo -ne $composeTexto) {
+      Copy-Item -LiteralPath $composeFile -Destination ($composeFile + '.before-startup.bak') -Force
+      [IO.File]::WriteAllText($composeFile, $composeNovo, $utf8)
     }
-  }
-  if ($valorDados) {
     $semDados = @($linhasEnv | Where-Object { $_ -match '\S' -and $_ -notmatch '^\s*FD_DATA_DIR\s*=' })
-    [IO.File]::WriteAllText($envFile, ($semDados -join "`r`n"), (New-Object Text.UTF8Encoding($false)))
+    [IO.File]::WriteAllText($envFile, ($semDados -join "`r`n"), $utf8)
+    [IO.File]::WriteAllText($arquivoDados, $pastaDados, $utf8)
   }
   Write-Host ('Pasta dos dados: ' + $pastaDados) -ForegroundColor Cyan
   $handler = @'
@@ -173,9 +181,11 @@ async function handleUpload(req, res, key) {
   if ($patchOnly) { Write-Host ('Rotina de upload atualizada para ' + $version); exit 0 }
   Push-Location $folder
   try {
+    Invoke-DockerRepair compose config --quiet
     Invoke-DockerRepair compose build --no-cache gateway
     $restarted = $true
-    Invoke-DockerRepair compose up -d --no-deps --force-recreate gateway
+    # Tambem inicia o armazenamento de instalacoes antigas quando ele parou.
+    Invoke-DockerRepair compose up -d --force-recreate gateway
   } finally { Pop-Location }
   $ready = $false
   for ($attempt = 0; $attempt -lt 30; $attempt++) {
@@ -192,12 +202,18 @@ async function handleUpload(req, res, key) {
   exit 0
 } catch {
   Write-Host ('[ERRO] ' + $_.Exception.Message) -ForegroundColor Red
+  if ($folder -and (Test-Path -LiteralPath (Join-Path $folder 'docker-compose.yml'))) {
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    Push-Location $folder
+    try { & docker compose ps -a; & docker compose logs --tail 60 gateway } finally { Pop-Location; $ErrorActionPreference = $previous }
+  }
   if ($backup -and (Test-Path -LiteralPath $backup)) {
     Copy-Item -LiteralPath $backup -Destination $gateway -Force
     Write-Host 'O arquivo anterior do servidor foi restaurado. Nenhum dado foi apagado.' -ForegroundColor Yellow
     if ($restarted) {
       Push-Location $folder
-      try { Invoke-DockerRepair compose build gateway; Invoke-DockerRepair compose up -d --no-deps --force-recreate gateway }
+      try { Invoke-DockerRepair compose build gateway; Invoke-DockerRepair compose up -d --force-recreate gateway }
       catch { Write-Host 'Nao foi possivel reiniciar o gateway anterior. Abra o Docker Desktop e execute a atualizacao novamente.' -ForegroundColor Yellow }
       finally { Pop-Location }
     }

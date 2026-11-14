@@ -92,7 +92,10 @@ jobs:
           body: |
             Instalador unificado: escolha Cliente ou Servidor; o cliente nao instala dependencias do servidor.
             Gateway 2.0.2: envios aceitam corpo em chunks e arquivos vazios, sem exigir o Content-Length que o tunel nao repassa (corrige o erro 411).
-            Pasta de dados: o caminho deixa de passar pelo .env (o Docker o lia com a codificacao do Windows e recusava com "Access is denied"); o servidor volta a subir e o tunel deixa de responder 502.
+            Inicializacao: removido o parametro invalido New-Item -LiteralPath que interrompia o assistente e o reparo antes de iniciar o gateway.
+            Configuracao: o segredo de assinatura e mantido na primeira instalacao, e as aspas envolvem o volume inteiro, corrigindo o Compose de pastas personalizadas.
+            Recuperacao: inicia tambem as dependencias de servidores antigos e confirma o gateway local antes de iniciar o tunel.
+            Regressao: os testes executam as rotinas reais no Windows PowerShell 5.1, com caminhos acentuados e configuracao antiga, sem apagar dados.
             Tunel: o assistente garante que o endereco do FortesDrive aponte para a porta 8790.
             Envio e download nativos em fluxo, ate 10 GiB por arquivo, sem copiar o conteudo inteiro para a memoria.
             Reconciliacao indexada e checkpoints agrupados para pastas com milhares de arquivos.
