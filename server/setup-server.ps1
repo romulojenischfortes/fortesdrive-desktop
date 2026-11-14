@@ -59,6 +59,34 @@ function Gravar($caminho, $conteudo) {
   [System.IO.File]::WriteAllText($caminho, $conteudo, $utf8SemBom)
 }
 
+# O .env e o ngrok.yml sao arquivos UTF-8, mas Get-Content no Windows PowerShell
+# decodifica como ANSI: "Rômulo" voltava como "RÃ´mulo" e a pasta de dados
+# apontava para um usuario que nao existe (o Docker recusava com "Access is
+# denied", o servidor nao subia e o tunel respondia 502). Tudo aqui e lido e
+# gravado em UTF-8.
+function Ler-TextoUtf8($caminho) {
+  if (-not (Test-Path -LiteralPath $caminho)) { return '' }
+  return [System.IO.File]::ReadAllText($caminho, [System.Text.Encoding]::UTF8)
+}
+
+function Desfazer-CaminhoCorrompido($texto) {
+  if (-not $texto) { return $texto }
+  $bytes = [System.Text.Encoding]::GetEncoding(28591).GetBytes($texto)
+  return [System.Text.Encoding]::UTF8.GetString($bytes)
+}
+
+# Conserta o caminho que uma instalacao anterior deixou corrompido e, quando
+# nenhum candidato serve, usa a pasta padrao.
+function Resolver-CaminhoPasta($valor, $padrao) {
+  if (-not $valor) { return $padrao }
+  $base = ([string]$valor).Trim().Trim('"')
+  if (-not $base) { return $padrao }
+  $candidatos = @($base, (Desfazer-CaminhoCorrompido $base), (Desfazer-CaminhoCorrompido (Desfazer-CaminhoCorrompido $base)))
+  foreach ($candidato in $candidatos) { if ($candidato -and (Test-Path -LiteralPath $candidato)) { return $candidato } }
+  foreach ($candidato in $candidatos) { if ($candidato -and (Test-Path -LiteralPath (Split-Path -Parent $candidato))) { return $candidato } }
+  return $padrao
+}
+
 # Janela do Windows para escolher uma pasta (com botao de criar pasta nova).
 # Quando a janela nao pode ser aberta, cai na digitacao do caminho — o
 # instalador nunca trava por causa disso.
@@ -256,8 +284,7 @@ if ($discoRaiz -and $discoServidor -and ($discoRaiz -ne $discoServidor)) {
 
 Passo '3/6 Segredo de assinatura'
 $envFile = Join-Path $pasta '.env'
-$linhas = @()
-if (Test-Path $envFile) { $linhas = @(Get-Content -LiteralPath $envFile) }
+$linhas = @((Ler-TextoUtf8 $envFile) -split "\r?\n" | Where-Object { $_ -ne '' })
 $atual = ($linhas | Where-Object { $_ -match '^\s*STORAGE_SIGNING_SECRET\s*=\s*\S' } | ForEach-Object { ($_ -split '=', 2)[1].Trim() } | Select-Object -First 1)
 if ($atual -and $atual.Length -ge 16) {
   $segredo = $atual
@@ -271,13 +298,33 @@ if ($atual -and $atual.Length -ge 16) {
   Write-Host 'Segredo novo criado no arquivo .env.' -ForegroundColor Green
 }
 
-# A pasta de dados do servidor fica registrada no .env, e ela que o Docker monta
-# (variavel FD_DATA_DIR do docker-compose.yml). Pode ser trocada a mao, no
-# proprio .env, por qualquer caminho — inclusive outro disco.
-$dadosExistentes = ($linhas | Where-Object { $_ -match '^\s*FD_DATA_DIR\s*=\s*\S' } | ForEach-Object { ($_ -split '=', 2)[1].Trim() } | Select-Object -First 1)
-if ($dadosExistentes) { $pastaDados = $dadosExistentes }
-$linhasEnv = @(Get-Content -LiteralPath $envFile | Where-Object { $_ -match '\S' -and $_ -notmatch '^\s*(FD_DATA_DIR|MAX_CONCURRENT_UPLOADS|RATE_LIMIT_PER_MINUTE)\s*=' })
-Gravar $envFile ((@('FD_DATA_DIR=' + $pastaDados, 'MAX_CONCURRENT_UPLOADS=30', 'RATE_LIMIT_PER_MINUTE=1800') + $linhasEnv) -join "`r`n")
+# A pasta de dados e a que o Docker monta (variavel FD_DATA_DIR do compose).
+# Ela NAO fica mais no .env: o Docker le esse arquivo com a codificacao do
+# Windows, entao "C:\Users\Rômulo\..." chegava como "C:\Users\RÃ´mulo\..." — o
+# daemon tentava criar essa pasta e recusava com "Access is denied", o servidor
+# nao subia e o tunel respondia 502. Agora o caminho fica escrito no proprio
+# docker-compose.yml (UTF-8) e a pasta e criada aqui antes de o Docker usar.
+$dadosExistentes = ($linhas | Where-Object { $_ -match '^\s*FD_DATA_DIR\s*=\s*\S' } | ForEach-Object { ($_ -split '=', 2)[1] } | Select-Object -First 1)
+$pastaDados = Resolver-CaminhoPasta $dadosExistentes $pastaDados
+New-Item -ItemType Directory -Force -LiteralPath $pastaDados | Out-Null
+$linhasEnv = @($linhas | Where-Object { $_ -match '\S' -and $_ -notmatch '^\s*(FD_DATA_DIR|MAX_UPLOAD_BYTES|MAX_CONCURRENT_UPLOADS|RATE_LIMIT_PER_MINUTE)\s*=' })
+$linhasEnv = @('MAX_CONCURRENT_UPLOADS=30', 'RATE_LIMIT_PER_MINUTE=1800') + $linhasEnv
+Gravar (Join-Path $pasta 'data-dir.txt') $pastaDados
+# Sem FD_DATA_DIR no .env, o compose monta a pasta ./data (ou seja, esta pasta
+# do servidor) — caminho relativo, sem acento e sem codificacao no meio. Uma
+# pasta de dados fora daqui e gravada no proprio compose, em UTF-8.
+$marcadorDados = '${FD_DATA_DIR:-./data}'
+$pastaDadosPadrao = Join-Path $pasta 'data'
+if ($pastaDados -ne $pastaDadosPadrao) {
+  $composeTexto = Ler-TextoUtf8 $composeAtual
+  if ($composeTexto.Contains($marcadorDados)) {
+    Gravar $composeAtual $composeTexto.Replace($marcadorDados, ('"' + ($pastaDados -replace '\\', '/').TrimEnd('/') + '"'))
+  } else {
+    $linhasEnv = @('FD_DATA_DIR=' + $pastaDados) + $linhasEnv
+    Write-Host '[AVISO] Este docker-compose.yml so aceita a pasta de dados personalizada pelo .env.' -ForegroundColor Yellow
+  }
+}
+Gravar $envFile ($linhasEnv -join "`r`n")
 Write-Host ('Pasta dos dados do armazenamento: ' + $pastaDados) -ForegroundColor Green
 
 # ---------------------------------------------------------------------
@@ -345,6 +392,8 @@ if (-not $subiu) {
   Push-Location $pasta
   docker compose logs --tail 40 gateway
   Pop-Location
+  Write-Host 'Se aparecer "Access is denied" ao preparar a pasta de dados, libere essa pasta no Docker Desktop' -ForegroundColor Yellow
+  Write-Host '(Settings > Resources > File sharing) ou escolha a pasta de dados em outro disco e rode de novo este atalho.' -ForegroundColor Yellow
   $dono = Get-NetTCPConnection -LocalPort 8790 -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
   if ($dono) {
     $proc = Get-Process -Id $dono.OwningProcess -ErrorAction SilentlyContinue
@@ -423,7 +472,7 @@ if ($localOk) {
     Push-Location $pasta
     docker compose logs --tail 60 gateway
     Pop-Location
-    Write-Host 'Se a pasta de dados (FD_DATA_DIR no .env) estiver em outro disco, confira se ele esta ligado' -ForegroundColor Yellow
+    Write-Host ('Se a pasta de dados (' + $pastaDados + ') estiver em outro disco, confira se ele esta ligado') -ForegroundColor Yellow
     Write-Host 'e compartilhado no Docker Desktop (Settings > Resources > File sharing).' -ForegroundColor Yellow
   }
 }
@@ -546,9 +595,36 @@ function Garantir-ConfigNgrok($dominio) {
   $arquivo = Arquivo-ConfigNgrok
   New-Item -ItemType Directory -Force (Split-Path $arquivo) | Out-Null
   if (-not (Test-Path $arquivo)) { Gravar $arquivo ("version: `"3`"" + "`r`n") }
-  $texto = Get-Content -Raw -LiteralPath $arquivo
+  $texto = Ler-TextoUtf8 $arquivo
   if ($texto -match '(?m)^tunnels:') {
-    Write-Host 'O ngrok.yml ja tinha tuneis definidos; mantidos como estao.' -ForegroundColor Green
+    # Um tunel antigo pode apontar para outra porta: o ngrok mostrava
+    # "http://localhost:87" e tudo respondia 502. Aqui o tunel do FortesDrive e
+    # corrigido para a porta 8790, sem mexer nos outros tuneis.
+    $padraoTunel = [regex]::new('(?ms)^(\s{2}fortesdrive:\r?\n)((?:[ \t]+.*(?:\r?\n|$))*)')
+    if ($padraoTunel.IsMatch($texto)) {
+      $novo = $padraoTunel.Replace($texto, [System.Text.RegularExpressions.MatchEvaluator]{ param($m)
+        $corpo = $m.Groups[2].Value
+        if ($corpo -match '(?m)^\s*addr:') {
+          $corpo = [regex]::Replace($corpo, '(?m)^(\s*addr:\s*).*$', [System.Text.RegularExpressions.MatchEvaluator]{ param($a) $a.Groups[1].Value + '8790' })
+        } else {
+          $corpo = "    proto: http`r`n    addr: 8790`r`n" + $corpo
+        }
+        if ($corpo -match '(?m)^\s*domain:') {
+          $corpo = [regex]::Replace($corpo, '(?m)^(\s*domain:\s*).*$', [System.Text.RegularExpressions.MatchEvaluator]{ param($d) $d.Groups[1].Value + $dominio })
+        } else {
+          $corpo = $corpo.TrimEnd() + "`r`n    domain: " + $dominio + "`r`n"
+        }
+        return $m.Groups[1].Value + $corpo
+      })
+      if ($novo -ne $texto) {
+        Gravar $arquivo $novo
+        Write-Host 'Tunel do FortesDrive ajustado no ngrok.yml: porta 8790.' -ForegroundColor Green
+      } else {
+        Write-Host 'Tunel do FortesDrive ja apontava para a porta 8790.' -ForegroundColor Green
+      }
+    } else {
+      Write-Host 'O ngrok.yml ja tinha tuneis definidos; mantidos como estao.' -ForegroundColor Green
+    }
     return $true
   }
   $bloco = @(
@@ -869,7 +945,7 @@ Write-Host 'Pasta de trabalho do servidor:' -ForegroundColor Cyan
 Write-Host ('  ' + $pasta)
 Write-Host 'Pasta raiz dos seus arquivos neste computador:' -ForegroundColor Cyan
 Write-Host ('  ' + $raiz)
-Write-Host 'Pasta dos dados do armazenamento (trocavel no .env):' -ForegroundColor Cyan
+Write-Host 'Pasta dos dados do armazenamento (anotada em data-dir.txt):' -ForegroundColor Cyan
 Write-Host ('  ' + $pastaDados)
 Write-Host 'Inicio automatico com o Windows:' -ForegroundColor Cyan
 Write-Host ('  tarefa "' + $nomeTarefa + '" — sobe ao ligar o Windows e a cada entrada na sessao.')

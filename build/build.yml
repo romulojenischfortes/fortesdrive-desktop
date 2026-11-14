@@ -15,7 +15,7 @@ jobs:
           node-version: 20
       - run: npm install
       - name: Test native transfers and updater
-        run: node --test tests/native.test.cjs tests/native-streams.test.cjs tests/updater.test.cjs tests/badge-setup.test.cjs tests/packaging.test.cjs tests/server-package.test.cjs tests/setup-handoff.test.cjs
+        run: node --test tests/native.test.cjs tests/native-streams.test.cjs tests/updater.test.cjs tests/badge-setup.test.cjs tests/packaging.test.cjs tests/server-package.test.cjs tests/setup-handoff.test.cjs tests/gateway-uploads.test.cjs tests/storage-folder.test.cjs
       - name: Build and test Explorer badges
         shell: cmd
         run: |
@@ -91,6 +91,9 @@ jobs:
           name: FortesDrive Desktop ${{ steps.version.outputs.version }}
           body: |
             Instalador unificado: escolha Cliente ou Servidor; o cliente nao instala dependencias do servidor.
+            Gateway 2.0.2: envios aceitam corpo em chunks e arquivos vazios, sem exigir o Content-Length que o tunel nao repassa (corrige o erro 411).
+            Pasta de dados: o caminho deixa de passar pelo .env (o Docker o lia com a codificacao do Windows e recusava com "Access is denied"); o servidor volta a subir e o tunel deixa de responder 502.
+            Tunel: o assistente garante que o endereco do FortesDrive aponte para a porta 8790.
             Envio e download nativos em fluxo, ate 10 GiB por arquivo, sem copiar o conteudo inteiro para a memoria.
             Reconciliacao indexada e checkpoints agrupados para pastas com milhares de arquivos.
             Sincronização recursiva de arquivos e subpastas, edição, renomeação, movimentos e exclusões bidirecionais.

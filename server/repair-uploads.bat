@@ -67,6 +67,40 @@ try {
     $confirm = Read-Host 'Pausar os envios e aplicar a correcao neste servidor? [s/N]'
     if ($confirm -notmatch '^(s|sim)$') { Write-Host 'Cancelado. Nada foi alterado.'; exit 0 }
   }
+  # --- Pasta de dados do Docker -----------------------------------------
+  # O caminho era gravado no .env, e o Docker le esse arquivo com a codificacao
+  # do Windows: "C:\Users\Rômulo\..." chegava como "C:\Users\RÃ´mulo\...". O
+  # daemon tentava criar essa pasta, recusava com "Access is denied", o servidor
+  # nao subia e o tunel respondia 502. Aqui o caminho e consertado, a pasta e
+  # criada agora e ele passa a ficar no proprio docker-compose.yml (UTF-8).
+  $envFile = Join-Path $folder '.env'
+  $composeFile = Join-Path $folder 'docker-compose.yml'
+  $textoEnv = if (Test-Path -LiteralPath $envFile) { [IO.File]::ReadAllText($envFile, [Text.Encoding]::UTF8) } else { '' }
+  $linhasEnv = @($textoEnv -split "\r?\n")
+  $valorDados = ($linhasEnv | Where-Object { $_ -match '^\s*FD_DATA_DIR\s*=\s*\S' } | ForEach-Object { ($_ -split '=', 2)[1] } | Select-Object -First 1)
+  $pastaDados = Join-Path $folder 'data'
+  if ($valorDados) {
+    $base = ([string]$valorDados).Trim().Trim('"')
+    $corrigido = if ($base) { [Text.Encoding]::UTF8.GetString([Text.Encoding]::GetEncoding(28591).GetBytes($base)) } else { '' }
+    if ($base -and (Test-Path -LiteralPath $base)) { $pastaDados = $base }
+    elseif ($corrigido -and (Test-Path -LiteralPath $corrigido)) { $pastaDados = $corrigido }
+    elseif ($base -and (Test-Path -LiteralPath (Split-Path -Parent $base))) { $pastaDados = $base }
+  }
+  New-Item -ItemType Directory -Force -LiteralPath $pastaDados | Out-Null
+  # Pasta padrao: o proprio compose monta ./data, sem passar caminho nenhum
+  # pelo .env. Pasta fora daqui: vai escrita no compose, que e UTF-8.
+  if ($pastaDados -ne (Join-Path $folder 'data')) {
+    $composeTexto = [IO.File]::ReadAllText($composeFile, [Text.Encoding]::UTF8)
+    $marcadorDados = '${FD_DATA_DIR:-./data}'
+    if ($composeTexto.Contains($marcadorDados)) {
+      [IO.File]::WriteAllText($composeFile, $composeTexto.Replace($marcadorDados, ('"' + ($pastaDados -replace '\\', '/').TrimEnd('/') + '"')), (New-Object Text.UTF8Encoding($false)))
+    }
+  }
+  if ($valorDados) {
+    $semDados = @($linhasEnv | Where-Object { $_ -match '\S' -and $_ -notmatch '^\s*FD_DATA_DIR\s*=' })
+    [IO.File]::WriteAllText($envFile, ($semDados -join "`r`n"), (New-Object Text.UTF8Encoding($false)))
+  }
+  Write-Host ('Pasta dos dados: ' + $pastaDados) -ForegroundColor Cyan
   $handler = @'
 async function handleUpload(req, res, key) {
   const declared = String(req.headers['x-fd-sha256'] || '').toLowerCase();
@@ -153,6 +187,7 @@ async function handleUpload(req, res, key) {
   }
   if (-not $ready) { throw 'O gateway corrigido nao confirmou a versao esperada.' }
   Write-Host ('Gateway ' + $version + ' ativo. Correcao instalada; retome os envios no FortesDrive.') -ForegroundColor Green
+  Write-Host ('Pasta dos dados usada pelo servidor: ' + $pastaDados) -ForegroundColor Green
   Write-Host 'Dados, configuracao e tunel preservados.' -ForegroundColor Green
   exit 0
 } catch {
