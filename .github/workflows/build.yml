@@ -14,6 +14,7 @@ jobs:
         with:
           node-version: 20
       - run: npm install
+      - run: node generate-icon.js
       - name: Test native transfers and updater
         run: node --test tests/native.test.cjs tests/native-streams.test.cjs tests/updater.test.cjs tests/badge-setup.test.cjs tests/packaging.test.cjs tests/server-package.test.cjs tests/setup-handoff.test.cjs tests/installer-folder.test.cjs tests/transfer-history.test.cjs tests/gateway-uploads.test.cjs tests/storage-folder.test.cjs
       - name: Build and test Explorer badges
@@ -57,7 +58,6 @@ jobs:
             "signed=false" >> $env:GITHUB_OUTPUT
             Write-Host "Sem credenciais de assinatura: o instalador será publicado sem assinatura digital."
           }
-      - run: node generate-icon.js
       - name: Build installer
         run: npx electron-builder --win nsis --publish never
       - name: Compute SHA-256
