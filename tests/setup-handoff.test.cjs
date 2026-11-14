@@ -52,6 +52,14 @@ test('falha de acesso preserva o pedido para nova tentativa', () => fixture(asyn
   await fs.access(filename);
 }));
 
+test('modo servidor e aplicado sem trocar a pasta existente', () => fixture(async filename => {
+  await fs.writeFile(filename, JSON.stringify({ machineRole: 'server' }));
+  let role;
+  const engine = { state: {}, watchFolder: 'raiz preservada', store: { set(key,value) { if(key==='machineRole') role=value; } }, async setWatchFolder() { throw new Error('Nao trocar a raiz'); } };
+  assert.equal(await applySetupConfiguration(engine, filename), true);
+  assert.equal(role, 'server'); assert.equal(engine.watchFolder, 'raiz preservada');
+}));
+
 test('o configurador abre o cliente e oferece um arquivo pela sincronizacao real', async () => {
   const setup = await fs.readFile(path.join(__dirname, '../server/setup-server.ps1'), 'utf8');
   assert.match(setup, /fortesdrive-setup\.json/);

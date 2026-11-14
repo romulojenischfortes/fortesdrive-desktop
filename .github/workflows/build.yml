@@ -15,7 +15,7 @@ jobs:
           node-version: 20
       - run: npm install
       - name: Test native transfers and updater
-        run: node --test tests/native.test.cjs tests/updater.test.cjs tests/badge-setup.test.cjs tests/packaging.test.cjs tests/server-package.test.cjs tests/setup-handoff.test.cjs
+        run: node --test tests/*.test.cjs
       - name: Build and test Explorer badges
         shell: cmd
         run: |
@@ -90,6 +90,9 @@ jobs:
           tag_name: v${{ steps.version.outputs.version }}
           name: FortesDrive Desktop ${{ steps.version.outputs.version }}
           body: |
+            Instalador unificado: escolha Cliente ou Servidor; o cliente nao instala dependencias do servidor.
+            Envio e download nativos em fluxo, ate 10 GiB por arquivo, sem copiar o conteudo inteiro para a memoria.
+            Reconciliacao indexada e checkpoints agrupados para pastas com milhares de arquivos.
             Sincronização recursiva de arquivos e subpastas, edição, renomeação, movimentos e exclusões bidirecionais.
             Marcas no Explorador do Windows: verde = na nuvem, relógio = pendente/alterado, cadeado = pasta protegida por senha aguardando desbloqueio, vermelho = erro.
             O instalador solicita permissão de administrador para registrar a extensão do Explorador.

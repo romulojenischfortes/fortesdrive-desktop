@@ -6,6 +6,7 @@ const Store = require("electron-store");
 const { SyncEngine } = require("./sync-engine");
 const { applySetupConfiguration } = require("./setup-handoff");
 const native = require("./native-files");
+const transfers = require("./native-transfers");
 const { DesktopUpdater } = require("./updater");
 // As marcas no Explorador são um recurso acessório (extensão registrada pelo
 // instalador). Se o módulo que cuida delas não estiver disponível, o aplicativo
@@ -132,7 +133,9 @@ function registerHandlers() {
     launchInstaller: () => updater.launchInstaller(),
     verifyUpdateSignature: () => updater.verifyUpdateSignature(),
     syncNow: () => { requestSync(); return true; },
-    snapshot: () => syncEngine.snapshot(),
+    snapshot: userId => syncEngine.snapshot(userId),
+    uploadFileStream: (relative, authorization, expected) => transfers.upload(syncEngine.watchFolder, relative, authorization, expected, (loaded, total) => mainWindow?.webContents.send("sync:transferProgress", { path: relative, direction: "upload", loaded, total })),
+    downloadFileStream: (relative, url, file, expected) => transfers.download(syncEngine.watchFolder, relative, url, file, expected, (loaded, total) => mainWindow?.webContents.send("sync:transferProgress", { path: relative, direction: "download", loaded, total })),
     publishSyncStatus: async payload => {
       try { await syncEngine.badges.publish(payload); syncEngine.state.badgeError = ""; }
       catch (error) { syncEngine.state.badgeError = error.message; }
@@ -140,7 +143,7 @@ function registerHandlers() {
     getManifest: userId => syncEngine.getManifest(userId),
     saveManifest: (userId, manifest) => syncEngine.saveManifest(userId, manifest),
     setState: async state => {
-      const allowed = ["syncing", "queue", "error", "lastSync", "userEmail", "online", "conflicts", "syncedCount", "skipped", "issues", "progress", "progressMode", "progressLabel"];
+      const allowed = ["syncing", "queue", "error", "lastSync", "userEmail", "online", "conflicts", "syncedCount", "skipped", "issues", "progress", "progressMode", "progressLabel", "localBytes", "localFiles", "cloudBytes", "cloudFiles", "pendingUploadBytes", "pendingUploadFiles"];
       for (const key of allowed) if (Object.hasOwn(state, key)) syncEngine.state[key] = state[key];
       applyWindowsProgress();
       // Atualiza o ícone do tray com base no estado

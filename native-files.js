@@ -2,7 +2,8 @@ const fs = require("fs/promises");
 const path = require("path");
 const crypto = require("crypto");
 const { createReadStream } = require("fs");
-const MAX_BYTES = 100 * 1024 * 1024;
+const MAX_BYTES = 100 * 1024 * 1024; // IPC legado: nunca carrega arquivos grandes na RAM.
+const MAX_SCAN_BYTES = 10 * 1024 * 1024 * 1024;
 
 async function checksum(file) {
   const hash = crypto.createHash("sha256");
@@ -38,16 +39,20 @@ async function safePath(root, relative, createParents = false) {
   }
   return current;
 }
-async function scan(root) {
+async function scan(root, baseline = {}) {
   if (cacheRoot !== root) { cacheRoot = root; checksums.clear(); }
+  for (const entry of Object.values(baseline)) {
+    if (entry.path && entry.ctimeMs != null && !checksums.has(entry.path)) checksums.set(entry.path, entry);
+  }
   const seen = new Set();
   const files = [], directories = [], skipped = [];
+  let totalBytes = 0, totalFiles = 0;
   async function visit(folder, prefix = "") {
     let entries;
     try { entries = await fs.readdir(folder, { withFileTypes: true }); }
     catch (e) { skipped.push({ path: prefix, reason: "Pasta não pôde ser lida: " + e.message }); return; }
     for (const entry of entries) {
-      if (entry.name === ".fortesdrive") continue;
+      if (entry.name === ".fortesdrive" || entry.name.startsWith(".fortesdrive-transfer-")) continue;
       if (entry.isSymbolicLink()) { skipped.push({ path: prefix + entry.name, reason: "Link simbólico não sincronizado" }); continue; }
       const relative = prefix + entry.name;
       let absolute;
@@ -60,18 +65,19 @@ async function scan(root) {
         const identity = `${stat.dev}:${stat.ino}`;
         if (stat.isDirectory()) { directories.push({ path: relative, identity }); await visit(absolute, relative + "/"); }
         else if (stat.isFile()) {
-          if (stat.size > MAX_BYTES) { skipped.push({ path: relative, reason: "Acima de 100 MB" }); continue; }
+          totalBytes += stat.size; totalFiles++;
+          if (stat.size > MAX_SCAN_BYTES) { skipped.push({ path: relative, size: stat.size, reason: "Acima do limite de 10 GiB por arquivo do servidor" }); continue; }
           seen.add(relative);
           let hash;
           try {
             const known = checksums.get(relative);
-            const reuse = known && known.size === stat.size && known.mtimeMs === stat.mtimeMs && known.identity === identity;
+            const reuse = known && known.size === stat.size && known.mtimeMs === stat.mtimeMs && known.ctimeMs === stat.ctimeMs && known.identity === identity;
             hash = reuse ? known.checksum : await checksum(absolute);
             const after = await fs.stat(absolute);
             if (stat.size !== after.size || stat.mtimeMs !== after.mtimeMs) { remember(root, relative, null); skipped.push({ path: relative, reason: "Arquivo em edição ou download" }); continue; }
-            remember(root, relative, { size: after.size, mtimeMs: after.mtimeMs, identity, checksum: hash });
+            remember(root, relative, { size: after.size, mtimeMs: after.mtimeMs, ctimeMs: after.ctimeMs, identity, checksum: hash });
           } catch (e) { skipped.push({ path: relative, reason: "Não foi possível ler: " + e.message }); continue; }
-          files.push({ path: relative, name: entry.name, size: stat.size, mtimeMs: stat.mtimeMs, checksum: hash, identity });
+          files.push({ path: relative, name: entry.name, size: stat.size, mtimeMs: stat.mtimeMs, ctimeMs: stat.ctimeMs, checksum: hash, identity });
         }
       } catch (e) { skipped.push({ path: relative, reason: e.message }); }
     }
@@ -79,7 +85,7 @@ async function scan(root) {
   await visit(root);
   // Arquivos que sumiram saem do cache: ele não cresce sem limite.
   for (const key of [...checksums.keys()]) if (!seen.has(key)) checksums.delete(key);
-  return { files, directories, skipped };
+  return { files, directories, skipped, totalBytes, totalFiles };
 }
 async function assertExpected(absolute, expected) {
   let stat;
@@ -132,4 +138,4 @@ async function move(root, from, to, expected) {
   remember(root, to, { size: saved.size, mtimeMs: saved.mtimeMs, identity: `${saved.dev}:${saved.ino}`, checksum: expected });
   return { size: saved.size, mtimeMs: saved.mtimeMs, identity: `${saved.dev}:${saved.ino}` };
 }
-module.exports = { safePath, scan, read, write, move, checksum, assertExpected, MAX_BYTES };
+module.exports = { safePath, scan, read, write, move, checksum, assertExpected, MAX_BYTES, MAX_SCAN_BYTES };

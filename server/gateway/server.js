@@ -37,11 +37,16 @@ const PORT = Number(process.env.PORT || 8790);
 const DATA_DIR = process.env.DATA_DIR || '/data';
 const SECRET = process.env.STORAGE_SIGNING_SECRET || '';
 const MAX_UPLOAD_BYTES = Number(process.env.MAX_UPLOAD_BYTES || 10737418240);
-const MAX_CONCURRENT_UPLOADS = Number(process.env.MAX_CONCURRENT_UPLOADS || 8);
+// Envio em lote: o cliente manda até 30 arquivos ao mesmo tempo. O gateway
+// aceita esses 30 e, se chegar mais, o arquivo espera a vez (acquireUploadSlot)
+// em vez de ser recusado — a fila nunca para no meio.
+const MAX_CONCURRENT_UPLOADS = Number(process.env.MAX_CONCURRENT_UPLOADS || 30);
 // Sincronização em lote faz muitas chamadas por minuto: o limite existe para
 // barrar abuso, não para atrapalhar o uso normal.
-const RATE_LIMIT_PER_MINUTE = Number(process.env.RATE_LIMIT_PER_MINUTE || 600);
-const VERSION = '2.0.0';
+const RATE_LIMIT_PER_MINUTE = Number(process.env.RATE_LIMIT_PER_MINUTE || 1800);
+// Tempo máximo que um arquivo espera por uma vaga antes de o cliente tentar de novo.
+const UPLOAD_SLOT_WAIT_MS = Number(process.env.UPLOAD_SLOT_WAIT_MS || 120000);
+const VERSION = '2.0.1';
 const STARTED_AT = Date.now();
 const MAX_SIGNATURE_LIFETIME_MS = 25 * 3600 * 1000;
 
@@ -209,24 +214,61 @@ function rateLimited(ip) {
   return false;
 }
 
+// Vaga para gravar: quem chega depois do limite espera na fila em vez de
+// receber erro. Só os bytes que estão sendo gravados de fato ocupam memória,
+// então o servidor não engasga com muitos arquivos ao mesmo tempo.
+const slotQueue = [];
+
+function acquireUploadSlot() {
+  if (activeUploads < MAX_CONCURRENT_UPLOADS) {
+    activeUploads += 1;
+    return Promise.resolve(true);
+  }
+  return new Promise((resolve) => {
+    const waiting = { resolve: null, timer: null };
+    waiting.resolve = (granted) => {
+      clearTimeout(waiting.timer);
+      resolve(granted);
+    };
+    waiting.timer = setTimeout(() => {
+      const index = slotQueue.indexOf(waiting);
+      if (index >= 0) slotQueue.splice(index, 1);
+      resolve(false);
+    }, UPLOAD_SLOT_WAIT_MS);
+    slotQueue.push(waiting);
+  });
+}
+
+function releaseUploadSlot() {
+  activeUploads = Math.max(0, activeUploads - 1);
+  const next = slotQueue.shift();
+  if (!next) return;
+  activeUploads += 1;
+  next.resolve(true);
+}
+
 async function handleUpload(req, res, key) {
+  // Grava cada bloco assim que chega, sem esperar juntar pacotes: o envio anda
+  // no ritmo do link em vez de esperar resposta em degraus.
+  req.socket?.setNoDelay?.(true);
   const declared = String(req.headers['x-fd-sha256'] || '').toLowerCase();
   const contentLength = Number(req.headers['content-length']);
 
   if (!/^[a-f0-9]{64}$/.test(declared)) {
     return sendJson(res, 422, { error: 'Informe o checksum SHA-256 em x-fd-sha256.' });
   }
-  if (!Number.isFinite(contentLength) || contentLength <= 0) {
+  if (req.headers['content-length'] == null || !Number.isSafeInteger(contentLength) || contentLength < 0) {
     return sendJson(res, 411, { error: 'Content-Length obrigatório.' });
   }
   if (contentLength > MAX_UPLOAD_BYTES) {
     return sendJson(res, 413, { error: 'Arquivo acima do limite configurado no servidor.' });
   }
-  if (activeUploads >= MAX_CONCURRENT_UPLOADS) {
-    return sendJson(res, 429, { error: 'Muitos envios ao mesmo tempo. Tente novamente em instantes.' });
+  // Todas as vagas ocupadas: o envio espera a vez (até dois minutos) em vez de
+  // ser recusado — a fila do cliente continua andando, sem engasgo.
+  if (!(await acquireUploadSlot())) {
+    return sendJson(res, 429, { error: 'O servidor está ocupado com outros envios. Tente novamente em instantes.' });
   }
 
-  activeUploads += 1;
   const tempPath = path.join(TMP_DIR, crypto.randomUUID() + '.part');
   const finalPath = objectPath(key);
 
@@ -235,7 +277,9 @@ async function handleUpload(req, res, key) {
 
     const hash = crypto.createHash('sha256');
     let written = 0;
-    const output = fs.createWriteStream(tempPath);
+    // Buffer maior na escrita: menos idas ao disco por arquivo, o que faz
+    // diferença quando vários arquivos sobem ao mesmo tempo.
+    const output = fs.createWriteStream(tempPath, { highWaterMark: 1024 * 1024 });
 
     await new Promise((resolve, reject) => {
       req.on('data', (chunk) => {
@@ -262,14 +306,17 @@ async function handleUpload(req, res, key) {
     console.error('[gateway] falha no envio de ' + key + ': ' + error.message);
     sendJson(res, 500, { error: error.message });
   } finally {
-    activeUploads -= 1;
+    // A vaga volta para a fila e o próximo arquivo começa na hora.
+    releaseUploadSlot();
     fsp.rm(tempPath, { force: true }).catch(() => {});
   }
 }
 
 function streamFile(filePath, res, options) {
   return new Promise((resolve) => {
-    const stream = fs.createReadStream(filePath, options);
+    // Blocos maiores por leitura: menos idas ao disco e mais dados em voo por
+    // conexão, o que faz diferença em links rápidos e túneis com latência.
+    const stream = fs.createReadStream(filePath, { highWaterMark: 1024 * 1024, ...options });
     stream.on('error', () => {
       if (!res.headersSent) sendJson(res, 500, { error: 'Falha ao ler o arquivo no disco.' });
       else res.destroy();
@@ -282,6 +329,9 @@ function streamFile(filePath, res, options) {
 
 async function handleDownload(req, res, key) {
   const finalPath = objectPath(key);
+  // Cada byte sai assim que chega: sem esperar juntar pacotes, o download mantém
+  // o ritmo do link em vez de andar em degraus.
+  req.socket?.setNoDelay?.(true);
 
   let stats;
   try {

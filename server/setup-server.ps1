@@ -41,7 +41,9 @@ $pacote = $PSScriptRoot
 # Pasta de trabalho do servidor: no Windows do dono isto resolve para
 # C:\Users\<seu usuario>\Desktop\storage-server — a mesma pasta usada por todas
 # as execuções, para reaproveitar dados, segredo e o endereço do túnel.
-$pasta = if ($Folder) { $Folder } else { Join-Path $env:USERPROFILE 'Desktop\storage-server' }
+$areaTrabalho = [Environment]::GetFolderPath('Desktop')
+if (-not $areaTrabalho) { $areaTrabalho = Join-Path $env:USERPROFILE 'Desktop' }
+$pasta = if ($Folder) { $Folder } else { Join-Path $areaTrabalho 'storage-server' }
 
 # Endereço do túnel deste servidor. Fica gravado em ngrok-domain.txt e é ele que
 # a subida automática usa ao ligar o Windows: ninguém digita o endereço de novo.
@@ -55,6 +57,35 @@ function Passo($texto) {
 function Gravar($caminho, $conteudo) {
   $utf8SemBom = New-Object System.Text.UTF8Encoding($false)
   [System.IO.File]::WriteAllText($caminho, $conteudo, $utf8SemBom)
+}
+
+# Janela do Windows para escolher uma pasta (com botao de criar pasta nova).
+# Quando a janela nao pode ser aberta, cai na digitacao do caminho — o
+# instalador nunca trava por causa disso.
+function Escolher-Pasta($titulo, $inicial) {
+  try {
+    Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+    $janela = New-Object System.Windows.Forms.Form
+    $janela.TopMost = $true
+    $janela.ShowInTaskbar = $false
+    $janela.WindowState = 'Minimized'
+    $janela.FormBorderStyle = 'None'
+    $dialogo = New-Object System.Windows.Forms.FolderBrowserDialog
+    $dialogo.Description = $titulo
+    $dialogo.ShowNewFolderButton = $true
+    if ($inicial -and (Test-Path -LiteralPath $inicial)) { $dialogo.SelectedPath = $inicial }
+    $escolha = $dialogo.ShowDialog($janela)
+    $escolhida = $dialogo.SelectedPath
+    $dialogo.Dispose()
+    $janela.Dispose()
+    if ($escolha -eq [System.Windows.Forms.DialogResult]::OK -and $escolhida) { return $escolhida.TrimEnd('\') }
+  } catch {
+    Write-Host ('[AVISO] A janela de pastas nao abriu: ' + $_.Exception.Message) -ForegroundColor Yellow
+  }
+  Write-Host $titulo
+  $digitada = Read-Host ('Caminho da pasta (Enter = ' + $inicial + ')')
+  if ($digitada) { return $digitada.Trim().Trim('"').TrimEnd('\') }
+  return $inicial
 }
 
 Write-Host ''
@@ -140,9 +171,22 @@ New-Item -ItemType Directory -Force $pasta | Out-Null
 New-Item -ItemType Directory -Force (Join-Path $pasta 'gateway') | Out-Null
 New-Item -ItemType Directory -Force (Join-Path $pasta 'data') | Out-Null
 New-Item -ItemType Directory -Force (Join-Path $pasta 'tmp') | Out-Null
-Gravar (Join-Path $pasta 'docker-compose.yml') (Get-Content -Raw -LiteralPath $origemCompose)
-Gravar (Join-Path $pasta 'gateway\server.js') (Get-Content -Raw -LiteralPath $origemGateway)
-Gravar (Join-Path $pasta 'gateway\Dockerfile') (Get-Content -Raw -LiteralPath $origemDockerfile)
+$composeAtual = Join-Path $pasta 'docker-compose.yml'
+$legado = (Test-Path $composeAtual) -and ((Get-Content -Raw -LiteralPath $composeAtual) -match '(?i)seaweedfs')
+if ($legado) {
+  # Migracao de binarios exige processo proprio: nunca troca o backend existente.
+  Write-Host 'Armazenamento existente preservado, sem migracao nem troca de volumes.' -ForegroundColor Green
+  $gatewayAtual = Join-Path $pasta 'gateway\server.js'
+  if (Test-Path $gatewayAtual) {
+    $textoGateway = [System.IO.File]::ReadAllText($gatewayAtual, [System.Text.Encoding]::UTF8)
+    $textoGateway = $textoGateway.Replace('contentLength <= 0', 'contentLength < 0')
+    Gravar $gatewayAtual $textoGateway
+  }
+} else {
+  Gravar $composeAtual ([System.IO.File]::ReadAllText($origemCompose, [System.Text.Encoding]::UTF8))
+  Gravar (Join-Path $pasta 'gateway\server.js') ([System.IO.File]::ReadAllText($origemGateway, [System.Text.Encoding]::UTF8))
+  Gravar (Join-Path $pasta 'gateway\Dockerfile') ([System.IO.File]::ReadAllText($origemDockerfile, [System.Text.Encoding]::UTF8))
+}
 Write-Host 'Arquivos gravados.' -ForegroundColor Green
 
 # ---------------------------------------------------------------------
@@ -165,7 +209,7 @@ function Ler-JsonUtf8($caminho) {
 $raiz = ''
 $configPendente = Join-Path (Split-Path $configClienteRaiz) 'fortesdrive-setup.json'
 $configLida = Ler-JsonUtf8 $configPendente
-if (-not $configLida) { $configLida = Ler-JsonUtf8 $configClienteRaiz }
+if (-not $configLida -or -not $configLida.watchFolder) { $configLida = Ler-JsonUtf8 $configClienteRaiz }
 if ($configLida -and $configLida.watchFolder) { $raiz = [string]$configLida.watchFolder }
 
 # Conserta a pasta que uma instalação anterior deixou com o nome do usuário
@@ -174,10 +218,13 @@ if ($raiz -match '^[A-Za-z]:\\Users\\[^\\]+') { $raiz = $raiz -replace '^[A-Za-z
 
 if (-not $raiz) { $raiz = $pastaPadrao }
 Write-Host ''
-Write-Host ('Pasta raiz neste computador: ' + $raiz) -ForegroundColor Cyan
-Write-Host 'Pressione Enter para manter, ou digite outro caminho (ex: D:\MeuDrive).'
-$respostaRaiz = Read-Host 'Pasta raiz (Enter = manter)'
-if ($respostaRaiz) { $raiz = $respostaRaiz.Trim().Trim('"').TrimEnd('\') }
+Write-Host ('Pasta de sincronizacao atual neste computador: ' + $raiz) -ForegroundColor Cyan
+# O usuario escolhe onde os arquivos ficam (janela de pastas do Windows). A
+# pasta e criada aqui, no perfil de quem esta instalando.
+if (-not $configLida -or -not $configLida.watchFolder) {
+  $escolhida = Escolher-Pasta 'Escolha a pasta onde seus arquivos serao salvos e sincronizados' $raiz
+  if ($escolhida) { $raiz = $escolhida }
+}
 
 # Caminho que não pode ser usado (usuário inexistente, disco removido) não
 # interrompe a instalação: cai na pasta padrão e segue.
@@ -194,7 +241,7 @@ Write-Host ('Pasta raiz definida: ' + $raiz) -ForegroundColor Green
 # O cliente aplica a raiz em memoria e reinicia o monitoramento, mesmo se ja
 # estiver na bandeja. O pedido so e removido depois de aplicado com sucesso.
 New-Item -ItemType Directory -Force (Split-Path $configPendente) | Out-Null
-Gravar $configPendente (@{ watchFolder = $raiz } | ConvertTo-Json -Compress)
+Gravar $configPendente (@{ watchFolder = $raiz; machineRole = 'server' } | ConvertTo-Json -Compress)
 Write-Host 'Pasta entregue ao cliente de sincronizacao.' -ForegroundColor Green
 
 # Os arquivos ficam no MESMO DISCO escolhido, em uma pasta propria — nunca
@@ -229,8 +276,10 @@ if ($atual -and $atual.Length -ge 16) {
 # A pasta de dados do servidor fica registrada no .env, e ela que o Docker monta
 # (variavel FD_DATA_DIR do docker-compose.yml). Pode ser trocada a mao, no
 # proprio .env, por qualquer caminho — inclusive outro disco.
-$linhasEnv = @(Get-Content -LiteralPath $envFile | Where-Object { $_ -match '\S' -and $_ -notmatch '^\s*FD_DATA_DIR\s*=' })
-Gravar $envFile ((@('FD_DATA_DIR=' + $pastaDados) + $linhasEnv) -join "`r`n")
+$dadosExistentes = ($linhas | Where-Object { $_ -match '^\s*FD_DATA_DIR\s*=\s*\S' } | ForEach-Object { ($_ -split '=', 2)[1].Trim() } | Select-Object -First 1)
+if ($dadosExistentes) { $pastaDados = $dadosExistentes }
+$linhasEnv = @(Get-Content -LiteralPath $envFile | Where-Object { $_ -match '\S' -and $_ -notmatch '^\s*(FD_DATA_DIR|MAX_CONCURRENT_UPLOADS|RATE_LIMIT_PER_MINUTE)\s*=' })
+Gravar $envFile ((@('FD_DATA_DIR=' + $pastaDados, 'MAX_CONCURRENT_UPLOADS=30', 'RATE_LIMIT_PER_MINUTE=1800') + $linhasEnv) -join "`r`n")
 Write-Host ('Pasta dos dados do armazenamento: ' + $pastaDados) -ForegroundColor Green
 
 # ---------------------------------------------------------------------
@@ -277,8 +326,7 @@ if ($encerrados -gt 0) {
 }
 
 Push-Location $pasta
-docker compose up -d --build
-$subiu = ($LASTEXITCODE -eq 0)
+$subiu = ((Invoke-DockerSilencioso compose up -d --build) -eq 0)
 Pop-Location
 
 # Se a porta estava presa por algo que so apareceu agora, libera de novo e

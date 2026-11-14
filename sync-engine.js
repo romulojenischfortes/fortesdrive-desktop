@@ -30,7 +30,7 @@ class SyncEngine {
     await this.badges.start(this.watchFolder).catch(error => { this.state.badgeError = error.message; });
     this.state.running = true;
     this.watcher = chokidar.watch(this.watchFolder, {
-      ignored: /(^|[/\\])\.fortesdrive([/\\]|$)/,
+      ignored: /(^|[/\\])(?:\.fortesdrive([/\\]|$)|\.fortesdrive-transfer-)/,
       ignoreInitial: true, followSymlinks: false,
       awaitWriteFinish: { stabilityThreshold: 1000, pollInterval: 200 },
     });
@@ -39,7 +39,7 @@ class SyncEngine {
       clearTimeout(this.debounce);
       this.debounce = setTimeout(() => this.notify(), 800);
     }).on("error", error => { this.state.error = error.message; });
-    this.timer = setInterval(() => this.notify(), 10000);
+    this.timer = setInterval(() => this.notify(), 60000);
     this.notify();
   }
   async stop() {
@@ -47,7 +47,7 @@ class SyncEngine {
     clearInterval(this.timer); clearTimeout(this.debounce);
     await this.watcher?.close();
   }
-  getStatus() { return { ...this.state, watchFolder: this.watchFolder, deviceId: this.deviceId }; }
+  getStatus() { return { ...this.state, machineRole: this.store.get("machineRole", "client"), nativeStreaming: true, watchFolder: this.watchFolder, deviceId: this.deviceId }; }
   manifestKey(userId) {
     if (typeof userId !== "string" || !userId || userId.length > 100 || !this.watchFolder) throw new Error("Conta e pasta são obrigatórias");
     return "manifest_" + crypto.createHash("sha256").update(userId + "\0" + this.watchFolder).digest("hex");
@@ -61,9 +61,9 @@ class SyncEngine {
     return this.store.get(key, { files: {}, folders: {}, pending: {} });
   }
   saveManifest(userId, manifest) { this.store.set(this.manifestKey(userId), manifest); }
-  async snapshot() {
+  async snapshot(userId) {
     if (!this.watchFolder) throw new Error("Escolha a pasta raiz primeiro");
-    return native.scan(this.watchFolder);
+    return native.scan(this.watchFolder, userId ? this.getManifest(userId).files : {});
   }
 }
 module.exports = { SyncEngine };

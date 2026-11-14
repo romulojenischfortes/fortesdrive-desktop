@@ -2,6 +2,7 @@ const { contextBridge, ipcRenderer } = require("electron");
 const channels = {
   selectFolder: "selectFolder", getStatus: "getStatus", syncNow: "syncNow",
   snapshot: "snapshot", readFile: "readFile", writeFile: "writeFile",
+  uploadFileStream: "uploadFileStream", downloadFileStream: "downloadFileStream",
   moveFile: "moveFile", trashFile: "trashFile", mkdir: "mkdir", rmdir: "rmdir",
   getManifest: "getManifest", saveManifest: "saveManifest", setState: "setState",
   notify: "notify", publishSyncStatus: "publishSyncStatus",
@@ -14,6 +15,11 @@ const api = { isDesktop: true };
 for (const [method, channel] of Object.entries(channels)) {
   api[method] = (...args) => ipcRenderer.invoke("sync:" + channel, ...args);
 }
+api.onTransferProgress = listener => {
+  const callback = (event, progress) => listener(progress);
+  ipcRenderer.on("sync:transferProgress", callback);
+  return () => ipcRenderer.removeListener("sync:transferProgress", callback);
+};
 api.onSyncRequested = (listener) => {
   const callback = () => listener();
   ipcRenderer.on("sync:requested", callback);

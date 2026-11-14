@@ -40,7 +40,7 @@ test('arquivo acima do limite não interrompe os demais arquivos', async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'fortesdrive-'));
   try {
     const large = await fs.open(path.join(root, 'grande.bin'), 'w');
-    await large.truncate(native.MAX_BYTES + 1); await large.close();
+    await large.truncate(native.MAX_SCAN_BYTES + 1); await large.close();
     await fs.writeFile(path.join(root, 'ok.txt'), 'ok');
     const scan = await native.scan(root);
     assert.equal(scan.files[0].path, 'ok.txt'); assert.equal(scan.skipped[0].path, 'grande.bin');

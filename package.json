@@ -1,7 +1,7 @@
 {
   "name": "fortesdrive-desktop",
-  "version": "1.4.16",
-  "description": "FortesDrive Desktop Client — sincronização local com a nuvem",
+  "version": "1.5.0",
+  "description": "FortesDrive Desktop — instalador unificado cliente e servidor, sincronizacao nativa em fluxo",
   "author": "FortesDrive",
   "license": "MIT",
   "main": "main.js",
@@ -29,6 +29,7 @@
       "sync-engine.js",
       "setup-handoff.js",
       "native-files.js",
+      "native-transfers.js",
       "shell-status.js",
       "updater.js",
       "badge-setup.js",
@@ -36,7 +37,8 @@
       "node_modules/**/*"
     ],
     "extraResources": [
-      { "from": "shell/FortesDriveOverlays.dll", "to": "shell/FortesDriveOverlays.dll" }
+      { "from": "shell/FortesDriveOverlays.dll", "to": "shell/FortesDriveOverlays.dll" },
+      { "from": "server", "to": "server" }
     ],
     "win": {
       "target": [

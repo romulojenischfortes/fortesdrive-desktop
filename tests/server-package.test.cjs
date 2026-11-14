@@ -19,18 +19,12 @@ const SERVER_PAYLOAD = [
   "server/setup-server.ps1",
 ];
 
-test("o instalador do cliente nao leva Docker, ngrok nem servidor", () => {
-  const resources = pkg.build?.extraResources ?? [];
-  assert.equal(
-    resources.some((entry) => String(entry.to ?? "") === "server"),
-    false,
-    "a pasta server nao deve ser publicada junto do cliente"
-  );
-  const include = read("build/overlays.nsh");
-  assert.doesNotMatch(include, /setup-server\.ps1/, "o cliente nao abre o assistente do servidor");
-  assert.doesNotMatch(include, /schtasks/i, "o cliente nao registra tarefas do servidor");
-  assert.doesNotMatch(include, /docker/i, "Docker nao e instalado com o cliente");
-  assert.doesNotMatch(include, /ngrok/i, "o tunel pertence ao servidor, nao ao cliente");
+test("o instalador unificado inclui servidor mas so configura no modo servidor", () => {
+  assert.ok(pkg.build.extraResources.some(entry => entry.to === 'server'));
+  const include = read('build/overlays.nsh');
+  assert.match(include, /FortesRolePageCreate/);
+  assert.match(include, /\$FortesMachineRole.*==.*"server"[\s\S]*setup-server\.ps1/);
+  assert.match(include, /IfNot.*Silent/);
 });
 
 test("o cliente instala o aplicativo e as marcas do Explorador", () => {
