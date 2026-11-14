@@ -176,12 +176,10 @@ $legado = (Test-Path $composeAtual) -and ((Get-Content -Raw -LiteralPath $compos
 if ($legado) {
   # Migracao de binarios exige processo proprio: nunca troca o backend existente.
   Write-Host 'Armazenamento existente preservado, sem migracao nem troca de volumes.' -ForegroundColor Green
-  $gatewayAtual = Join-Path $pasta 'gateway\server.js'
-  if (Test-Path $gatewayAtual) {
-    $textoGateway = [System.IO.File]::ReadAllText($gatewayAtual, [System.Text.Encoding]::UTF8)
-    $textoGateway = $textoGateway.Replace('contentLength <= 0', 'contentLength < 0')
-    Gravar $gatewayAtual $textoGateway
-  }
+  $reparoUpload = Join-Path $pacote 'repair-uploads.bat'
+  if (-not (Test-Path -LiteralPath $reparoUpload)) { throw 'Pacote de correcao de upload ausente. O armazenamento existente foi preservado.' }
+  & $reparoUpload $pasta 'patch-only'
+  if ($LASTEXITCODE -ne 0) { throw 'Nao foi possivel atualizar os uploads do servidor existente. Os dados foram preservados.' }
 } else {
   Gravar $composeAtual ([System.IO.File]::ReadAllText($origemCompose, [System.Text.Encoding]::UTF8))
   Gravar (Join-Path $pasta 'gateway\server.js') ([System.IO.File]::ReadAllText($origemGateway, [System.Text.Encoding]::UTF8))

@@ -46,7 +46,7 @@ const MAX_CONCURRENT_UPLOADS = Number(process.env.MAX_CONCURRENT_UPLOADS || 30);
 const RATE_LIMIT_PER_MINUTE = Number(process.env.RATE_LIMIT_PER_MINUTE || 1800);
 // Tempo máximo que um arquivo espera por uma vaga antes de o cliente tentar de novo.
 const UPLOAD_SLOT_WAIT_MS = Number(process.env.UPLOAD_SLOT_WAIT_MS || 120000);
-const VERSION = '2.0.1';
+const VERSION = '2.0.2';
 const STARTED_AT = Date.now();
 const MAX_SIGNATURE_LIFETIME_MS = 25 * 3600 * 1000;
 
@@ -248,67 +248,65 @@ function releaseUploadSlot() {
 }
 
 async function handleUpload(req, res, key) {
-  // Grava cada bloco assim que chega, sem esperar juntar pacotes: o envio anda
-  // no ritmo do link em vez de esperar resposta em degraus.
-  req.socket?.setNoDelay?.(true);
   const declared = String(req.headers['x-fd-sha256'] || '').toLowerCase();
-  const contentLength = Number(req.headers['content-length']);
+  const lengthHeader = req.headers['content-length'];
+  const contentLength = lengthHeader == null ? null : Number(lengthHeader);
 
   if (!/^[a-f0-9]{64}$/.test(declared)) {
     return sendJson(res, 422, { error: 'Informe o checksum SHA-256 em x-fd-sha256.' });
   }
-  if (req.headers['content-length'] == null || !Number.isSafeInteger(contentLength) || contentLength < 0) {
-    return sendJson(res, 411, { error: 'Content-Length obrigatório.' });
+  if (contentLength !== null && (!/^\d+$/.test(String(lengthHeader)) || !Number.isSafeInteger(contentLength))) {
+    return sendJson(res, 400, { error: 'Tamanho informado inválido.' });
   }
-  if (contentLength > MAX_UPLOAD_BYTES) {
+  if (contentLength !== null && contentLength > MAX_UPLOAD_BYTES) {
     return sendJson(res, 413, { error: 'Arquivo acima do limite configurado no servidor.' });
   }
-  // Todas as vagas ocupadas: o envio espera a vez (até dois minutos) em vez de
-  // ser recusado — a fila do cliente continua andando, sem engasgo.
+  req.socket?.setNoDelay?.(true);
   if (!(await acquireUploadSlot())) {
     return sendJson(res, 429, { error: 'O servidor está ocupado com outros envios. Tente novamente em instantes.' });
   }
 
   const tempPath = path.join(TMP_DIR, crypto.randomUUID() + '.part');
-  const finalPath = objectPath(key);
-
   try {
-    await fsp.mkdir(path.dirname(finalPath), { recursive: true });
-
+    const finalPath = typeof uploadToFiler === 'function' ? null : objectPath(key);
+    if (finalPath) await fsp.mkdir(path.dirname(finalPath), { recursive: true });
     const hash = crypto.createHash('sha256');
     let written = 0;
-    // Buffer maior na escrita: menos idas ao disco por arquivo, o que faz
-    // diferença quando vários arquivos sobem ao mesmo tempo.
-    const output = fs.createWriteStream(tempPath, { highWaterMark: 1024 * 1024 });
-
-    await new Promise((resolve, reject) => {
-      req.on('data', (chunk) => {
-        hash.update(chunk);
+    const output = fs.createWriteStream(tempPath, { flags: 'wx', highWaterMark: 1024 * 1024 });
+    const { pipeline } = require('node:stream/promises');
+    // Túneis podem entregar o corpo em chunks, sem Content-Length. Contamos
+    // os bytes em fluxo e mantemos o limite e o SHA-256, inclusive para vazios.
+    const input = (async function* () {
+      for await (const chunk of req.iterator({ destroyOnReturn: false })) {
         written += chunk.length;
-      });
-      req.on('error', reject);
-      output.on('error', reject);
-      output.on('finish', resolve);
-      req.pipe(output);
-    });
-
+        if (written > MAX_UPLOAD_BYTES) {
+          throw Object.assign(new Error('Arquivo acima do limite configurado no servidor.'), { status: 413 });
+        }
+        if (contentLength !== null && written > contentLength) {
+          throw Object.assign(new Error('O conteúdo recebido não corresponde ao tamanho informado.'), { status: 422 });
+        }
+        hash.update(chunk);
+        yield chunk;
+      }
+    })();
+    await pipeline(input, output);
     const digest = hash.digest('hex');
-    if (written !== contentLength) {
-      throw new Error('O conteúdo recebido não corresponde ao tamanho informado.');
+    if (contentLength !== null && written !== contentLength) {
+      throw Object.assign(new Error('O conteúdo recebido não corresponde ao tamanho informado.'), { status: 422 });
     }
     if (digest !== declared) {
-      throw new Error('Checksum divergente: o arquivo chegou corrompido e não foi gravado.');
+      throw Object.assign(new Error('Checksum divergente: o arquivo chegou corrompido e não foi gravado.'), { status: 422 });
     }
-
-    await fsp.rename(tempPath, finalPath);
+    if (finalPath) await fsp.rename(tempPath, finalPath);
+    else await uploadToFiler(key, tempPath, written, req.headers['content-type']);
     sendJson(res, 200, { ok: true, key, size: written, checksum: digest });
   } catch (error) {
+    if (!req.destroyed) req.resume();
     console.error('[gateway] falha no envio de ' + key + ': ' + error.message);
-    sendJson(res, 500, { error: error.message });
+    if (!res.destroyed) sendJson(res, error.status || (typeof uploadToFiler === 'function' ? 502 : 500), { error: error.message });
   } finally {
-    // A vaga volta para a fila e o próximo arquivo começa na hora.
     releaseUploadSlot();
-    fsp.rm(tempPath, { force: true }).catch(() => {});
+    await fsp.rm(tempPath, { force: true });
   }
 }
 

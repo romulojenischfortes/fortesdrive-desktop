@@ -16,6 +16,7 @@ const SERVER_PAYLOAD = [
   "server/docker-compose.yml",
   "server/gateway/server.js",
   "server/gateway/Dockerfile",
+  "server/repair-uploads.bat",
   "server/setup-server.ps1",
 ];
 
