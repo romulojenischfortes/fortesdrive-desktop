@@ -11,7 +11,7 @@ class ShellStatus {
   constructor() { this.entries = new Map(); this.lastWritten = ''; this.writes = Promise.resolve(); }
   async start(root) {
     if (process.platform !== 'win32') return;
-    clearTimeout(this.timer);
+    clearTimeout(this.timer); clearTimeout(this.confirmTimer); this.confirmTimer = null;
     await this.writes.catch(() => {});
     this.root = root;
     this.entries.clear(); this.lastWritten = '';
@@ -41,15 +41,18 @@ class ShellStatus {
       }
     }
     this.entries = next;
-    clearTimeout(this.timer);
+    clearTimeout(this.timer); clearTimeout(this.confirmTimer); this.confirmTimer = null;
     await this.flush();
   }
   async confirm(relative, signature) {
     if (!this.root || process.platform !== 'win32') return;
-    const entries = [...this.entries.values()].filter(entry => entry.path !== relative);
-    entries.push({ path: relative, state: 'synced', size: signature.size, mtimeMs: signature.mtimeMs });
-    // Outros arquivos continuam pendentes ate a propria confirmacao.
-    await this.publish({ entries, state: 'synced' });
+    this.entries.set(relative, { path: relative, state: 'synced', size: signature.size, mtimeMs: signature.mtimeMs });
+    // Agrupa conclusoes simultaneas: uma atualizacao do Explorador por lote,
+    // sem gravar a lista inteira nem abrir um processo para cada arquivo.
+    if (!this.confirmTimer) this.confirmTimer = setTimeout(() => {
+      this.confirmTimer = null;
+      this.flush().catch(error => console.error('FortesDrive status:', error.message));
+    }, 200);
   }
   dirty(absolute) {
     if (!this.root || process.platform !== 'win32') return;
