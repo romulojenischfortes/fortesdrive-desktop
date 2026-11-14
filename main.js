@@ -3,6 +3,7 @@ const path = require("path");
 const fs = require("fs/promises");
 const { SyncEngine } = require("./sync-engine");
 const { applySetupConfiguration } = require("./setup-handoff");
+const { TransferHistory } = require("./transfer-history");
 const native = require("./native-files");
 const transfers = require("./native-transfers");
 const { DesktopUpdater } = require("./updater");
@@ -18,18 +19,31 @@ try {
   badgeSetup = { readBadgeSetup: unavailable, repairBadges: unavailable };
 }
 const WEB_APP_URL = process.env.NODE_ENV === "development" ? "http://localhost:5173" : "https://fortesdrive.base44.app";
-let mainWindow, tray, syncEngine, updater;
+let mainWindow, tray, syncEngine, updater, transferHistory;
 let lastOnlineState = null;
+if (process.platform === "win32") app.setAppUserModelId("com.fortesdrive.desktop");
+const notificationQueue = [];
+const visibleNotifications = new Set();
+let notificationTimer = null;
 
 // --- Notificações nativas do sistema operacional ---
-function notify(title, body, urgency) {
-  try {
-    if (Notification.isSupported()) {
-      const n = new Notification({ title, body, silent: false, urgency: urgency || "normal" });
-      n.on("click", () => { mainWindow?.show(); mainWindow?.focus(); });
+function notify(title, body, urgency, onClick) {
+  if (!Notification.isSupported()) return;
+  notificationQueue.push({ title, body, urgency, onClick });
+  if (notificationTimer) return;
+  const showNext = () => {
+    const item = notificationQueue.shift();
+    if (!item) { notificationTimer = null; return; }
+    try {
+      const n = new Notification({ title: item.title, body: item.body, silent: false, urgency: item.urgency || "normal", icon: path.join(__dirname, "build", "icon.png") });
+      visibleNotifications.add(n);
+      n.on("close", () => visibleNotifications.delete(n));
+      n.on("click", () => { mainWindow?.show(); mainWindow?.focus(); item.onClick?.(); });
       n.show();
-    }
-  } catch (e) { /* notificações podem não estar disponíveis */ }
+    } catch (error) { console.warn("Notificação indisponível:", error.message); }
+    notificationTimer = setTimeout(showNext, 2500);
+  };
+  showNext();
 }
 
 // --- Ícones de estado do tray (gerados em memória, sem arquivos externos) ---
@@ -115,9 +129,55 @@ async function selectFolder() {
   await syncEngine.setWatchFolder(result.filePaths[0]);
   return syncEngine.watchFolder;
 }
+
+// Onde a pasta dos documentos da nuvem vai ser criada. Devolve só o local
+// escolhido, sem configurar nada: o aplicativo mostra o caminho completo
+// (local + nome da pasta) antes de o usuário confirmar.
+async function chooseFolderParent() {
+  const result = await dialog.showOpenDialog(mainWindow, {
+    properties: ["openDirectory", "createDirectory"],
+    title: "Escolha onde criar a pasta dos documentos da nuvem",
+    defaultPath: syncEngine.watchFolder ? path.dirname(syncEngine.watchFolder) : app.getPath("documents"),
+  });
+  if (result.canceled) return null;
+  return result.filePaths[0];
+}
+
+// Cria (ou reaproveita) a pasta escolhida — local + nome — e passa a sincronizar
+// nela. É o mesmo caminho na primeira configuração e na troca posterior; a pasta
+// anterior continua intacta no computador.
+async function useFolder(parent, name) {
+  const clean = String(name || "").trim();
+  if (!clean || clean.length > 120) throw new Error("Informe o nome da pasta.");
+  if (/[<>:"/\\|?*\u0000-\u001f]/.test(clean) || /[. ]$/.test(clean) || /^(con|prn|aux|nul|com\d|lpt\d)$/i.test(clean)) {
+    throw new Error('Nome de pasta inválido. Não use < > : " / \\ | ? * e não termine com ponto.');
+  }
+  if (typeof parent !== "string" || !parent.trim()) throw new Error("Escolha onde a pasta será criada.");
+  const target = path.join(parent, clean);
+  await fs.mkdir(target, { recursive: true });
+  await syncEngine.setWatchFolder(target);
+  return syncEngine.getStatus();
+}
+// Abre o assistente de pasta dentro do próprio cliente: mostra a janela na
+// tela de configuração e pede ao aplicativo que abra o diálogo (local + nome).
+// Vem da bandeja do sistema e também do primeiro passo depois de instalar.
+function openFolderSetup() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  mainWindow.show();
+  mainWindow.focus();
+  const ask = () => {
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send("sync:openFolderSetup");
+  };
+  if (mainWindow.webContents.getURL().includes("/desktop")) { ask(); return; }
+  mainWindow.webContents.once("did-finish-load", ask);
+  mainWindow.loadURL(WEB_APP_URL + "/desktop");
+}
+
 function registerHandlers() {
   const handlers = {
     selectFolder: selectFolder,
+    chooseFolderParent: chooseFolderParent,
+    useFolder: useFolder,
     // badgeStates informa ao aplicativo web quais marcas do Explorador este
     // instalador sabe desenhar, para recursos novos (cadeado) não quebrarem
     // clientes antigos que ainda não foram atualizados.
@@ -143,8 +203,34 @@ function registerHandlers() {
     },
     getManifest: userId => syncEngine.getManifest(userId),
     saveManifest: (userId, manifest) => syncEngine.saveManifest(userId, manifest),
+    recordTransferCompletion: async (userId, event) => {
+      const result = await transferHistory.add(userId, event);
+      if (result.added) {
+        const item = result.item;
+        const absolute = await native.safePath(syncEngine.watchFolder, item.path);
+        const stat = await fs.stat(absolute);
+        await syncEngine.badges.confirm(item.path, { size: event.size, mtimeMs: event.mtimeMs ?? stat.mtimeMs }).catch(error => { syncEngine.state.badgeError = error.message; });
+        notify(item.direction === "download" ? "FortesDrive — Download concluído" : "FortesDrive — Arquivo sincronizado", item.path, "normal", () => shell.showItemInFolder(absolute));
+        mainWindow?.webContents.send("sync:transferCompleted");
+      }
+      return true;
+    },
+    getTransferHistory: (userId, options) => transferHistory.query(userId, options),
+    revealTransferHistoryItem: async (userId, id) => {
+      const item = await transferHistory.find(userId, id);
+      const absolute = await native.safePath(syncEngine.watchFolder, item.path);
+      await fs.access(absolute);
+      shell.showItemInFolder(absolute);
+    },
+    exportTransferHistory: async (userId, options) => {
+      const result = await transferHistory.csv(userId, options);
+      const choice = await dialog.showSaveDialog(mainWindow, { title: "Salvar histórico de arquivos", defaultPath: "FortesDrive-historico.csv", filters: [{ name: "Planilha CSV", extensions: ["csv"] }] });
+      if (choice.canceled) return { saved: false };
+      await fs.writeFile(choice.filePath, result.content, "utf8");
+      return { saved: true, count: result.count };
+    },
     setState: async state => {
-      const allowed = ["syncing", "queue", "error", "lastSync", "userEmail", "online", "conflicts", "syncedCount", "skipped", "issues", "progress", "progressMode", "progressLabel", "localBytes", "localFiles", "cloudBytes", "cloudFiles", "pendingUploadBytes", "pendingUploadFiles"];
+      const allowed = ["syncing", "queue", "error", "lastSync", "userEmail", "online", "conflicts", "syncedCount", "skipped", "issues", "progress", "progressMode", "progressLabel", "localBytes", "localFiles", "cloudBytes", "cloudFiles", "pendingUploadBytes", "pendingUploadFiles", "historyError"];
       for (const key of allowed) if (Object.hasOwn(state, key)) syncEngine.state[key] = state[key];
       applyWindowsProgress();
       // Atualiza o ícone do tray com base no estado
@@ -193,7 +279,8 @@ async function createTray() {
   tray.setToolTip("FortesDrive");
   tray.setContextMenu(Menu.buildFromTemplate([
     { label: "Abrir FortesDrive", click: () => mainWindow.show() },
-    { label: "Escolher diretório raiz", click: () => selectFolder().catch(error => dialog.showErrorBox("FortesDrive", error.message)) },
+    { label: "Histórico de arquivos", click: () => { mainWindow.show(); mainWindow.focus(); mainWindow.loadURL(WEB_APP_URL + "/desktop#desktop-transfer-history"); } },
+    { label: "Pasta dos documentos da nuvem", click: openFolderSetup },
     { label: "Sincronizar agora", click: requestSync },
     { label: "Verificar atualizações", click: () => { mainWindow.show(); updater.check().catch(error => dialog.showErrorBox("FortesDrive", error.message)); } },
     { label: "Iniciar com o Windows", type: "checkbox", checked: app.getLoginItemSettings().openAtLogin, click: item => app.setLoginItemSettings({ openAtLogin: item.checked }) },
@@ -221,6 +308,7 @@ async function createTray() {
 app.whenReady().then(async () => {
   // Primeiro aplica a escolha feita no instalador, sem criar uma pasta padrao.
   syncEngine = new SyncEngine(requestSync);
+  transferHistory = new TransferHistory(app.getPath("userData"), syncEngine);
   await refreshSetupConfiguration();
   // Se outro perfil do Windows abrir o app, exige a propria escolha nativa
   // antes da janela web, do login e de qualquer transferencia.

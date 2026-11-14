@@ -44,6 +44,13 @@ class ShellStatus {
     clearTimeout(this.timer);
     await this.flush();
   }
+  async confirm(relative, signature) {
+    if (!this.root || process.platform !== 'win32') return;
+    const entries = [...this.entries.values()].filter(entry => entry.path !== relative);
+    entries.push({ path: relative, state: 'synced', size: signature.size, mtimeMs: signature.mtimeMs });
+    // Outros arquivos continuam pendentes ate a propria confirmacao.
+    await this.publish({ entries, state: 'synced' });
+  }
   dirty(absolute) {
     if (!this.root || process.platform !== 'win32') return;
     const relative = path.relative(this.root, absolute).split(path.sep).join('/');

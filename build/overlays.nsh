@@ -22,10 +22,14 @@
   !macro customPageAfterChangeDir
     Page custom FortesRolePageCreate FortesRolePageLeave
     Page custom FortesSyncPageCreate FortesSyncPageLeave
+    ; Aqui o electron-builder ja adicionou os plugins NSIS (StdUtils/nsDialogs).
+    !insertmacro FortesInstallerPageFunctions
   !macroend
 !endif
 
 !ifndef BUILD_UNINSTALLER
+; Nao compilar funcoes durante o include: StdUtils ainda nao foi carregado.
+!macro FortesInstallerPageFunctions
 ; Primeira pergunta do instalador: este computador e o servidor (onde ficam os
 ; arquivos da nuvem) ou um cliente (ramal/instancia)? No servidor nada e
 ; alterado — a pasta e o armazenamento que ja existem continuam iguais. No
@@ -142,6 +146,15 @@ Function FortesSyncPageLeave
   ${EndIf}
   Delete "$R1"
 FunctionEnd
+!macroend
+!macro customInit
+  ; Primeira instalacao silenciosa nao pode ignorar a escolha obrigatoria.
+  ${If} ${Silent}
+  ${AndIfNot} ${isUpdated}
+    SetErrorLevel 2
+    Quit
+  ${EndIf}
+!macroend
 !endif
 
 ; Entrega a escolha ao cliente usando somente o Windows/NSIS, sem PowerShell.

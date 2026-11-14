@@ -30,6 +30,9 @@ test('a pagina do cliente nao e ocultada por uma configuracao antiga nem preench
   const source = await fs.readFile(path.join(__dirname, '../build/overlays.nsh'), 'utf8');
   const page = source.slice(source.indexOf('Function FortesSyncPageCreate'), source.indexOf('Function FortesSyncBrowse'));
   assert.match(source, /Page custom FortesSyncPageCreate FortesSyncPageLeave/);
+  assert.match(source, /!macro FortesInstallerPageFunctions[\s\S]*Function FortesRolePageCreate[\s\S]*!macroend/);
+  assert.match(source, /!insertmacro FortesInstallerPageFunctions/);
+  assert.match(source, /!macro customInit[\s\S]*SetErrorLevel 2/);
   assert.doesNotMatch(page, /fortesdrive-native-v2\.json|StrCpy \$FortesSyncDir/);
   assert.match(page, /isUpdated/);
   assert.match(page, /\$FortesMachineRole.*==.*"server"/);
