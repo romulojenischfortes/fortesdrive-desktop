@@ -61,8 +61,14 @@ test('o reparo executa de verdade com pasta padrão, acentos, colchetes e volume
       const data = kind === 'default' ? path.join(folder, 'data') : path.join(folder, 'dados Rômulo [1]');
       fs.mkdirSync(data, { recursive: true });
       fs.writeFileSync(path.join(data, 'preservado.txt'), 'nao apagar');
-      const mount = kind === 'broken-compose' ? `"${data.replaceAll('\\', '/')}"` : '${FD_DATA_DIR:-./data}';
-      fs.writeFileSync(path.join(folder, 'docker-compose.yml'), compose.replace('${FD_DATA_DIR:-./data}', mount));
+      // A pasta de dados é a do serviço do gateway (o redis monta uma pasta que
+      // também se chama /data, dentro da mesma raiz): o volume malformado é
+      // aplicado só na linha do gateway.
+      const gateway = /^([ \t]*-[ \t]+)\$\{FD_DATA_DIR:-\.\/data\}(:\/data[ \t]*)$/m;
+      const composeComVolume = kind === 'broken-compose'
+        ? compose.replace(gateway, (linha, inicio, fim) => `${inicio}"${data.replaceAll('\\', '/')}"${fim}`)
+        : compose;
+      fs.writeFileSync(path.join(folder, 'docker-compose.yml'), composeComVolume);
       fs.writeFileSync(path.join(folder, '.env'), `STORAGE_SIGNING_SECRET=${secret}\n${kind === 'external-env' ? `FD_DATA_DIR=${data}\n` : ''}`);
       for (let repeat = 0; repeat < 2; repeat++) runPowerShell(`$ErrorActionPreference='Stop'; $folder=$env:FD_TEST_FOLDER; ${block}`, folder);
       assert.equal(fs.readFileSync(path.join(data, 'preservado.txt'), 'utf8'), 'nao apagar');

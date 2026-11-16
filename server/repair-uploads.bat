@@ -77,8 +77,17 @@ try {
   $valorDados = ($linhasEnv | Where-Object { $_ -match '^\s*FD_DATA_DIR\s*=\s*\S' } | ForEach-Object { ($_ -split '=', 2)[1] } | Select-Object -First 1)
   $composeTexto = [IO.File]::ReadAllText($composeFile, [Text.Encoding]::UTF8)
   $padraoDados = [regex]::new('(?m)^(?<indent>[ \t]*)-[ \t]+(?<source>.+?):/data["'']?[ \t]*\r?$')
-  $montagens = $padraoDados.Matches($composeTexto)
-  if ($montagens.Count -gt 1) { throw 'Mais de uma pasta /data foi encontrada. Os dados foram preservados.' }
+  # A pasta de dados pertence ao servico do gateway. O redis monta uma pasta que
+  # tambem se chama /data, porem DENTRO dessa raiz: olhar o arquivo inteiro
+  # encontraria duas montagens (e o reparo pararia sem motivo) ou apontaria o
+  # cache do redis para a raiz dos arquivos. O trecho do gateway e isolado antes.
+  $inicioGateway = [regex]::Match($composeTexto, '(?ms)^  gateway:[ \t]*\r?\n')
+  $restoCompose = if ($inicioGateway.Success) { $composeTexto.Substring($inicioGateway.Index + $inicioGateway.Length) } else { '' }
+  $fimGateway = if ($inicioGateway.Success) { [regex]::Match($restoCompose, '(?m)^  \S') } else { $null }
+  $tamanhoGateway = if (-not $inicioGateway.Success) { $composeTexto.Length } elseif ($fimGateway.Success) { $fimGateway.Index } else { $restoCompose.Length }
+  $trechoDados = if ($inicioGateway.Success) { $restoCompose.Substring(0, $tamanhoGateway) } else { $composeTexto }
+  $montagens = $padraoDados.Matches($trechoDados)
+  if ($montagens.Count -gt 1) { throw 'Mais de uma pasta /data foi encontrada no servico do gateway. Os dados foram preservados.' }
   $origemDados = if ($montagens.Count -eq 1) { $montagens[0].Groups['source'].Value.Trim().Trim('"').Trim("'") } else { '' }
   $pastaDados = Join-Path $folder 'data'
   $arquivoDados = Join-Path $folder 'data-dir.txt'
@@ -97,9 +106,12 @@ try {
   if ($montagens.Count -eq 1) {
     # As aspas envolvem o volume INTEIRO, nunca so a origem antes de :/data.
     $caminhoDocker = ($pastaDados -replace '\\', '/').TrimEnd('/').Replace("'", "''")
-    $composeNovo = $padraoDados.Replace($composeTexto, [Text.RegularExpressions.MatchEvaluator]{ param($m)
+    $trechoNovo = $padraoDados.Replace($trechoDados, [Text.RegularExpressions.MatchEvaluator]{ param($m)
       $m.Groups['indent'].Value + "- '" + $caminhoDocker + ":/data'"
     })
+    $composeNovo = if ($inicioGateway.Success) {
+      $composeTexto.Substring(0, $inicioGateway.Index + $inicioGateway.Length) + $trechoNovo + $restoCompose.Substring($tamanhoGateway)
+    } else { $trechoNovo }
     if ($composeNovo -ne $composeTexto) {
       Copy-Item -LiteralPath $composeFile -Destination ($composeFile + '.before-startup.bak') -Force
       [IO.File]::WriteAllText($composeFile, $composeNovo, $utf8)
