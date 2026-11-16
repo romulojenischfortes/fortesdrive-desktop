@@ -13,6 +13,8 @@ const channels = {
   getUpdateStatus: "getUpdateStatus", checkForUpdates: "checkForUpdates",
   downloadUpdate: "downloadUpdate", installUpdate: "installUpdate",
   launchInstaller: "launchInstaller", verifyUpdateSignature: "verifyUpdateSignature",
+  getServerTunnel: "getServerTunnel", setServerTunnelEnabled: "setServerTunnelEnabled",
+  restartServerTunnel: "restartServerTunnel", chooseServerRoot: "chooseServerRoot",
 };
 const api = { isDesktop: true };
 for (const [method, channel] of Object.entries(channels)) {

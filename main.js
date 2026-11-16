@@ -7,6 +7,7 @@ const { TransferHistory } = require("./transfer-history");
 const native = require("./native-files");
 const transfers = require("./native-transfers");
 const { DesktopUpdater } = require("./updater");
+const { ServerTunnel } = require("./server-tunnel");
 // As marcas no Explorador são um recurso acessório (extensão registrada pelo
 // instalador). Se o módulo que cuida delas não estiver disponível, o aplicativo
 // inicia normalmente e somente as marcas ficam indisponíveis.
@@ -19,7 +20,10 @@ try {
   badgeSetup = { readBadgeSetup: unavailable, repairBadges: unavailable };
 }
 const WEB_APP_URL = process.env.NODE_ENV === "development" ? "http://localhost:5173" : "https://fortesdrive.base44.app";
-let mainWindow, tray, syncEngine, updater, transferHistory;
+// Aberto pelo inicio automatico do Windows: fica na bandeja, sem janela na
+// tela, para o servidor e o tunel subirem em segundo plano.
+const START_HIDDEN = process.argv.includes("--background");
+let mainWindow, tray, syncEngine, updater, transferHistory, serverTunnel;
 let lastOnlineState = null;
 if (process.platform === "win32") app.setAppUserModelId("com.fortesdrive.desktop");
 const notificationQueue = [];
@@ -185,6 +189,13 @@ function registerHandlers() {
       await refreshSetupConfiguration();
       return { ...syncEngine.getStatus(), updating: updater?.state.status === "installing", appVersion: app.getVersion(), badgeStates: ["synced", "pending", "error", "locked"] };
     },
+    getServerTunnel: () => serverTunnel.getStatus(),
+    setServerTunnelEnabled: enabled => serverTunnel.setEnabled(enabled),
+    restartServerTunnel: () => serverTunnel.restart(),
+    chooseServerRoot: async () => {
+      const result = await dialog.showOpenDialog(mainWindow, { properties: ["openDirectory"], title: "Pasta raiz do servidor FortesDrive", defaultPath: serverTunnel.getStatus().serverRoot });
+      return result.canceled ? null : serverTunnel.setServerRoot(result.filePaths[0]);
+    },
     getUpdateStatus: () => updater.getStatus(),
     getBadgeSetup: () => badgeSetup.readBadgeSetup(),
     repairBadges: () => badgeSetup.repairBadges({ app }),
@@ -265,7 +276,7 @@ function createWindow() {
     webPreferences: { preload: path.join(__dirname, "preload.js"), contextIsolation: true, nodeIntegration: false, sandbox: true, backgroundThrottling: false },
   });
   mainWindow.loadURL(WEB_APP_URL + "/desktop");
-  mainWindow.once("ready-to-show", () => mainWindow.show());
+  mainWindow.once("ready-to-show", () => { if (!START_HIDDEN) mainWindow.show(); });
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     if (url.startsWith("https://") || url.startsWith("http://localhost:")) shell.openExternal(url);
     return { action: "deny" };
@@ -273,20 +284,37 @@ function createWindow() {
   mainWindow.webContents.on("did-finish-load", requestSync);
   mainWindow.on("close", event => { if (!app.isQuitting) { event.preventDefault(); mainWindow.hide(); } });
 }
-async function createTray() {
-  const icon = await app.getFileIcon(process.execPath, { size: "small" });
-  tray = new Tray(icon);
-  tray.setToolTip("FortesDrive");
-  tray.setContextMenu(Menu.buildFromTemplate([
+// Estado do tunel no topo do menu da bandeja, regenerado a cada mudanca.
+const TUNNEL_LABELS = { stopped: "Túnel: parado", starting: "Túnel: iniciando...", online: "Túnel: conectado", reconnecting: "Túnel: reconectando...", error: "Túnel: erro" };
+
+function trayTemplate() {
+  const tunnel = serverTunnel?.getStatus();
+  const items = [{ label: TUNNEL_LABELS[tunnel?.status] || TUNNEL_LABELS.stopped, enabled: false }];
+  if (tunnel?.url) items.push({ label: tunnel.url, click: () => shell.openExternal(tunnel.url) });
+  return [
+    ...items,
+    { type: "separator" },
     { label: "Abrir FortesDrive", click: () => mainWindow.show() },
     { label: "Histórico de arquivos", click: () => { mainWindow.show(); mainWindow.focus(); mainWindow.loadURL(WEB_APP_URL + "/desktop#desktop-transfer-history"); } },
     { label: "Pasta dos documentos da nuvem", click: openFolderSetup },
     { label: "Sincronizar agora", click: requestSync },
+    { label: "Reiniciar túnel do servidor", click: () => serverTunnel.restart().catch(error => dialog.showErrorBox("FortesDrive", error.message)) },
     { label: "Verificar atualizações", click: () => { mainWindow.show(); updater.check().catch(error => dialog.showErrorBox("FortesDrive", error.message)); } },
     { label: "Iniciar com o Windows", type: "checkbox", checked: app.getLoginItemSettings().openAtLogin, click: item => app.setLoginItemSettings({ openAtLogin: item.checked }) },
     { type: "separator" },
     { label: "Sair", click: () => { app.isQuitting = true; app.quit(); } },
-  ]));
+  ];
+}
+
+function refreshTrayMenu() {
+  if (tray && !tray.isDestroyed()) tray.setContextMenu(Menu.buildFromTemplate(trayTemplate()));
+}
+
+async function createTray() {
+  const icon = await app.getFileIcon(process.execPath, { size: "small" });
+  tray = new Tray(icon);
+  tray.setToolTip("FortesDrive");
+  refreshTrayMenu();
   tray.on("click", () => mainWindow.show());
 
   // Monitora conexão de internet no processo principal
@@ -309,6 +337,8 @@ app.whenReady().then(async () => {
   // Primeiro aplica a escolha feita no instalador, sem criar uma pasta padrao.
   syncEngine = new SyncEngine(requestSync);
   transferHistory = new TransferHistory(app.getPath("userData"), syncEngine);
+  serverTunnel = new ServerTunnel({ userDataDir: app.getPath("userData"), app, onState: refreshTrayMenu });
+  await serverTunnel.init();
   await refreshSetupConfiguration();
   // Se outro perfil do Windows abrir o app, exige a propria escolha nativa
   // antes da janela web, do login e de qualquer transferencia.
@@ -320,18 +350,22 @@ app.whenReady().then(async () => {
   registerHandlers(); createWindow();
   if (syncEngine.watchFolder) await syncEngine.start().catch(error => { syncEngine.state.error = error.message; });
   await createTray();
+  refreshTrayMenu();
   updater.start();
+  // Servidor e tunel sobem sozinhos quando o inicio automatico esta ligado.
+  if (serverTunnel.getStatus().enabled) serverTunnel.start().catch(error => console.error("Túnel:", error.message));
 });
 app.on("activate", () => mainWindow?.show());
 app.on("window-all-closed", () => {});
 let installingOnExit = false;
 // Encerramento da sessão do Windows: fecha sem tentar instalar a atualização.
-app.on("session-end", () => { app.isQuitting = true; installingOnExit = true; });
+app.on("session-end", () => { app.isQuitting = true; installingOnExit = true; serverTunnel?.stop(); });
 app.on("before-quit", event => {
   app.isQuitting = true;
   // Fechar o aplicativo com uma atualização já baixada aplica a nova versão
   // sozinho, pelo mesmo caminho com permissão de administrador do botão
   // "Reiniciar e instalar".
+  serverTunnel?.stop();
   if (installingOnExit || !updater?.hasPendingUpdate()) { syncEngine?.stop(); return; }
   event.preventDefault();
   installingOnExit = true;

@@ -29,6 +29,7 @@
       "sync-engine.js",
       "setup-handoff.js",
       "transfer-history.js",
+      "server-tunnel.js",
       "build/icon.png",
       "native-files.js",
       "native-transfers.js",
