@@ -14,9 +14,15 @@
  * validade curta). O FortesDrive assina no servidor dele e entrega ao navegador
  * apenas um endereço já assinado e temporário.
  *
+ * Com NEXTCLOUD_URL/NEXTCLOUD_USER/NEXTCLOUD_APP_PASSWORD definidos, os bytes
+ * são gravados e lidos no Nextcloud por WebDAV, com o próprio Nextcloud
+ * conferindo o checksum. Sem essas variáveis, tudo continua na pasta local.
+ *
  * Rotas:
  *   GET    /health                                    → vivo? (sem assinatura)
  *   GET    /v1/status?expires=&sig=                   → disco, versão, gravação
+ *   GET    /v1/migrate?expires=&sig=                  → estado da migração
+ *   POST   /v1/migrate?expires=&sig=                  → inicia/retoma a migração
  *   PUT    /v1/objects/<chave>?op=put&expires=&sig=   → envia conteúdo (header x-fd-sha256)
  *   GET    /v1/objects/<chave>?op=get&expires=&sig=   → baixa (aceita Range)
  *   DELETE /v1/objects/<chave>?op=delete&expires=&sig= → apaga
@@ -30,6 +36,16 @@ const crypto = require('node:crypto');
 const fs = require('node:fs');
 const fsp = require('node:fs/promises');
 const path = require('node:path');
+
+// Armazenamento no Nextcloud (WebDAV). Ausente, o gateway segue gravando na
+// pasta local — nenhuma instalação antiga deixa de funcionar por causa disso.
+let nextcloud = null;
+try {
+  nextcloud = require('./nextcloud.js');
+} catch (error) {
+  console.error('[gateway] Nextcloud indisponivel: ' + error.message);
+}
+const useNextcloud = Boolean(nextcloud && nextcloud.isConfigured());
 
 const PORT = Number(process.env.PORT || 8790);
 // Pasta onde os arquivos moram (o volume do Docker aponta para a pasta de dados
@@ -46,9 +62,12 @@ const MAX_CONCURRENT_UPLOADS = Number(process.env.MAX_CONCURRENT_UPLOADS || 30);
 const RATE_LIMIT_PER_MINUTE = Number(process.env.RATE_LIMIT_PER_MINUTE || 1800);
 // Tempo máximo que um arquivo espera por uma vaga antes de o cliente tentar de novo.
 const UPLOAD_SLOT_WAIT_MS = Number(process.env.UPLOAD_SLOT_WAIT_MS || 120000);
-const VERSION = '2.0.2';
+const VERSION = '2.1.0';
 const STARTED_AT = Date.now();
 const MAX_SIGNATURE_LIFETIME_MS = 25 * 3600 * 1000;
+// Pasta onde estão os arquivos gravados antes da migração (o volume da pasta
+// de dados do computador). É só a origem: nada é alterado nem apagado aqui.
+const LEGACY_DIR = process.env.LEGACY_DIR || DATA_DIR;
 
 // Área de preparo dentro da própria pasta de dados: o arquivo só é publicado
 // quando o checksum confere, e o rename fica no mesmo disco (nunca falha).
@@ -267,8 +286,11 @@ async function handleUpload(req, res, key) {
   }
 
   const tempPath = path.join(TMP_DIR, crypto.randomUUID() + '.part');
+  // Em um gateway antigo (sem o módulo do Nextcloud) `nextcloud` não existe: o
+  // teste abaixo é seguro ali também — é esta a rotina que o reparo distribui.
+  const backend = typeof nextcloud !== 'undefined' && nextcloud ? nextcloud : null;
   try {
-    const finalPath = typeof uploadToFiler === 'function' ? null : objectPath(key);
+    const finalPath = backend ? null : objectPath(key);
     if (finalPath) await fsp.mkdir(path.dirname(finalPath), { recursive: true });
     const hash = crypto.createHash('sha256');
     let written = 0;
@@ -298,12 +320,12 @@ async function handleUpload(req, res, key) {
       throw Object.assign(new Error('Checksum divergente: o arquivo chegou corrompido e não foi gravado.'), { status: 422 });
     }
     if (finalPath) await fsp.rename(tempPath, finalPath);
-    else await uploadToFiler(key, tempPath, written, req.headers['content-type']);
-    sendJson(res, 200, { ok: true, key, size: written, checksum: digest });
+    else await backend.putFile(key, tempPath, digest);
+    sendJson(res, 200, { ok: true, key, size: written, checksum: digest, backend: backend ? 'nextcloud' : 'disk' });
   } catch (error) {
     if (!req.destroyed) req.resume();
     console.error('[gateway] falha no envio de ' + key + ': ' + error.message);
-    if (!res.destroyed) sendJson(res, error.status || (typeof uploadToFiler === 'function' ? 502 : 500), { error: error.message });
+    if (!res.destroyed) sendJson(res, error.status || (backend ? 502 : 500), { error: error.message });
   } finally {
     releaseUploadSlot();
     await fsp.rm(tempPath, { force: true });
@@ -326,6 +348,9 @@ function streamFile(filePath, res, options) {
 }
 
 async function handleDownload(req, res, key) {
+  // No Nextcloud o próprio servidor entrega o fluxo (com Range).
+  if (useNextcloud) return nextcloud.streamToClient(key, req, res);
+
   const finalPath = objectPath(key);
   // Cada byte sai assim que chega: sem esperar juntar pacotes, o download mantém
   // o ritmo do link em vez de andar em degraus.
@@ -373,6 +398,16 @@ async function handleDownload(req, res, key) {
 }
 
 async function handleDelete(res, key) {
+  if (useNextcloud) {
+    try {
+      const result = await nextcloud.deleteFile(key);
+      return sendJson(res, 200, { ok: true, key, existed: result.existed, backend: 'nextcloud' });
+    } catch (error) {
+      console.error('[gateway] falha ao apagar ' + key + ': ' + error.message);
+      return sendJson(res, 500, { error: error.message });
+    }
+  }
+
   const finalPath = objectPath(key);
   let existed = true;
   try {
@@ -388,10 +423,36 @@ async function handleDelete(res, key) {
 }
 
 async function handleStatus(res) {
-  let disk = { freeBytes: null, totalBytes: null };
+  let disk = { freeBytes: null, totalBytes: null, usedBytes: null };
+
+  if (useNextcloud) {
+    // Quem manda no espaço agora é o Nextcloud: a cota informada é a dele.
+    const [quota, writable] = await Promise.all([nextcloud.quota(), nextcloud.writable()]);
+    disk = { freeBytes: quota.freeBytes, totalBytes: quota.totalBytes, usedBytes: quota.usedBytes };
+    return sendJson(res, 200, {
+      ok: true,
+      version: VERSION,
+      uptimeSec: Math.round((Date.now() - STARTED_AT) / 1000),
+      filer: { reachable: writable, backend: 'nextcloud' },
+      storage: {
+        writable,
+        backend: 'nextcloud',
+        root: process.env.NEXTCLOUD_ROOT || 'FortesDrive',
+        url: process.env.NEXTCLOUD_URL || null,
+      },
+      migration: migrationView(),
+      disk,
+      limits: {
+        maxUploadBytes: MAX_UPLOAD_BYTES,
+        maxConcurrentUploads: MAX_CONCURRENT_UPLOADS,
+        rateLimitPerMinute: RATE_LIMIT_PER_MINUTE,
+      },
+    });
+  }
+
   try {
     const stats = await fsp.statfs(DATA_DIR);
-    disk = { freeBytes: stats.bavail * stats.bsize, totalBytes: stats.blocks * stats.bsize };
+    disk = { freeBytes: stats.bavail * stats.bsize, totalBytes: stats.blocks * stats.bsize, usedBytes: null };
   } catch (error) {
     console.error('[gateway] não foi possível ler o disco: ' + error.message);
   }
@@ -413,6 +474,127 @@ async function handleStatus(res) {
       rateLimitPerMinute: RATE_LIMIT_PER_MINUTE,
     },
   });
+}
+
+// ── Migração dos arquivos antigos para o Nextcloud ─────────────────────
+// Roda no próprio servidor: lê cada arquivo da pasta antiga, confere o
+// SHA-256 e envia ao Nextcloud. Arquivo que já está lá com o mesmo tamanho é
+// contado como ignorado, então repetir a operação nunca duplica nada e uma
+// interrupção pode ser retomada de onde parou. Nada é apagado da origem.
+const MIGRATION_FILE = path.join(DATA_DIR, '.migration.json');
+const MAX_MIGRATION_ERRORS = 40;
+let migration = {
+  running: false,
+  total: 0,
+  done: 0,
+  skipped: 0,
+  failed: 0,
+  current: null,
+  startedAt: null,
+  finishedAt: null,
+  errors: [],
+};
+
+async function loadMigration() {
+  try {
+    const saved = JSON.parse(await fsp.readFile(MIGRATION_FILE, 'utf8'));
+    migration = { ...migration, ...saved, running: false, current: null };
+  } catch { /* primeira execução */ }
+}
+
+function saveMigration() {
+  return fsp.writeFile(MIGRATION_FILE, JSON.stringify(migration)).catch(() => {});
+}
+
+function migrationView() {
+  return {
+    ...migration,
+    pending: Math.max(0, migration.total - migration.done - migration.skipped - migration.failed),
+  };
+}
+
+async function sha256Of(filePath) {
+  const hash = crypto.createHash('sha256');
+  await new Promise((resolve, reject) => {
+    const stream = fs.createReadStream(filePath, { highWaterMark: 1024 * 1024 });
+    stream.on('data', (chunk) => hash.update(chunk));
+    stream.on('end', resolve);
+    stream.on('error', reject);
+  });
+  return hash.digest('hex');
+}
+
+async function runMigration() {
+  if (!useNextcloud || migration.running) return;
+  Object.assign(migration, {
+    running: true,
+    total: 0,
+    done: 0,
+    skipped: 0,
+    failed: 0,
+    current: null,
+    startedAt: new Date().toISOString(),
+    finishedAt: null,
+    errors: [],
+  });
+  try {
+    const files = await nextcloud.legacyFiles(LEGACY_DIR);
+    migration.total = files.length;
+    await saveMigration();
+    console.log('[gateway] migração iniciada: ' + files.length + ' arquivo(s) em ' + LEGACY_DIR);
+    for (const key of files) {
+      migration.current = key;
+      try {
+        const sourcePath = path.join(LEGACY_DIR, ...key.split('/'));
+        const stats = await fsp.stat(sourcePath);
+        const remoteSize = await nextcloud.objectSize(key);
+        if (remoteSize === stats.size) {
+          migration.skipped += 1;
+        } else {
+          await nextcloud.putFile(key, sourcePath, await sha256Of(sourcePath));
+          migration.done += 1;
+        }
+      } catch (error) {
+        migration.failed += 1;
+        if (migration.errors.length < MAX_MIGRATION_ERRORS) {
+          migration.errors.push({ key, error: error.message });
+        }
+      }
+      if ((migration.done + migration.skipped + migration.failed) % 10 === 0) await saveMigration();
+    }
+  } catch (error) {
+    migration.errors.push({ key: '', error: error.message });
+    console.error('[gateway] migração interrompida: ' + error.message);
+  } finally {
+    migration.running = false;
+    migration.current = null;
+    migration.finishedAt = new Date().toISOString();
+    await saveMigration();
+    console.log('[gateway] migração encerrada: ' + migration.done + ' enviados, ' +
+      migration.skipped + ' já estavam, ' + migration.failed + ' falharam.');
+  }
+}
+
+/** Estado (GET) e início (POST) da migração. Só aceita pedido assinado. */
+async function handleMigration(req, res, url) {
+  const failure = signatureError(url, 'migrate', '');
+  if (failure) return sendJson(res, 401, { error: failure });
+
+  if (!useNextcloud) {
+    return sendJson(res, 200, {
+      ok: true,
+      backend: 'disk',
+      available: false,
+      state: migrationView(),
+    });
+  }
+
+  if (req.method === 'POST') {
+    if (!migration.running) runMigration();
+    return sendJson(res, 200, { ok: true, backend: 'nextcloud', available: true, state: migrationView() });
+  }
+
+  return sendJson(res, 200, { ok: true, backend: 'nextcloud', available: true, state: migrationView() });
 }
 
 const server = http.createServer(async (req, res) => {
@@ -440,6 +622,13 @@ const server = http.createServer(async (req, res) => {
       const failure = signatureError(url, 'status', '');
       if (failure) return sendJson(res, 401, { error: failure });
       return await handleStatus(res);
+    }
+
+    if (url.pathname === '/v1/migrate') {
+      if (req.method !== 'GET' && req.method !== 'POST') {
+        return sendJson(res, 405, { error: 'Use GET para consultar ou POST para migrar.' });
+      }
+      return await handleMigration(req, res, url);
     }
 
     if (url.pathname.startsWith('/v1/objects/')) {
@@ -481,9 +670,13 @@ server.requestTimeout = 12 * 60 * 60 * 1000;
 server.headersTimeout = 60000;
 server.keepAliveTimeout = 65000;
 
+// Estado da migração anterior (se houve) fica disponível já na primeira consulta.
+loadMigration().catch(() => {});
+
 server.listen(PORT, '0.0.0.0', () => {
   console.log('[gateway] FortesDrive storage gateway ' + VERSION + ' na porta ' + PORT);
-  console.log('[gateway] arquivos guardados em ' + DATA_DIR);
+  console.log('[gateway] armazenamento: ' + (useNextcloud ? 'Nextcloud ' + (process.env.NEXTCLOUD_URL || '') : 'pasta local ' + DATA_DIR));
+  if (useNextcloud) console.log('[gateway] arquivos antigos para migrar em ' + LEGACY_DIR);
 });
 
 for (const signal of ['SIGTERM', 'SIGINT']) {

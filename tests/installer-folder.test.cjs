@@ -42,6 +42,15 @@ test('a pagina do cliente nao e ocultada por uma configuracao antiga nem preench
   assert.doesNotMatch(writer, /powershell|SetEnvironmentVariable/i);
 });
 
+test('o cliente abre o aplicativo com a pasta escolhida, sincronizando a pasta inteira', async () => {
+  const include = await fs.readFile(path.join(__dirname, '../build/overlays.nsh'), 'utf8');
+  const client = include.slice(include.indexOf('"$FortesMachineRole" == "client"'), include.indexOf('!macro RegisterFortesOverlay'));
+  assert.ok(/Exec '"\$INSTDIR\\FortesDrive\.exe" "--sync-folder=\$FortesSyncDir"'/.test(client), "o instalador abre o cliente com a pasta escolhida");
+  const main = await fs.readFile(path.join(__dirname, '../main.js'), 'utf8');
+  assert.match(main, /--sync-folder=/);
+  assert.ok(main.indexOf('installFolderArgument()') < main.indexOf('createWindow()'), "a pasta do instalador e aplicada antes da janela web");
+});
+
 test('o cliente exige selecao nativa antes da janela web e nao cria Documentos por conta propria', async () => {
   const main = await fs.readFile(path.join(__dirname, '../main.js'), 'utf8');
   const startup = main.slice(main.indexOf('app.whenReady()'));

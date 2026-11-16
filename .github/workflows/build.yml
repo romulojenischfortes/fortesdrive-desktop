@@ -16,7 +16,7 @@ jobs:
       - run: npm install
       - run: node generate-icon.js
       - name: Test native transfers and updater
-        run: node --test tests/native.test.cjs tests/native-streams.test.cjs tests/updater.test.cjs tests/badge-setup.test.cjs tests/packaging.test.cjs tests/server-package.test.cjs tests/setup-handoff.test.cjs tests/installer-folder.test.cjs tests/transfer-history.test.cjs tests/gateway-uploads.test.cjs tests/storage-folder.test.cjs
+        run: node --test tests/native.test.cjs tests/native-streams.test.cjs tests/updater.test.cjs tests/badge-setup.test.cjs tests/packaging.test.cjs tests/server-package.test.cjs tests/setup-handoff.test.cjs tests/installer-folder.test.cjs tests/transfer-history.test.cjs tests/gateway-uploads.test.cjs tests/storage-folder.test.cjs tests/install-health.test.cjs
       - name: Build and test Explorer badges
         shell: cmd
         run: |
@@ -91,6 +91,8 @@ jobs:
           name: FortesDrive Desktop ${{ steps.version.outputs.version }}
           body: |
             Instalador unificado: escolha Cliente ou Servidor; o cliente nao instala dependencias do servidor.
+            Verificacao da atualizacao no instalador: confere os componentes desta versao e mostra um alerta quando algum nao foi aplicado, com registro em verificacao-instalacao.log.
+            Verificacao no cliente ao abrir: confere versao em execucao, componentes do instalador, servidor de armazenamento e sincronizacao, avisa na tela e no sistema as etapas que falharam e oferece verificar de novo ou baixar o instalador.
             Cliente: escolha obrigatoria da pasta de download e sincronizacao dentro do instalador, antes de instalar. Corrigida a ordem de carregamento dos plugins NSIS que impedia gerar o novo instalador. Configuracao nativa Unicode sem PowerShell, sem pasta padrao imposta. Atualizacoes automaticas preservam a pasta existente.
             Avisos individuais do Windows para cada arquivo concluido, historico persistente por conta e pasta, filtros, ordenacao, paginacao e exportacao CSV real. As marcas do Explorador sao atualizadas apos a confirmacao de cada arquivo.
             No Meu Drive do cliente, selecione arquivos ou pastas e use Sincronizar Agora para reconciliar somente a selecao.

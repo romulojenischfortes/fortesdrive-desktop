@@ -7,11 +7,13 @@
   inteiro ficar pronto com um único download.
 
   O que ele faz, em ordem:
-    1. confere se o Docker Desktop está instalado e funcionando;
+    1. instala o Docker Desktop quando falta, abre ele e espera o login e o
+       serviço responderem (o login é o que libera o download das imagens);
     2. grava os arquivos do servidor (gateway) na pasta de trabalho;
-    3. reaproveita ou cria o segredo de assinatura (.env);
-    4. libera a porta 8790 (encerrando servidor anterior) e sobe os serviços,
-       esperando o gateway responder;
+    3. reaproveita ou cria o segredo de assinatura (.env) e prepara a pasta de
+       dados do Nextcloud, que é o que os volumes do Docker usam;
+    4. libera a porta 8790 (encerrando servidor anterior) e sobe o Nextcloud e
+       o gateway em contêineres, esperando os dois responderem;
     5. instala o túnel, abre a janela dele na pasta do servidor e explica a
        etapa manual do token;
     6. mostra o endereço e o segredo que devem ser colados no app;
@@ -125,8 +127,43 @@ Write-Host '=====================================================' -ForegroundCo
 # ---------------------------------------------------------------------
 #  1/6 Docker Desktop
 # ---------------------------------------------------------------------
-Passo '1/6 Verificando o Docker Desktop'
-if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
+Passo '1/6 Preparando o Docker Desktop'
+
+# O comando pode nao aparecer no PATH desta janela logo depois de instalar:
+# por isso o caminho do programa e procurado tambem na mao.
+function Achar-Docker {
+  # O PATH desta janela nao conhece um Docker recem-instalado: atualiza antes,
+  # para os comandos "docker ..." do resto do assistente funcionarem tambem.
+  $env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' + [Environment]::GetEnvironmentVariable('Path', 'User')
+  $comando = Get-Command docker -ErrorAction SilentlyContinue
+  if ($comando) { return $comando.Source }
+  foreach ($candidato in @(
+      (Join-Path $env:ProgramFiles 'Docker\Docker\resources\bin\docker.exe'),
+      (Join-Path $env:LOCALAPPDATA 'Docker\Docker\resources\bin\docker.exe')
+    )) {
+    if (Test-Path -LiteralPath $candidato) { return $candidato }
+  }
+  return $null
+}
+
+# Abre a janela do Docker Desktop: e nela que o usuario aceita os termos, entra
+# com a conta e ve o servico ficar pronto.
+function Abrir-DockerDesktop {
+  foreach ($candidato in @(
+      (Join-Path $env:ProgramFiles 'Docker\Docker\Docker Desktop.exe'),
+      (Join-Path $env:LOCALAPPDATA 'Docker\Docker Desktop.exe')
+    )) {
+    if (Test-Path -LiteralPath $candidato) {
+      Start-Process -FilePath $candidato
+      return $true
+    }
+  }
+  return $false
+}
+
+$script:dockerCli = Achar-Docker
+
+if (-not $script:dockerCli) {
   Write-Host 'O Docker Desktop ainda nao esta instalado neste computador.' -ForegroundColor Yellow
   Write-Host 'Baixando o instalador oficial do Docker (nao precisa procurar no site)...'
   $instaladorDocker = Join-Path $env:TEMP 'DockerDesktopInstaller.exe'
@@ -138,16 +175,26 @@ if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
     Write-Host ('[AVISO] Nao consegui baixar o instalador do Docker: ' + $_.Exception.Message) -ForegroundColor Yellow
   }
   if ($baixouDocker) {
-    Write-Host 'Abrindo o instalador do Docker Desktop (mantenha a opcao do WSL 2 marcada)...' -ForegroundColor Cyan
-    Start-Process -FilePath $instaladorDocker -Wait
+    Write-Host 'Instalando o Docker Desktop (pode levar alguns minutos)...' -ForegroundColor Cyan
+    Start-Process -FilePath $instaladorDocker -ArgumentList 'install', '--accept-license' -Wait
+    $script:dockerCli = Achar-Docker
+    if (-not $script:dockerCli) {
+      # Instalacao silenciosa sem caminho: abre o assistente, para o usuario
+      # resolver o WSL 2 e o reinicio quando o Docker pedir.
+      Write-Host 'Abrindo o assistente do Docker Desktop (mantenha a opcao do WSL 2 marcada)...' -ForegroundColor Cyan
+      Start-Process -FilePath $instaladorDocker -Wait
+      $script:dockerCli = Achar-Docker
+    }
   } else {
     Start-Process 'https://www.docker.com/products/docker-desktop'
   }
-  Write-Host ''
-  Write-Host 'Quando a instalacao do Docker Desktop terminar, abra o Docker Desktop' -ForegroundColor Cyan
-  Write-Host 'uma vez, reinicie o Windows se ele pedir, e use de novo o atalho' -ForegroundColor Cyan
-  Write-Host '"FortesDrive - configurar servidor" no menu Iniciar.' -ForegroundColor Cyan
-  exit 2
+  if (-not $script:dockerCli) {
+    Write-Host '[ERRO] O Docker Desktop nao ficou instalado. Rode o instalador dele,' -ForegroundColor Red
+    Write-Host 'reinicie o Windows se ele pedir e use de novo o atalho' -ForegroundColor Red
+    Write-Host '"FortesDrive - configurar servidor" no menu Iniciar.' -ForegroundColor Red
+    exit 2
+  }
+  Write-Host 'Docker Desktop instalado.' -ForegroundColor Green
 }
 
 # O Docker escreve o progresso dele no canal de erro do PowerShell. Quando esse
@@ -159,24 +206,60 @@ if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
 function Invoke-DockerSilencioso {
   $antes = $ErrorActionPreference
   $ErrorActionPreference = 'Continue'
-  try { & docker @args 2>&1 | Out-Null } finally { $ErrorActionPreference = $antes }
+  try { & $script:dockerCli @args 2>&1 | Out-Null } finally { $ErrorActionPreference = $antes }
   return $LASTEXITCODE
 }
 
-if ((Invoke-DockerSilencioso info) -ne 0) {
-  Write-Host 'Abrindo o Docker Desktop e esperando ele ficar pronto...'
-  $atalho = Join-Path $env:ProgramFiles 'Docker\Docker\Docker Desktop.exe'
-  if (Test-Path $atalho) { Start-Process $atalho }
-  $pronto = $false
-  for ($i = 1; $i -le 36; $i++) {
+# Mesma ideia, devolvendo o codigo junto com o texto: e assim que o limite de
+# downloads do Docker Hub (que aparece quando nao ha login) fica reconhecido.
+function Invoke-DockerComSaida {
+  $antes = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  $codigo = 1
+  $saida = ''
+  try {
+    $saida = (& $script:dockerCli @args 2>&1 | Out-String)
+    $codigo = $LASTEXITCODE
+  } finally { $ErrorActionPreference = $antes }
+  return @{ codigo = $codigo; saida = $saida }
+}
+
+# Espera o SERVICO do Docker responder (o login e outra coisa: o Docker
+# funciona sem conta, mas e a conta que libera o download das imagens).
+function Esperar-DockerPronto($segundos) {
+  $voltas = [int][math]::Ceiling($segundos / 5)
+  for ($i = 1; $i -le $voltas; $i++) {
     Start-Sleep -Seconds 5
-    if ((Invoke-DockerSilencioso info) -eq 0) { $pronto = $true; break }
-    Write-Host ('  aguardando o Docker... (' + ($i * 5) + 's)')
+    if ((Invoke-DockerSilencioso info) -eq 0) { return $true }
+    if ($i % 6 -eq 0) { Write-Host ('  ainda aguardando o Docker... (' + ($i * 5) + 's)') }
   }
-  if (-not $pronto) {
-    Write-Host '[ERRO] O Docker Desktop nao ficou pronto. Abra ele, reinicie o Windows se pedir,' -ForegroundColor Red
+  return $false
+}
+
+if ((Invoke-DockerSilencioso info) -ne 0) {
+  Write-Host ''
+  Write-Host 'Abrindo o Docker Desktop...' -ForegroundColor Cyan
+  if (-not (Abrir-DockerDesktop)) {
+    Write-Host '[ERRO] Nao encontrei o Docker Desktop para abrir. Abra ele pelo menu Iniciar' -ForegroundColor Red
     Write-Host 'e rode de novo o atalho "FortesDrive - configurar servidor".' -ForegroundColor Red
     exit 2
+  }
+  Write-Host ''
+  Write-Host '  Na janela do Docker Desktop que abriu:' -ForegroundColor Yellow
+  Write-Host '    1. aceite os termos de uso, se ele pedir;' -ForegroundColor Yellow
+  Write-Host '    2. entre com a sua conta Docker (ou crie uma gratuita): sem login o' -ForegroundColor Yellow
+  Write-Host '       Docker Hub limita o download das imagens do Nextcloud;' -ForegroundColor Yellow
+  Write-Host '    3. espere aparecer que o Docker esta rodando e volte para esta janela.' -ForegroundColor Yellow
+  Write-Host ''
+  Write-Host 'A instalacao continua sozinha assim que o Docker responder.' -ForegroundColor Cyan
+  while (-not (Esperar-DockerPronto 300)) {
+    $tentar = Read-Host 'O Docker ainda nao respondeu. Tentar de novo? [S/n]'
+    if ($tentar -match '^(n|nao|não)$') {
+      Write-Host '[ERRO] O Docker Desktop nao ficou pronto. Abra ele, reinicie o Windows se pedir,' -ForegroundColor Red
+      Write-Host 'e rode de novo o atalho "FortesDrive - configurar servidor".' -ForegroundColor Red
+      exit 2
+    }
+    Abrir-DockerDesktop | Out-Null
   }
 }
 Write-Host 'Docker respondendo.' -ForegroundColor Green
@@ -187,8 +270,9 @@ Write-Host 'Docker respondendo.' -ForegroundColor Green
 Passo ('2/6 Gravando os arquivos em ' + $pasta)
 $origemCompose = Join-Path $pacote 'docker-compose.yml'
 $origemGateway = Join-Path $pacote 'gateway\server.js'
+$origemNextcloud = Join-Path $pacote 'gateway\nextcloud.js'
 $origemDockerfile = Join-Path $pacote 'gateway\Dockerfile'
-foreach ($arquivo in @($origemCompose, $origemGateway, $origemDockerfile)) {
+foreach ($arquivo in @($origemCompose, $origemGateway, $origemNextcloud, $origemDockerfile)) {
   if (-not (Test-Path $arquivo)) {
     Write-Host ('[ERRO] Pacote do servidor incompleto: faltou ' + $arquivo) -ForegroundColor Red
     exit 1
@@ -211,6 +295,7 @@ if ($legado) {
 } else {
   Gravar $composeAtual ([System.IO.File]::ReadAllText($origemCompose, [System.Text.Encoding]::UTF8))
   Gravar (Join-Path $pasta 'gateway\server.js') ([System.IO.File]::ReadAllText($origemGateway, [System.Text.Encoding]::UTF8))
+  Gravar (Join-Path $pasta 'gateway\nextcloud.js') ([System.IO.File]::ReadAllText($origemNextcloud, [System.Text.Encoding]::UTF8))
   Gravar (Join-Path $pasta 'gateway\Dockerfile') ([System.IO.File]::ReadAllText($origemDockerfile, [System.Text.Encoding]::UTF8))
 }
 Write-Host 'Arquivos gravados.' -ForegroundColor Green
@@ -304,22 +389,50 @@ if (-not $dadosExistentes) { $dadosExistentes = (Ler-TextoUtf8 (Join-Path $pasta
 $pastaDados = Resolver-CaminhoPasta $dadosExistentes $pastaDados
 # New-Item nao tem parametro LiteralPath. A API cria sem interpretar curingas.
 [IO.Directory]::CreateDirectory($pastaDados) | Out-Null
-$linhasEnv = @($linhas | Where-Object { $_ -match '\S' -and $_ -notmatch '^\s*(STORAGE_SIGNING_SECRET|FD_DATA_DIR|MAX_UPLOAD_BYTES|MAX_CONCURRENT_UPLOADS|RATE_LIMIT_PER_MINUTE)\s*=' })
-$linhasEnv = @(('STORAGE_SIGNING_SECRET=' + $segredo), 'MAX_CONCURRENT_UPLOADS=30', 'RATE_LIMIT_PER_MINUTE=1800') + $linhasEnv
+$linhasEnv = @($linhas | Where-Object { $_ -match '\S' -and $_ -notmatch '^\s*(STORAGE_SIGNING_SECRET|FD_DATA_DIR|MAX_UPLOAD_BYTES|MAX_CONCURRENT_UPLOADS|RATE_LIMIT_PER_MINUTE|NEXTCLOUD_ADMIN_USER|NEXTCLOUD_ADMIN_PASSWORD|NEXTCLOUD_DB_PASSWORD|NEXTCLOUD_DB_ROOT_PASSWORD|NEXTCLOUD_APP_PASSWORD)\s*=' })
+
+# --- Nextcloud: credenciais do armazenamento ---------------------------
+# A conta do Nextcloud é a dona dos arquivos e é ela que o gateway usa por
+# WebDAV. Estes valores valem na PRIMEIRA subida (é quando o Nextcloud cria a
+# conta e o banco); depois disso eles precisam continuar iguais, por isso um
+# valor que já existe é sempre reaproveitado.
+function Manter-Ou-Gerar($nome, $tamanho) {
+  $existente = ($linhas | Where-Object { $_ -match ('^\s*' + $nome + '\s*=\s*\S') } | ForEach-Object { ($_ -split '=', 2)[1].Trim() } | Select-Object -First 1)
+  if ($existente) { return $existente }
+  $bytes = New-Object 'byte[]' $tamanho
+  [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
+  return (-join ($bytes | ForEach-Object { $_.ToString('x2') }))
+}
+
+$usuarioNextcloud = Manter-Ou-Gerar 'NEXTCLOUD_ADMIN_USER' 0
+if (-not $usuarioNextcloud) { $usuarioNextcloud = 'fortesdrive' }
+$senhaNextcloud = Manter-Ou-Gerar 'NEXTCLOUD_ADMIN_PASSWORD' 18
+# O gateway entra no Nextcloud por WebDAV com esta mesma conta, então a senha de
+# aplicativo é a senha da conta — não existe um segundo cadastro para manter.
+$senhaAppNextcloud = $senhaNextcloud
+$senhaBanco = Manter-Ou-Gerar 'NEXTCLOUD_DB_PASSWORD' 18
+$senhaBancoRaiz = Manter-Ou-Gerar 'NEXTCLOUD_DB_ROOT_PASSWORD' 18
+
+$linhasEnv = @(
+  ('STORAGE_SIGNING_SECRET=' + $segredo),
+  'MAX_CONCURRENT_UPLOADS=30',
+  'RATE_LIMIT_PER_MINUTE=1800',
+  ('NEXTCLOUD_ADMIN_USER=' + $usuarioNextcloud),
+  ('NEXTCLOUD_ADMIN_PASSWORD=' + $senhaNextcloud),
+  ('NEXTCLOUD_APP_PASSWORD=' + $senhaAppNextcloud),
+  ('NEXTCLOUD_DB_PASSWORD=' + $senhaBanco),
+  ('NEXTCLOUD_DB_ROOT_PASSWORD=' + $senhaBancoRaiz),
+  # A pasta escolhida vale para todos os serviços (Nextcloud, banco, redis e
+  # gateway): o Compose lê esta variável do .env em cada volume.
+  ('FD_DATA_DIR=' + ($pastaDados -replace '\\', '/'))
+) + $linhasEnv
 Gravar (Join-Path $pasta 'data-dir.txt') $pastaDados
-$marcadorDados = '${FD_DATA_DIR:-./data}:/data'
 $pastaDadosPadrao = Join-Path $pasta 'data'
-if ($pastaDados -ne $pastaDadosPadrao) {
-  $composeTexto = Ler-TextoUtf8 $composeAtual
-  if ($composeTexto.Contains($marcadorDados)) {
-    $volumeDados = "'" + ($pastaDados -replace '\\', '/').TrimEnd('/').Replace("'", "''") + ":/data'"
-    Gravar $composeAtual $composeTexto.Replace($marcadorDados, $volumeDados)
-  } elseif ($legado) {
-    # Nao troca volumes de um backend antigo durante a atualizacao.
-    $linhasEnv = @('FD_DATA_DIR=' + $pastaDados) + $linhasEnv
-  } else {
-    throw 'A pasta de dados nao foi localizada no Compose. Nenhum arquivo foi apagado.'
-  }
+# A pasta dos dados vai no .env (FD_DATA_DIR) e vale para todos os serviços.
+# Nenhum volume precisa ser editado à mão no Compose, e uma pasta escolhida em
+# outro disco continua sendo respeitada nas próximas execuções.
+if (-not (Ler-TextoUtf8 $composeAtual).Contains('FD_DATA_DIR') -and -not $legado) {
+  Write-Host '[AVISO] O Compose do servidor nao usa FD_DATA_DIR: confira a pasta dos dados antes de subir.' -ForegroundColor Yellow
 }
 Gravar $envFile ($linhasEnv -join "`r`n")
 Write-Host ('Pasta dos dados do armazenamento: ' + $pastaDados) -ForegroundColor Green
@@ -327,7 +440,7 @@ Write-Host ('Pasta dos dados do armazenamento: ' + $pastaDados) -ForegroundColor
 # ---------------------------------------------------------------------
 #  4/6 Sobe os servicos
 # ---------------------------------------------------------------------
-Passo '4/6 Subindo o servidor (a primeira vez leva alguns minutos)'
+Passo '4/6 Subindo o servidor e o Nextcloud (a primeira vez baixa as imagens e leva alguns minutos)'
 
 # Um servidor anterior — de outra pasta, de uma versao antiga ou aberto a mao —
 # pode estar preso na porta 8790, e ai o Docker recusa a subida com
@@ -368,24 +481,43 @@ if ($encerrados -gt 0) {
 }
 
 Push-Location $pasta
-$subiu = ((Invoke-DockerSilencioso compose up -d --build) -eq 0)
+$subida = Invoke-DockerComSaida compose up -d --build
 Pop-Location
+$subiu = ($subida.codigo -eq 0)
 
 # Se a porta estava presa por algo que so apareceu agora, libera de novo e
 # tenta uma segunda vez, em vez de desistir na primeira tentativa.
-if (-not $subiu) {
+if (-not $subiu -and $subida.saida -notmatch '(?i)toomanyrequests|rate limit|unauthorized|pull access denied') {
   Write-Host ''
   Write-Host 'A subida falhou. Liberando a porta 8790 de novo e tentando uma segunda vez...' -ForegroundColor Yellow
   Liberar-Porta8790 | Out-Null
   Start-Sleep -Seconds 3
   Push-Location $pasta
-  docker compose up -d --build
-  $subiu = ($LASTEXITCODE -eq 0)
+  $subida = Invoke-DockerComSaida compose up -d --build
   Pop-Location
+  $subiu = ($subida.codigo -eq 0)
+}
+
+# O Docker funciona sem conta, mas o Docker Hub limita os downloads de quem nao
+# esta logado: nesse caso o proprio Docker Desktop resolve, com o login.
+if (-not $subiu -and $subida.saida -match '(?i)toomanyrequests|rate limit|unauthorized|pull access denied') {
+  Write-Host ''
+  Write-Host 'O Docker Hub recusou o download das imagens (limite de quem nao esta logado).' -ForegroundColor Yellow
+  Write-Host 'Abra o Docker Desktop, entre com a sua conta Docker e volte para esta janela.' -ForegroundColor Yellow
+  Abrir-DockerDesktop | Out-Null
+  Read-Host 'Pressione Enter depois de entrar no Docker Desktop'
+  Push-Location $pasta
+  $subida = Invoke-DockerComSaida compose up -d --build
+  Pop-Location
+  $subiu = ($subida.codigo -eq 0)
 }
 
 if (-not $subiu) {
-  Write-Host '[ERRO] O docker compose falhou. Ultimas mensagens do gateway:' -ForegroundColor Red
+  Write-Host '[ERRO] O docker compose falhou. Ultimas mensagens recebidas:' -ForegroundColor Red
+  if ($subida.saida) {
+    @($subida.saida -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -Last 25) | ForEach-Object { Write-Host ('  ' + $_) }
+  }
+  Write-Host 'Mensagens do gateway:' -ForegroundColor Red
   Push-Location $pasta
   docker compose logs --tail 40 gateway
   Pop-Location
@@ -451,8 +583,14 @@ function Testar-Armazenamento {
 
 $armazenaOk = $false
 if ($localOk) {
-  Write-Host 'Conferindo o armazenamento com um envio de teste...'
-  $armazenaOk = Testar-Armazenamento
+  # Na primeira subida o Nextcloud leva alguns minutos para instalar e criar a
+  # conta: o envio de teste é repetido com paciencia antes de acusar falha.
+  Write-Host 'Conferindo o armazenamento com um envio de teste (o Nextcloud pode levar alguns minutos na primeira vez)...'
+  for ($i = 1; $i -le 48; $i++) {
+    if (Testar-Armazenamento) { $armazenaOk = $true; break }
+    Write-Host ('  aguardando o Nextcloud... (' + ($i * 5) + 's)')
+    Start-Sleep -Seconds 5
+  }
   if (-not $armazenaOk) {
     Write-Host '[AVISO] O gateway respondeu, mas a pasta de dados nao aceitou a gravacao. Recriando o servico...' -ForegroundColor Yellow
     Push-Location $pasta
@@ -939,7 +1077,9 @@ if ($localOk -and $publicoOk -and $armazenaOk) {
 }
 Write-Host '=====================================================' -ForegroundColor Cyan
 Write-Host ''
-Write-Host 'No app (pagina Armazenamento), clique em "Verificar conexao".' -ForegroundColor Cyan
+Write-Host 'Dashboard do FortesDrive (abra no navegador para comecar a usar):' -ForegroundColor Cyan
+Write-Host '  https://fortesdrive.base44.app/drive'
+Write-Host 'Na pagina Armazenamento, clique em "Verificar conexao".' -ForegroundColor Cyan
 Write-Host ''
 Write-Host 'Endereco do servidor (segredo STORAGE_SERVER_URL):' -ForegroundColor Cyan
 if ($dominio) {
@@ -951,6 +1091,12 @@ Write-Host ''
 Write-Host 'Segredo do servidor (segredo STORAGE_SIGNING_SECRET):' -ForegroundColor Cyan
 Write-Host ('  ' + $segredo)
 Write-Host ''
+Write-Host 'Nextcloud (armazenamento dos arquivos):' -ForegroundColor Cyan
+Write-Host ('  conta: ' + $usuarioNextcloud)
+Write-Host ('  senha: ' + $senhaNextcloud)
+Write-Host '  A interface web do Nextcloud fica apenas neste computador.'
+Write-Host '  Os segredos do Nextcloud ficam no .env e sao reaproveitados nas proximas execucoes.'
+Write-Host ''
 Write-Host 'Se os segredos do app estiverem diferentes destes dois valores,' -ForegroundColor Yellow
 Write-Host 'atualize-os na pagina Secrets e clique em "Verificar conexao" de novo.' -ForegroundColor Yellow
 Write-Host ''
@@ -958,7 +1104,7 @@ Write-Host 'Pasta de trabalho do servidor:' -ForegroundColor Cyan
 Write-Host ('  ' + $pasta)
 Write-Host 'Pasta raiz dos seus arquivos neste computador:' -ForegroundColor Cyan
 Write-Host ('  ' + $raiz)
-Write-Host 'Pasta dos dados do armazenamento (anotada em data-dir.txt):' -ForegroundColor Cyan
+Write-Host 'Pasta dos dados do Nextcloud (usada pelos containers, anotada em data-dir.txt):' -ForegroundColor Cyan
 Write-Host ('  ' + $pastaDados)
 Write-Host 'Inicio automatico com o Windows:' -ForegroundColor Cyan
 Write-Host ('  tarefa "' + $nomeTarefa + '" — sobe ao ligar o Windows e a cada entrada na sessao.')
@@ -992,6 +1138,14 @@ if ($exeCliente) {
   Write-Host 'FortesDrive aberto. Entre na sua conta para iniciar a sincronizacao bilateral.' -ForegroundColor Green
 } else {
   Write-Host '[AVISO] Cliente nao encontrado. Abra o FortesDrive pelo menu Iniciar.' -ForegroundColor Yellow
+}
+
+# Fim da instalacao: o dashboard e onde este servidor aparece conectado.
+try {
+  Start-Process 'https://fortesdrive.base44.app/drive'
+  Write-Host 'Dashboard aberto no navegador: entre na sua conta e comece a usar o FortesDrive.' -ForegroundColor Green
+} catch {
+  Write-Host 'Abra o dashboard no navegador: https://fortesdrive.base44.app/drive' -ForegroundColor Yellow
 }
 
 exit 0

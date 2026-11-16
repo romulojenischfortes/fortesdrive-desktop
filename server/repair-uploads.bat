@@ -130,8 +130,11 @@ async function handleUpload(req, res, key) {
   }
 
   const tempPath = path.join(TMP_DIR, crypto.randomUUID() + '.part');
+  // Em um gateway antigo (sem o módulo do Nextcloud) `nextcloud` não existe: o
+  // teste abaixo é seguro ali também — é esta a rotina que o reparo distribui.
+  const backend = typeof nextcloud !== 'undefined' && nextcloud ? nextcloud : null;
   try {
-    const finalPath = typeof uploadToFiler === 'function' ? null : objectPath(key);
+    const finalPath = backend ? null : objectPath(key);
     if (finalPath) await fsp.mkdir(path.dirname(finalPath), { recursive: true });
     const hash = crypto.createHash('sha256');
     let written = 0;
@@ -161,12 +164,12 @@ async function handleUpload(req, res, key) {
       throw Object.assign(new Error('Checksum divergente: o arquivo chegou corrompido e não foi gravado.'), { status: 422 });
     }
     if (finalPath) await fsp.rename(tempPath, finalPath);
-    else await uploadToFiler(key, tempPath, written, req.headers['content-type']);
-    sendJson(res, 200, { ok: true, key, size: written, checksum: digest });
+    else await backend.putFile(key, tempPath, digest);
+    sendJson(res, 200, { ok: true, key, size: written, checksum: digest, backend: backend ? 'nextcloud' : 'disk' });
   } catch (error) {
     if (!req.destroyed) req.resume();
     console.error('[gateway] falha no envio de ' + key + ': ' + error.message);
-    if (!res.destroyed) sendJson(res, error.status || (typeof uploadToFiler === 'function' ? 502 : 500), { error: error.message });
+    if (!res.destroyed) sendJson(res, error.status || (backend ? 502 : 500), { error: error.message });
   } finally {
     releaseUploadSlot();
     await fsp.rm(tempPath, { force: true });

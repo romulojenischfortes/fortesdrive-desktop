@@ -11,6 +11,7 @@ const channels = {
   exportTransferHistory: "exportTransferHistory", revealTransferHistoryItem: "revealTransferHistoryItem",
   getBadgeSetup: "getBadgeSetup", repairBadges: "repairBadges",
   getUpdateStatus: "getUpdateStatus", checkForUpdates: "checkForUpdates",
+  getInstallationHealth: "getInstallationHealth", confirmInstallation: "confirmInstallation",
   downloadUpdate: "downloadUpdate", installUpdate: "installUpdate",
   launchInstaller: "launchInstaller", verifyUpdateSignature: "verifyUpdateSignature",
   getServerTunnel: "getServerTunnel", setServerTunnelEnabled: "setServerTunnelEnabled",

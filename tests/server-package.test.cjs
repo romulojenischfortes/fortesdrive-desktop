@@ -15,6 +15,7 @@ const read = (relative) => fs.readFileSync(path.join(root, relative), "utf8");
 const SERVER_PAYLOAD = [
   "server/docker-compose.yml",
   "server/gateway/server.js",
+  "server/gateway/nextcloud.js",
   "server/gateway/Dockerfile",
   "server/repair-uploads.bat",
   "server/setup-server.ps1",
@@ -46,12 +47,15 @@ test("o servidor sobe o gateway na porta local do tunel", () => {
   assert.match(compose, /gateway:/, "o compose precisa declarar o servico gateway");
   assert.match(compose, /127\.0\.0\.1:8790:8790/, "o gateway deve ser publicado apenas na porta local 8790");
   assert.match(compose, /FD_DATA_DIR/, "a pasta de dados precisa vir do arquivo .env");
+  assert.match(compose, /nextcloud:/, "o Nextcloud e o servico que guarda os arquivos");
+  assert.match(compose, /NEXTCLOUD_URL/, "o gateway precisa falar com o Nextcloud pela rede interna");
 });
 
-test("o gateway grava direto na pasta de dados, sem servico intermediario", () => {
+test("o gateway grava no Nextcloud e continua conferindo cada envio", () => {
   const gateway = read("server/gateway/server.js");
-  assert.match(gateway, /DATA_DIR/, "o gateway precisa gravar na pasta de dados (DATA_DIR)");
+  assert.match(gateway, /DATA_DIR/, "o gateway precisa da pasta de dados (origem da migracao)");
   assert.match(gateway, /x-fd-sha256/, "o gateway precisa conferir o checksum de cada envio");
   assert.match(gateway, /\/v1\/status/, "o gateway precisa informar o estado da gravacao");
+  assert.match(gateway, /\/v1\/migrate/, "o gateway precisa migrar os arquivos antigos para o Nextcloud");
   assert.doesNotMatch(gateway, /seaweedfs/i, "o gateway nao pode depender de outro servico para gravar");
 });

@@ -1,31 +1,98 @@
-# FortesDrive — armazenamento próprio
+# FortesDrive — servidor de armazenamento (Nextcloud + gateway)
 #
-# Um único serviço: o gateway que autentica, confere o checksum de cada envio e
-# grava o arquivo direto na pasta de dados deste computador. Não existe serviço
-# intermediário para cair — se o gateway está no ar, a gravação funciona (e ele
-# mesmo confirma isso com um teste real antes de o app autorizar um envio).
+# O Nextcloud é o armazenamento: ele guarda os arquivos, as versões e a lixeira,
+# e tem a própria interface web. O gateway do FortesDrive fica na frente dele e
+# é o único serviço publicado (porta local 8790): autentica cada pedido do app,
+# confere o SHA-256 do envio e grava no Nextcloud por WebDAV. Quem publica para
+# a internet é o túnel/proxy descrito no README (HTTPS obrigatório).
 #
-# Só o gateway aparece para fora, e apenas na porta local 8790 — quem publica
-# para a internet é o túnel descrito no README (HTTPS obrigatório).
+# Todos os dados ficam dentro da pasta escolhida no assistente (FD_DATA_DIR):
+#   <pasta>/nextcloud  arquivos e configuração do Nextcloud
+#   <pasta>/db         banco de dados do Nextcloud
+#   <pasta>/redis      cache do Nextcloud
+#   <pasta>/u          arquivos da versão anterior (origem da migração)
 #
 #   docker compose up -d --build
 #
 name: fortesdrive-storage
 
 services:
+  nextcloud-db:
+    image: mariadb:11.4
+    command: --transaction-isolation=READ-COMMITTED --binlog-format=ROW
+    environment:
+      MARIADB_AUTO_UPGRADE: "1"
+      MARIADB_DATABASE: nextcloud
+      MARIADB_USER: nextcloud
+      MARIADB_PASSWORD: ${NEXTCLOUD_DB_PASSWORD}
+      MARIADB_ROOT_PASSWORD: ${NEXTCLOUD_DB_ROOT_PASSWORD}
+    volumes:
+      - ${FD_DATA_DIR:-./data}/db:/var/lib/mysql
+    restart: unless-stopped
+    networks:
+      - fd-storage
+
+  nextcloud-redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    volumes:
+      - ${FD_DATA_DIR:-./data}/redis:/data
+    networks:
+      - fd-storage
+
+  nextcloud:
+    image: nextcloud:30-apache
+    depends_on:
+      - nextcloud-db
+      - nextcloud-redis
+    environment:
+      MYSQL_HOST: nextcloud-db
+      MYSQL_DATABASE: nextcloud
+      MYSQL_USER: nextcloud
+      MYSQL_PASSWORD: ${NEXTCLOUD_DB_PASSWORD}
+      REDIS_HOST: nextcloud-redis
+      NEXTCLOUD_ADMIN_USER: ${NEXTCLOUD_ADMIN_USER}
+      NEXTCLOUD_ADMIN_PASSWORD: ${NEXTCLOUD_ADMIN_PASSWORD}
+      # O app nunca fala com o Nextcloud direto: quem fala é o gateway. Acrescente
+      # o endereço do túnel aqui se quiser abrir a interface web do Nextcloud.
+      NEXTCLOUD_TRUSTED_DOMAINS: nextcloud localhost 127.0.0.1
+      # Arquivos grandes: o limite real de tamanho é do gateway (10 GiB).
+      PHP_MEMORY_LIMIT: 1G
+      PHP_UPLOAD_LIMIT: 10G
+      APACHE_BODY_LIMIT: 0
+    volumes:
+      - ${FD_DATA_DIR:-./data}/nextcloud:/var/www/html
+    restart: unless-stopped
+    networks:
+      - fd-storage
+
   gateway:
     build: ./gateway
     env_file:
       - ./.env
     environment:
       PORT: "8790"
+      # Pasta de dados deste computador: área de preparo da conferência de
+      # integridade e origem da migração (a subpasta u/ da versão anterior).
       DATA_DIR: /data
+      LEGACY_DIR: /data
+      MAX_CONCURRENT_UPLOADS: "30"
+      RATE_LIMIT_PER_MINUTE: "1800"
+      NEXTCLOUD_URL: http://nextcloud
+      NEXTCLOUD_ROOT: FortesDrive
     volumes:
-      # Pasta dos dados (variável FD_DATA_DIR do arquivo .env; pode apontar para
-      # outro disco, ex: D:\FortesDriveServer\data). É aqui que os arquivos
-      # ficam — a cópia de segurança é copiar esta pasta.
+      # A pasta escolhida no assistente. É aqui que ficam os arquivos: a cópia
+      # de segurança é copiar esta pasta.
       - ${FD_DATA_DIR:-./data}:/data
     ports:
       # Publicado só no próprio computador: o túnel fala com ele por aqui.
       - "127.0.0.1:8790:8790"
+    depends_on:
+      - nextcloud
     restart: unless-stopped
+    networks:
+      - fd-storage
+
+networks:
+  fd-storage:
+    driver: bridge

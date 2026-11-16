@@ -190,6 +190,12 @@ FunctionEnd
       Abort
     ${EndIf}
     WriteRegStr HKLM "Software\FortesDrive" "MachineRole" "$FortesMachineRole"
+    ${If} "$FortesMachineRole" == "client"
+      ; O cliente abre já com a pasta escolhida, sincronizando essa pasta por
+      ; inteiro: a mesma pasta vai na linha de comando, para o aplicativo
+      ; aplicá-la antes da janela web (sem depender de o INI ser lido antes).
+      Exec '"$INSTDIR\FortesDrive.exe" "--sync-folder=$FortesSyncDir"'
+    ${EndIf}
     ${If} "$FortesMachineRole" == "server"
       CreateShortCut "$SMPROGRAMS\FortesDrive - configurar servidor.lnk" "$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" '-NoProfile -ExecutionPolicy Bypass -File "$INSTDIR\resources\server\setup-server.ps1"'
       ; Executado apenas no modo servidor, usando o pacote incluido no .exe.
@@ -212,9 +218,60 @@ FunctionEnd
   WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Explorer\ShellIconOverlayIdentifiers\ FortesDrive ${label}" "" "{9E76E330-7AB7-4AFE-B912-2A305BCD4F0${suffix}}"
   WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Shell Extensions\Approved" "{9E76E330-7AB7-4AFE-B912-2A305BCD4F0${suffix}}" "FortesDrive ${label}"
 !macroend
+; Verificacao pos-instalacao: confirma que os componentes desta versao chegaram
+; ao disco. Qualquer ausencia aparece como alerta no fim do instalador e fica
+; registrada em %APPDATA%\FortesDrive\verificacao-instalacao.log (sem segredos).
+!macro FortesVerifyInstall
+  StrCpy $R2 ""
+  StrCpy $R3 0
+  ${IfNot} ${FileExists} "$INSTDIR\FortesDrive.exe"
+    StrCpy $R2 "$R2- Programa principal (FortesDrive.exe)$\r$\n"
+    IntOp $R3 $R3 + 1
+  ${EndIf}
+  ${IfNot} ${FileExists} "$INSTDIR\resources\server\gateway\server.js"
+    StrCpy $R2 "$R2- Gateway do servidor$\r$\n"
+    IntOp $R3 $R3 + 1
+  ${EndIf}
+  ${IfNot} ${FileExists} "$INSTDIR\resources\server\gateway\nextcloud.js"
+    StrCpy $R2 "$R2- Integracao com o Nextcloud$\r$\n"
+    IntOp $R3 $R3 + 1
+  ${EndIf}
+  ${IfNot} ${FileExists} "$INSTDIR\resources\server\gateway\Dockerfile"
+    StrCpy $R2 "$R2- Imagem do gateway$\r$\n"
+    IntOp $R3 $R3 + 1
+  ${EndIf}
+  ${IfNot} ${FileExists} "$INSTDIR\resources\server\docker-compose.yml"
+    StrCpy $R2 "$R2- Composicao do servidor$\r$\n"
+    IntOp $R3 $R3 + 1
+  ${EndIf}
+  ${IfNot} ${FileExists} "$INSTDIR\resources\server\setup-server.ps1"
+    StrCpy $R2 "$R2- Assistente do servidor$\r$\n"
+    IntOp $R3 $R3 + 1
+  ${EndIf}
+  ${IfNot} ${FileExists} "$INSTDIR\resources\shell\FortesDriveOverlays.dll"
+    StrCpy $R2 "$R2- Marcas do Explorador$\r$\n"
+    IntOp $R3 $R3 + 1
+  ${EndIf}
+
+  ClearErrors
+  CreateDirectory "$APPDATA\FortesDrive"
+  FileOpen $0 "$APPDATA\FortesDrive\verificacao-instalacao.log" w
+  ${IfNot} ${Errors}
+    ${If} $R3 > 0
+      FileWrite $0 "Resultado: $R3 componente(s) desta versao nao foram aplicados.$\r$\n$R2"
+      FileClose $0
+      MessageBox MB_ICONEXCLAMATION "A atualizacao nao foi aplicada por inteiro neste computador:$\r$\n$\r$\n$R2$\r$\nFeche o aplicativo e execute este instalador novamente. Sua conta, seus arquivos e a pasta configurada continuam intactos.$\r$\n$\r$\nRegistro: $APPDATA\FortesDrive\verificacao-instalacao.log"
+    ${Else}
+      FileWrite $0 "Resultado: todos os componentes desta versao foram aplicados.$\r$\n"
+      FileClose $0
+    ${EndIf}
+  ${EndIf}
+!macroend
+
 !macro customInstall
   SetRegView 64
   !insertmacro FortesWriteSyncFolder
+  !insertmacro FortesVerifyInstall
   !insertmacro RegisterFortesOverlay 1 Synced
   !insertmacro RegisterFortesOverlay 2 Pending
   !insertmacro RegisterFortesOverlay 3 Error

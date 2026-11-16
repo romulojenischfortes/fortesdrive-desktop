@@ -8,6 +8,7 @@ const native = require("./native-files");
 const transfers = require("./native-transfers");
 const { DesktopUpdater } = require("./updater");
 const { ServerTunnel } = require("./server-tunnel");
+const { createInstallHealth } = require("./install-health");
 // As marcas no Explorador são um recurso acessório (extensão registrada pelo
 // instalador). Se o módulo que cuida delas não estiver disponível, o aplicativo
 // inicia normalmente e somente as marcas ficam indisponíveis.
@@ -23,7 +24,7 @@ const WEB_APP_URL = process.env.NODE_ENV === "development" ? "http://localhost:5
 // Aberto pelo inicio automatico do Windows: fica na bandeja, sem janela na
 // tela, para o servidor e o tunel subirem em segundo plano.
 const START_HIDDEN = process.argv.includes("--background");
-let mainWindow, tray, syncEngine, updater, transferHistory, serverTunnel;
+let mainWindow, tray, syncEngine, updater, transferHistory, serverTunnel, installHealth;
 let lastOnlineState = null;
 if (process.platform === "win32") app.setAppUserModelId("com.fortesdrive.desktop");
 const notificationQueue = [];
@@ -120,6 +121,16 @@ async function refreshSetupConfiguration() {
   }
 }
 
+// A pasta escolhida no instalador também chega na linha de comando
+// (--sync-folder=C:\...): é o que faz o cliente abrir já sincronizando a pasta
+// inteira, mesmo quando o arquivo de configuração não foi aplicado antes.
+function installFolderArgument() {
+  const prefix = "--sync-folder=";
+  const argument = process.argv.find(value => value.startsWith(prefix));
+  if (!argument) return "";
+  return argument.slice(prefix.length).trim().replace(/^"(.*)"$/, "$1").trim();
+}
+
 function trusted(event) {
   if (event.sender !== mainWindow?.webContents || event.senderFrame?.parent || new URL(event.senderFrame.url).origin !== new URL(WEB_APP_URL).origin) throw new Error("Solicitação não autorizada");
 }
@@ -197,6 +208,10 @@ function registerHandlers() {
       return result.canceled ? null : serverTunnel.setServerRoot(result.filePaths[0]);
     },
     getUpdateStatus: () => updater.getStatus(),
+    // Verificação pós-atualização: versão em execução, componentes que o
+    // instalador precisa ter entregado e o registro da última versão aprovada.
+    getInstallationHealth: () => installHealth.report(),
+    confirmInstallation: version => installHealth.confirm(version),
     getBadgeSetup: () => badgeSetup.readBadgeSetup(),
     repairBadges: () => badgeSetup.repairBadges({ app }),
     checkForUpdates: () => updater.check(),
@@ -339,7 +354,17 @@ app.whenReady().then(async () => {
   transferHistory = new TransferHistory(app.getPath("userData"), syncEngine);
   serverTunnel = new ServerTunnel({ userDataDir: app.getPath("userData"), app, onState: refreshTrayMenu });
   await serverTunnel.init();
+  installHealth = createInstallHealth({ app });
+  await installHealth.load();
   await refreshSetupConfiguration();
+  // A pasta vinda do instalador é aplicada aqui, antes da janela web, e some
+  // quando já é a mesma pasta configurada.
+  const folderArgument = installFolderArgument();
+  if (folderArgument) {
+    const current = syncEngine.watchFolder;
+    const same = current && path.resolve(current).toLowerCase() === path.resolve(folderArgument).toLowerCase();
+    if (!same) await syncEngine.setWatchFolder(folderArgument).catch(error => { syncEngine.state.error = "Não foi possível usar a pasta escolhida no instalador: " + error.message; });
+  }
   // Se outro perfil do Windows abrir o app, exige a propria escolha nativa
   // antes da janela web, do login e de qualquer transferencia.
   if (!syncEngine.folderConfigured) {
@@ -347,6 +372,11 @@ app.whenReady().then(async () => {
   }
   const { autoUpdater } = require("electron-updater");
   updater = new DesktopUpdater(autoUpdater, app, syncEngine, notify);
+  // A versão baixada é a que precisa estar rodando no próximo início: é com ela
+  // que a verificação pós-atualização confirma se a instalação foi aplicada.
+  autoUpdater.on("update-downloaded", info => {
+    installHealth.expectUpdate(info.version).catch(error => console.warn("Registro da atualização: " + error.message));
+  });
   registerHandlers(); createWindow();
   if (syncEngine.watchFolder) await syncEngine.start().catch(error => { syncEngine.state.error = error.message; });
   await createTray();

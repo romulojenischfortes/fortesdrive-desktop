@@ -9,6 +9,10 @@ class SyncEngine {
   constructor(notify) {
     this.store = new Store({ name: "fortesdrive-native-v2" });
     this.watchFolder = this.store.get("watchFolder", null);
+    // A pasta padrão da primeira execução já existe, mas ninguém escolheu onde
+    // ela fica nem como se chama: enquanto isso não é confirmado, o aplicativo
+    // abre o assistente de pasta. Uma instalação antiga já sincronizando conta
+    // como confirmada e não é interrompida.
     if (this.store.has("folderConfigured")) this.folderConfigured = !!this.store.get("folderConfigured");
     else { this.folderConfigured = !!this.watchFolder; this.store.set("folderConfigured", this.folderConfigured); }
     this.deviceId = this.store.get("deviceId", crypto.randomUUID());
@@ -24,6 +28,7 @@ class SyncEngine {
     await this.stop();
     this.watchFolder = canonical;
     this.store.set("watchFolder", canonical);
+    // Pasta escolhida explicitamente (local + nome) não precisa mais do assistente.
     this.folderConfigured = true;
     this.store.set("folderConfigured", true);
     await this.start();
