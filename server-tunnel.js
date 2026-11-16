@@ -150,7 +150,8 @@ class ServerTunnel {
     });
     this.child = child;
     this.tail = "";
-    child.stdout?.on("data", () => {});
+    this.log = "";
+    child.stdout?.on("data", data => { this.log = (this.log + String(data)).slice(-2000); });
     child.stderr?.on("data", data => { this.tail = (this.tail + String(data)).slice(-400); });
     child.on("error", error => {
       if (this.child !== child) return;
@@ -159,10 +160,13 @@ class ServerTunnel {
     });
     child.on("exit", () => this.exited(child));
 
-    const url = `https://${this.state.domain}`;
     for (let i = 0; i < 60; i++) {
       await sleep(1000);
       if (this.child !== child) return this.getStatus();
+      // O proprio ngrok avisa o endereco publicado ("Forwarding https://... ");
+      // se ele for diferente do dominio reservado, e esse que vale conferir.
+      const announced = (this.log.match(/Forwarding\s+(https:\/\/[^\s]+)/i) || [])[1];
+      const url = announced || `https://${this.state.domain}`;
       if (await answers(url + "/health", { "ngrok-skip-browser-warning": "1" })) {
         this.update({ status: "online", url, error: "", attempts: 0 });
         return this.getStatus();
