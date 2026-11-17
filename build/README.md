@@ -129,7 +129,7 @@ inteiro:
 2. grava o gateway (SeaweedFS + Docker Compose) na pasta de trabalho do servidor;
 3. reaproveita ou cria o segredo de assinatura;
 4. sobe os serviços e espera o gateway responder na porta 8790;
-5. instala o túnel e explica a etapa manual do token (ngrok);
+5. instala o cloudflared e explica a etapa manual do token (Cloudflare Tunnel);
 6. mostra o endereço e o segredo que devem ser colados no app.
 
 A pasta padrão é a mesma do instalador avulso `instalar-servidor.bat`

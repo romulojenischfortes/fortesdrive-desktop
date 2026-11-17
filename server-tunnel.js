@@ -3,10 +3,11 @@ const fs = require("node:fs/promises");
 const path = require("node:path");
 
 const PORT = 8790;
-const DEFAULT_DOMAIN = "uranometrical-nonequatorial-kiley.ngrok-free.dev";
-const DEFAULT_ROOT = path.join(process.env.USERPROFILE || process.env.HOME || "", "Desktop", "storage-server");
 const MAX_ATTEMPTS = 6;
 const LEGACY_TASK = "FortesDrive - servidor de armazenamento";
+const DEFAULT_ROOT = path.join(process.env.USERPROFILE || process.env.HOME || "", "Desktop", "storage-server");
+// Túnel rápido do Cloudflare (sem conta): o endereço muda a cada subida.
+const QUICK_URL = /https:\/\/[a-z0-9-]+\.trycloudflare\.com/i;
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -20,21 +21,57 @@ async function exists(target) {
   try { await fs.access(target); return true; } catch { return false; }
 }
 
-async function answers(url, headers) {
+async function answers(url) {
   try {
-    const response = await fetch(url, { headers, signal: AbortSignal.timeout(5000) });
+    const response = await fetch(url, { signal: AbortSignal.timeout(5000) });
     return response.ok;
   } catch { return false; }
+}
+
+/** Endereço público digitado no assistente: só o nome do host, sem esquema nem barra. */
+function normalizeHost(value) {
+  return String(value || "")
+    .trim()
+    .replace(/^https?:\/\//i, "")
+    .replace(/\/.*$/, "")
+    .toLowerCase();
+}
+
+/**
+ * Comando do cloudflared. Com token, o Cloudflare entrega o túnel nomeado (o
+ * hostname público é definido no painel da Cloudflare e não muda). Sem token, o
+ * túnel rápido devolve um endereço trycloudflare.com que muda a cada subida.
+ */
+function tunnelPlan({ token, hostname, port = PORT }) {
+  const host = normalizeHost(hostname);
+  if (token) {
+    return {
+      mode: "named",
+      args: ["tunnel", "--no-autoupdate", "run", "--token", token],
+      url: host ? "https://" + host : "",
+      host,
+    };
+  }
+  return {
+    mode: "quick",
+    args: ["tunnel", "--no-autoupdate", "--url", "http://127.0.0.1:" + port],
+    url: "",
+    host,
+  };
 }
 
 /**
  * Servidor e túnel do modo Servidor, gerenciados pelo próprio aplicativo.
  *
- * O gateway é conferido na porta 8790 e o comando do ngrok
- * (ngrok http --domain=... 8790) roda a partir da pasta raiz do servidor, sem
- * janela de CMD: o processo é filho do aplicativo e continua vivo com a janela
- * principal oculta na bandeja. Se o túnel cair, ele volta sozinho algumas
- * vezes e, se não voltar, o estado e o erro aparecem na bandeja e no painel.
+ * O gateway é conferido na porta 8790 e o cloudflared roda a partir da pasta
+ * raiz do servidor, sem janela de CMD: o processo é filho do aplicativo e
+ * continua vivo com a janela principal oculta na bandeja. Se o túnel cair, ele
+ * volta sozinho algumas vezes e, se não voltar, o estado e o erro aparecem na
+ * bandeja e no painel.
+ *
+ * Lê três arquivos que o assistente do servidor grava na pasta do servidor:
+ * cloudflare-hostname.txt (endereço público), cloudflared-token.txt (token do
+ * tunnel nomeado) e cloudflared-path.txt (onde o cloudflared.exe ficou).
  */
 class ServerTunnel {
   constructor({ userDataDir, app, onState }) {
@@ -44,12 +81,14 @@ class ServerTunnel {
     this.child = null;
     this.retry = null;
     this.tail = "";
+    this.log = "";
     this.killedStray = false;
     this.state = {
       enabled: false,
       status: "stopped",
       serverRoot: DEFAULT_ROOT,
-      domain: DEFAULT_DOMAIN,
+      hostname: "",
+      mode: "",
       url: "",
       port: PORT,
       attempts: 0,
@@ -71,7 +110,7 @@ class ServerTunnel {
       if (saved.serverRoot) this.state.serverRoot = saved.serverRoot;
       this.state.enabled = saved.enabled === true;
     } catch { /* arquivo ilegivel: volta ao padrao */ }
-    await this.readDomain();
+    await this.readTunnelFiles();
     // Reafirma o inicio com o Windows para quem já tinha o túnel ligado.
     if (this.state.enabled) this.app?.setLoginItemSettings?.({ openAtLogin: true, args: ["--background"] });
     return this.getStatus();
@@ -82,10 +121,12 @@ class ServerTunnel {
     await fs.writeFile(this.file, JSON.stringify({ enabled: this.state.enabled, serverRoot: this.state.serverRoot }), "utf8");
   }
 
-  /** O endereço gravado pelo assistente do servidor é a fonte do domínio. */
-  async readDomain() {
-    const saved = (await fs.readFile(path.join(this.state.serverRoot, "ngrok-domain.txt"), "utf8").catch(() => "")).trim();
-    if (saved) this.state.domain = saved;
+  /** Endereço e token gravados pelo assistente do servidor. */
+  async readTunnelFiles() {
+    const host = await fs.readFile(path.join(this.state.serverRoot, "cloudflare-hostname.txt"), "utf8").catch(() => "");
+    this.state.hostname = normalizeHost(host);
+    this.token = (await fs.readFile(path.join(this.state.serverRoot, "cloudflared-token.txt"), "utf8").catch(() => "")).trim();
+    this.state.mode = this.token ? "named" : "quick";
   }
 
   async setEnabled(enabled) {
@@ -102,13 +143,16 @@ class ServerTunnel {
     if (!(await exists(root))) throw new Error("Escolha uma pasta que exista no computador.");
     this.state.serverRoot = root;
     await this.save();
-    await this.readDomain();
+    await this.readTunnelFiles();
     if (this.state.enabled) await this.restart();
     return this.getStatus();
   }
 
   async restart() {
     await this.stop();
+    // Reiniciar precisa valer de verdade: encerra também um túnel que a tarefa
+    // do Windows deixou no ar, para não continuar no estado antigo.
+    await this.killStray();
     void this.start();
     return this.getStatus();
   }
@@ -120,7 +164,16 @@ class ServerTunnel {
     this.update({ status: "starting", error: "", url: "" });
     if (!(await this.ensureServer())) return this.getStatus();
     if (!this.state.enabled) return this.getStatus();
-    await this.launch();
+    await this.readTunnelFiles();
+
+    // O assistente do servidor já pode ter deixado o túnel no ar (tarefa do
+    // Windows): nesse caso ele é usado como está, sem abrir um segundo agente.
+    const plan = tunnelPlan({ token: this.token, hostname: this.state.hostname, port: PORT });
+    if (plan.url && (await answers(plan.url + "/health"))) {
+      this.update({ status: "online", url: plan.url, error: "", attempts: 0 });
+      return this.getStatus();
+    }
+    await this.launch(plan);
     return this.getStatus();
   }
 
@@ -139,20 +192,24 @@ class ServerTunnel {
     return this.fail("O servidor local não respondeu na porta 8790. Abra o Docker Desktop e reinicie o túnel.");
   }
 
-  async launch() {
-    const exe = await this.findNgrok();
+  async launch(plan) {
+    const exe = await this.findCloudflared();
     if (!exe) {
-      return this.fail('O ngrok não está instalado neste computador. Use o atalho "FortesDrive — configurar servidor" do menu Iniciar.');
+      return this.fail('O cloudflared não está instalado neste computador. Use o atalho "FortesDrive — configurar servidor" do menu Iniciar.');
     }
+    if (plan.mode === "named" && !plan.host) {
+      return this.fail("O túnel do Cloudflare está configurado, mas falta o endereço público. No assistente do servidor, informe o Public Hostname do túnel (por exemplo drive.seudominio.com).");
+    }
+
     // O comando do túnel roda a partir da pasta raiz do servidor.
-    const child = spawn(exe, ["http", `--domain=${this.state.domain}`, String(PORT)], {
+    const child = spawn(exe, plan.args, {
       cwd: this.state.serverRoot, windowsHide: true, stdio: ["ignore", "pipe", "pipe"],
     });
     this.child = child;
     this.tail = "";
     this.log = "";
-    child.stdout?.on("data", data => { this.log = (this.log + String(data)).slice(-2000); });
-    child.stderr?.on("data", data => { this.tail = (this.tail + String(data)).slice(-400); });
+    child.stdout?.on("data", data => { this.log = (this.log + String(data)).slice(-4000); });
+    child.stderr?.on("data", data => { this.tail = (this.tail + String(data)).slice(-400); this.log = (this.log + String(data)).slice(-4000); });
     child.on("error", error => {
       if (this.child !== child) return;
       this.child = null;
@@ -163,12 +220,12 @@ class ServerTunnel {
     for (let i = 0; i < 60; i++) {
       await sleep(1000);
       if (this.child !== child) return this.getStatus();
-      // O proprio ngrok avisa o endereco publicado ("Forwarding https://... ");
-      // se ele for diferente do dominio reservado, e esse que vale conferir.
-      const announced = (this.log.match(/Forwarding\s+(https:\/\/[^\s]+)/i) || [])[1];
-      const url = announced || `https://${this.state.domain}`;
-      if (await answers(url + "/health", { "ngrok-skip-browser-warning": "1" })) {
-        this.update({ status: "online", url, error: "", attempts: 0 });
+      // Túnel rápido: o cloudflared anuncia o endereço publicado no log e ele
+      // muda a cada subida — é esse o endereço a conferir.
+      const quick = plan.mode === "quick" ? (this.log.match(QUICK_URL) || [])[0] : "";
+      const url = plan.mode === "named" ? plan.url : quick;
+      if (url && (await answers(url + "/health"))) {
+        this.update({ status: "online", url, mode: plan.mode, error: "", attempts: 0 });
         return this.getStatus();
       }
     }
@@ -181,9 +238,9 @@ class ServerTunnel {
   async exited(child) {
     if (this.child !== child) return;
     this.child = null;
-    // Mesmo endereço já publicado por outro ngrok (por exemplo, a tarefa antiga
-    // do assistente): encerra o processo duplicado e sobe o túnel de novo.
-    if (!this.killedStray && /already online|ERR_NGROK_334|failed to start tunnel/i.test(this.tail)) {
+    // Um agente anterior (tarefa antiga do assistente) publicando o mesmo túnel:
+    // encerra o processo duplicado e sobe o túnel de novo.
+    if (!this.killedStray && /already|in use|conflict|failed to start|unable to|connection refused/i.test(this.tail)) {
       this.killedStray = true;
       await this.killStray();
       return void this.start({ attempts: this.state.attempts });
@@ -224,7 +281,7 @@ class ServerTunnel {
   }
 
   async killStray() {
-    if (process.platform === "win32") await run("taskkill", ["/IM", "ngrok.exe", "/F"]);
+    if (process.platform === "win32") await run("taskkill", ["/IM", "cloudflared.exe", "/F"]);
   }
 
   /** A tarefa agendada do assistente antigo disputaria o mesmo endereço público. */
@@ -232,22 +289,21 @@ class ServerTunnel {
     if (process.platform === "win32") await run("schtasks", ["/Delete", "/TN", LEGACY_TASK, "/F"]);
   }
 
-  async findNgrok() {
-    const recorded = (await fs.readFile(path.join(this.state.serverRoot, "ngrok-path.txt"), "utf8").catch(() => "")).trim();
+  async findCloudflared() {
+    const recorded = (await fs.readFile(path.join(this.state.serverRoot, "cloudflared-path.txt"), "utf8").catch(() => "")).trim();
     const candidates = [
       recorded,
-      process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, "ngrok", "ngrok.exe"),
-      process.env.USERPROFILE && path.join(process.env.USERPROFILE, "ngrok.exe"),
-      "C:\\ngrok\\ngrok.exe",
-      process.env.ProgramFiles && path.join(process.env.ProgramFiles, "ngrok", "ngrok.exe"),
+      process.env.ProgramFiles && path.join(process.env.ProgramFiles, "cloudflared", "cloudflared.exe"),
+      process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, "cloudflared", "cloudflared.exe"),
+      process.env.USERPROFILE && path.join(process.env.USERPROFILE, "cloudflared.exe"),
     ].filter(Boolean);
     for (const candidate of candidates) if (await exists(candidate)) return candidate;
     return new Promise(resolve => {
-      execFile("where", ["ngrok"], { windowsHide: true }, (error, stdout) => {
+      execFile("where", ["cloudflared"], { windowsHide: true }, (error, stdout) => {
         resolve(error ? null : String(stdout).split(/\r?\n/)[0].trim() || null);
       });
     });
   }
 }
 
-module.exports = { ServerTunnel, DEFAULT_DOMAIN, DEFAULT_ROOT };
+module.exports = { ServerTunnel, PORT, DEFAULT_ROOT, QUICK_URL, normalizeHost, tunnelPlan };

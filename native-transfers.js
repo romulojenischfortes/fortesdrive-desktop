@@ -59,7 +59,7 @@ async function upload(root, relative, authorization, expected, progress, allowLo
   if (!before.isFile() || before.isSymbolicLink() || before.size !== expected.size || (expected.mtimeMs != null && before.mtimeMs !== expected.mtimeMs)) throw new Error('Arquivo alterado antes do envio.');
   const hash = crypto.createHash('sha256');
   const counter = meter(hash, expected.size, progress);
-  const req = request(url, 'PUT', { 'Content-Type': 'application/octet-stream', 'Content-Length': expected.size, 'x-fd-sha256': expected.checksum, 'ngrok-skip-browser-warning': 'true' });
+  const req = request(url, 'PUT', { 'Content-Type': 'application/octet-stream', 'Content-Length': expected.size, 'x-fd-sha256': expected.checksum });
   const received = new Promise((resolve, reject) => {
     req.once('error', reject);
     req.once('response', response => responseJson(response).then(resolve, reject));
@@ -81,7 +81,7 @@ async function download(root, relative, address, file, expected, progress, allow
   if (internalStat?.isSymbolicLink() || (internalStat && !internalStat.isDirectory())) throw new Error('Diretorio interno inseguro.');
   await fs.mkdir(internalDir, { recursive: true });
   const internal = path.join(internalDir, crypto.randomUUID() + '.tmp');
-  const req = request(url, 'GET', { 'ngrok-skip-browser-warning': 'true' });
+  const req = request(url, 'GET', {});
   try {
     const response = await new Promise((resolve, reject) => { req.once('error', reject); req.once('response', resolve); req.end(); });
     if (response.statusCode !== 200) { response.resume(); throw Object.assign(new Error('Servidor recusou o download.'), { status: response.statusCode }); }

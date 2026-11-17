@@ -14,13 +14,14 @@
        dados do Nextcloud, que é o que os volumes do Docker usam;
     4. libera a porta 8790 (encerrando servidor anterior) e sobe o Nextcloud e
        o gateway em contêineres, esperando os dois responderem;
-    5. instala o túnel, abre a janela dele na pasta do servidor e explica a
-       etapa manual do token;
+    5. instala o cloudflared (túnel do Cloudflare) e pede o token do tunnel uma
+       única vez, guardando o endereço público para as próximas subidas;
     6. mostra o endereço e o segredo que devem ser colados no app;
     7. registra a subida automática com o Windows (servidor + túnel), ao ligar
        o computador e a cada entrada na sessão;
-    8. guarda o endereço do túnel (ngrok-domain.txt), que é o que a subida
-       automática usa — ninguém precisa digitar o endereço de novo.
+    8. guarda o endereço público (cloudflare-hostname.txt), o token do tunnel
+       (cloudflared-token.txt) e o caminho do cloudflared (cloudflared-path.txt),
+       que é o que a subida automática e o aplicativo usam.
 
   Nada aqui apaga arquivos já gravados: a pasta ./data e o .env
   existentes são mantidos.
@@ -47,9 +48,10 @@ $areaTrabalho = [Environment]::GetFolderPath('Desktop')
 if (-not $areaTrabalho) { $areaTrabalho = Join-Path $env:USERPROFILE 'Desktop' }
 $pasta = if ($Folder) { $Folder } else { Join-Path $areaTrabalho 'storage-server' }
 
-# Endereço do túnel deste servidor. Fica gravado em ngrok-domain.txt e é ele que
-# a subida automática usa ao ligar o Windows: ninguém digita o endereço de novo.
-$dominioPadrao = 'uranometrical-nonequatorial-kiley.ngrok-free.dev'
+# Endereço público do túnel deste servidor (o Public Hostname definido no painel
+# da Cloudflare). Fica gravado em cloudflare-hostname.txt e é ele que o app usa;
+# sem ele o túnel sobe no modo temporário (trycloudflare), que muda a cada subida.
+$dominioPadrao = ''
 
 function Passo($texto) {
   Write-Host ''
@@ -61,7 +63,7 @@ function Gravar($caminho, $conteudo) {
   [System.IO.File]::WriteAllText($caminho, $conteudo, $utf8SemBom)
 }
 
-# O .env e o ngrok.yml sao arquivos UTF-8, mas Get-Content no Windows PowerShell
+# O .env e os arquivos do tunel sao UTF-8, mas Get-Content no Windows PowerShell
 # decodifica como ANSI: "Rômulo" voltava como "RÃ´mulo" e a pasta de dados
 # apontava para um usuario que nao existe (o Docker recusava com "Access is
 # denied", o servidor nao subia e o tunel respondia 502). Tudo aqui e lido e
@@ -615,267 +617,178 @@ if ($localOk) {
   }
 }
 
-$arquivoDominio = Join-Path $pasta 'ngrok-domain.txt'
-$dominio = [string]$env:FD_DOMAIN
-if (-not $dominio -and (Test-Path $arquivoDominio)) {
-  $dominio = (Get-Content -Raw -LiteralPath $arquivoDominio).Trim()
-}
-if (-not $dominio) { $dominio = $dominioPadrao }
-# Grava o endereco: e este arquivo que a subida automatica le ao ligar o Windows.
-Gravar $arquivoDominio $dominio
-Write-Host ('Endereco do tunel guardado para as proximas subidas: ' + $dominio) -ForegroundColor Green
+$arquivoHost = Join-Path $pasta 'cloudflare-hostname.txt'
+$arquivoTokenCf = Join-Path $pasta 'cloudflared-token.txt'
+$arquivoExeCf = Join-Path $pasta 'cloudflared-path.txt'
 
-function Achar-Ngrok {
-  $cmd = Get-Command ngrok -ErrorAction SilentlyContinue
+# Endereco publico do tunel: o Public Hostname configurado no painel da
+# Cloudflare para este tunnel (por exemplo drive.seudominio.com).
+$hostPublico = [string]$env:FD_HOSTNAME
+if (-not $hostPublico -and (Test-Path -LiteralPath $arquivoHost)) { $hostPublico = (Ler-TextoUtf8 $arquivoHost).Trim() }
+$hostPublico = ($hostPublico -replace '^\s*https?://', '').Trim().TrimEnd('/').ToLower()
+if (-not $hostPublico -and $dominioPadrao) { $hostPublico = $dominioPadrao }
+
+function Achar-Cloudflared {
+  $cmd = Get-Command cloudflared -ErrorAction SilentlyContinue
   if ($cmd) { return $cmd.Source }
   $candidatos = @(
-    (Join-Path $env:LOCALAPPDATA 'ngrok\ngrok.exe'),
-    (Join-Path $env:USERPROFILE 'ngrok.exe'),
-    'C:\ngrok\ngrok.exe',
-    (Join-Path $env:ProgramFiles 'ngrok\ngrok.exe')
+    (Join-Path $env:ProgramFiles 'cloudflared\cloudflared.exe'),
+    (Join-Path $env:LOCALAPPDATA 'cloudflared\cloudflared.exe'),
+    (Join-Path $env:USERPROFILE 'cloudflared.exe')
   )
-  foreach ($p in $candidatos) { if ($p -and (Test-Path $p)) { return $p } }
+  foreach ($p in $candidatos) { if ($p -and (Test-Path -LiteralPath $p)) { return $p } }
   return $null
 }
 
-# O pacote do ngrok fica guardado dentro do proprio FortesDrive (nao depende do
-# site de terceiros). A copia do app tem a impressao digital conferida antes de
-# ser usada; o endereco oficial do ngrok fica como alternativa.
-$fontesNgrok = @(
-  @{ Url = 'https://fortesdrive.base44.app/storage-server/ngrok.zip'; Sha256 = '438bad3dbefd7e244be9dfae3889dcf99073b515845b66ab5617e4887bc24636' },
-  @{ Url = 'https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip'; Sha256 = '' }
-)
-
-function Instalar-Ngrok($pastaDestino) {
-  $zip = Join-Path $env:TEMP 'ngrok-fortesdrive.zip'
-  foreach ($fonte in $fontesNgrok) {
-    try {
-      Invoke-WebRequest $fonte.Url -OutFile $zip -UseBasicParsing -TimeoutSec 900
-      if ($fonte.Sha256) {
-        $obtido = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLower()
-        if ($obtido -ne $fonte.Sha256) { throw 'o pacote baixado nao passou na verificacao de integridade' }
-      }
-      Expand-Archive -LiteralPath $zip -DestinationPath $pastaDestino -Force
-      $exe = Join-Path $pastaDestino 'ngrok.exe'
-      if (Test-Path $exe) { Write-Host ('  ngrok pronto em ' + $exe) -ForegroundColor Green; return $exe }
-      throw 'o pacote nao continha o ngrok.exe'
-    } catch {
-      Write-Host ('  [AVISO] ' + $_.Exception.Message) -ForegroundColor Yellow
-    }
-  }
-  return $null
-}
-
-$ngrok = Achar-Ngrok
-if (-not $ngrok) {
-  Write-Host 'ngrok nao encontrado: instalando a partir dos arquivos do FortesDrive...'
-  $destino = Join-Path $env:LOCALAPPDATA 'ngrok'
+# O cloudflared e o binario oficial do Cloudflare. A copia fica na pasta do
+# usuario e o caminho e guardado para as proximas subidas (inclusive a do
+# aplicativo, que rele esse arquivo ao ligar o Windows).
+function Instalar-Cloudflared {
+  $destino = Join-Path $env:LOCALAPPDATA 'cloudflared'
   New-Item -ItemType Directory -Force $destino | Out-Null
-  $ngrok = Instalar-Ngrok $destino
-}
-if ($ngrok) {
-  Write-Host ('ngrok instalado: ' + $ngrok) -ForegroundColor Green
-  Gravar (Join-Path $pasta 'ngrok-path.txt') $ngrok
-} else {
-  Write-Host '[AVISO] Nao consegui instalar o ngrok automaticamente.' -ForegroundColor Yellow
-  Write-Host 'Baixe em https://ngrok.com/download e use o caminho do ngrok.exe nos passos abaixo.'
-}
-
-# O token do ngrok e pessoal e nunca fica guardado neste assistente: ele e
-# pedido uma vez (digitacao oculta) e registrado na configuracao do proprio
-# ngrok. Se a configuracao ja existir, o tunel sobe sem perguntar nada.
-function Tem-TokenNgrok {
-  $config = Join-Path $env:LOCALAPPDATA 'ngrok\ngrok.yml'
-  return (Test-Path $config) -and ((Get-Content -Raw -LiteralPath $config) -match 'authtoken\s*:')
-}
-
-# O token do ngrok e pessoal: fica ligado a conta de quem criou o tunel e por
-# isso nunca vem dentro do instalador. Ele e pedido UMA vez aqui, no proprio
-# assistente, e registrado na configuracao do ngrok (que passa a subir o tunel
-# sozinho com o Windows). A digitacao e oculta e o token nao e gravado em log,
-# nem mostrado no resumo final.
-function Registrar-TokenNgrok($exe) {
-  Write-Host ''
-  Write-Host 'O tunel precisa do token da SUA conta ngrok (o cadastro e gratuito).' -ForegroundColor Cyan
-  Write-Host 'Abri a pagina do token no navegador. Copie o token que aparece la e cole aqui.'
-  Write-Host 'A digitacao fica oculta e o token nao e guardado por este assistente'
-  Write-Host 'nem aparece no resumo final.'
-  Write-Host ''
-  try { Start-Process 'https://dashboard.ngrok.com/get-started/your-authtoken' } catch { }
-  $oculto = Read-Host 'Token do ngrok (Enter vazio = deixar para depois)' -AsSecureString
-  $ponteiro = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($oculto)
-  try { $token = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($ponteiro) }
-  finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ponteiro) }
-  if (-not $token) { return $false }
-
-  $antes = $ErrorActionPreference
-  $ErrorActionPreference = 'Continue'
-  try { & $exe config add-authtoken $token 2>&1 | Out-Null } finally { $ErrorActionPreference = $antes }
-  $token = $null
-  if (Tem-TokenNgrok) {
-    return $true
-  }
-  Write-Host '[AVISO] O token nao foi aceito. Confira se copiou o token inteiro.' -ForegroundColor Yellow
-  return $false
-}
-
-# --- ngrok como Servico do Windows -----------------------------------
-# O ngrok.yml e o arquivo de configuracao do proprio ngrok: guarda o authtoken
-# (pessoal, colocado acima com "ngrok config add-authtoken") e o tunel fixo
-# deste servidor. E esse arquivo que o Servico do Windows usa.
-function Arquivo-ConfigNgrok {
-  return (Join-Path $env:LOCALAPPDATA 'ngrok\ngrok.yml')
-}
-
-# Garante, no ngrok.yml, o tunel fixo do FortesDrive: http -> porta 8790 no
-# dominio reservado, sem depender de nenhum comando na linha de comando.
-function Garantir-ConfigNgrok($dominio) {
-  $arquivo = Arquivo-ConfigNgrok
-  New-Item -ItemType Directory -Force (Split-Path $arquivo) | Out-Null
-  if (-not (Test-Path $arquivo)) { Gravar $arquivo ("version: `"3`"" + "`r`n") }
-  $texto = Ler-TextoUtf8 $arquivo
-  if ($texto -match '(?m)^tunnels:') {
-    # Um tunel antigo pode apontar para outra porta: o ngrok mostrava
-    # "http://localhost:87" e tudo respondia 502. Aqui o tunel do FortesDrive e
-    # corrigido para a porta 8790, sem mexer nos outros tuneis.
-    $padraoTunel = [regex]::new('(?ms)^(\s{2}fortesdrive:\r?\n)((?:[ \t]+.*(?:\r?\n|$))*)')
-    if ($padraoTunel.IsMatch($texto)) {
-      $novo = $padraoTunel.Replace($texto, [System.Text.RegularExpressions.MatchEvaluator]{ param($m)
-        $corpo = $m.Groups[2].Value
-        if ($corpo -match '(?m)^\s*addr:') {
-          $corpo = [regex]::Replace($corpo, '(?m)^(\s*addr:\s*).*$', [System.Text.RegularExpressions.MatchEvaluator]{ param($a) $a.Groups[1].Value + '8790' })
-        } else {
-          $corpo = "    proto: http`r`n    addr: 8790`r`n" + $corpo
-        }
-        if ($corpo -match '(?m)^\s*domain:') {
-          $corpo = [regex]::Replace($corpo, '(?m)^(\s*domain:\s*).*$', [System.Text.RegularExpressions.MatchEvaluator]{ param($d) $d.Groups[1].Value + $dominio })
-        } else {
-          $corpo = $corpo.TrimEnd() + "`r`n    domain: " + $dominio + "`r`n"
-        }
-        return $m.Groups[1].Value + $corpo
-      })
-      if ($novo -ne $texto) {
-        Gravar $arquivo $novo
-        Write-Host 'Tunel do FortesDrive ajustado no ngrok.yml: porta 8790.' -ForegroundColor Green
-      } else {
-        Write-Host 'Tunel do FortesDrive ja apontava para a porta 8790.' -ForegroundColor Green
-      }
-    } else {
-      Write-Host 'O ngrok.yml ja tinha tuneis definidos; mantidos como estao.' -ForegroundColor Green
-    }
-    return $true
-  }
-  $bloco = @(
-    'tunnels:',
-    '  fortesdrive:',
-    '    proto: http',
-    '    addr: 8790',
-    ('    domain: ' + $dominio)
-  ) -join "`r`n"
-  Gravar $arquivo (($texto.TrimEnd() + "`r`n") + $bloco + "`r`n")
-  Write-Host 'Tunel fixo gravado no ngrok.yml: http -> porta 8790 no dominio reservado.' -ForegroundColor Green
-  return $true
-}
-
-function ServicoNgrok {
-  return (Get-Service -ErrorAction SilentlyContinue | Where-Object { $_.Name -match 'ngrok' -or $_.DisplayName -match 'ngrok' } | Select-Object -First 1)
-}
-
-# Registra o tunel como Servico do Windows: roda em segundo plano, sem janela
-# nenhuma, e sobe junto com o computador. O install/uninstall precisa de
-# administrador; quando nao der, quem chamou cai no atalho antigo.
-function Instalar-ServicoNgrok($exe) {
-  $config = Arquivo-ConfigNgrok
-  $antes = $ErrorActionPreference
-  $ErrorActionPreference = 'Continue'
+  $exe = Join-Path $destino 'cloudflared.exe'
   try {
-    & $exe service stop 2>&1 | Out-Null
-    & $exe service uninstall 2>&1 | Out-Null
-    & $exe service install ('--config=' + $config) 2>&1 | Out-Null
-    & $exe service start 2>&1 | Out-Null
-  } finally { $ErrorActionPreference = $antes }
-
-  for ($i = 1; $i -le 10; $i++) {
-    $servico = ServicoNgrok
-    if ($servico -and $servico.Status -eq 'Running') { return $true }
-    Start-Sleep -Seconds 2
+    Invoke-WebRequest 'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe' -OutFile $exe -UseBasicParsing -TimeoutSec 900
+    if (-not (Test-Path -LiteralPath $exe)) { throw 'o download nao gerou o cloudflared.exe' }
+    Write-Host ('  cloudflared pronto em ' + $exe) -ForegroundColor Green
+    return $exe
+  } catch {
+    Write-Host ('  [AVISO] ' + $_.Exception.Message) -ForegroundColor Yellow
+    return $null
   }
-  return $false
 }
 
-# A janela do tunel e aberta VISIVEL, na pasta do servidor: e ali que se confere
-# o endereco publicado e se acompanha o trafego. O arquivo abrir-tunel.cmd guarda
-# o comando exato, para subir o tunel de novo com dois cliques quando precisar.
+$cloudflared = Achar-Cloudflared
+if (-not $cloudflared) {
+  Write-Host 'cloudflared nao encontrado: baixando o binario oficial do Cloudflare...'
+  $cloudflared = Instalar-Cloudflared
+}
+if ($cloudflared) {
+  Write-Host ('cloudflared instalado: ' + $cloudflared) -ForegroundColor Green
+  Gravar $arquivoExeCf $cloudflared
+} else {
+  Write-Host '[AVISO] Nao consegui instalar o cloudflared automaticamente.' -ForegroundColor Yellow
+  Write-Host 'Baixe em https://github.com/cloudflare/cloudflared/releases e rode de novo este atalho.'
+}
+
+# O token do tunnel e pessoal: fica ligado a conta Cloudflare de quem criou o
+# tunel e por isso nunca vem dentro do instalador. Ele e pedido UMA vez aqui
+# (digitacao oculta), guardado em cloudflared-token.txt e reaproveitado depois.
+$tokenTunel = ''
+if (Test-Path -LiteralPath $arquivoTokenCf) { $tokenTunel = (Ler-TextoUtf8 $arquivoTokenCf).Trim() }
+
+function Registrar-TokenCloudflare {
+  Write-Host ''
+  Write-Host 'O tunel precisa do token do tunnel da SUA conta Cloudflare (o plano gratuito serve).' -ForegroundColor Cyan
+  Write-Host 'No painel: Zero Trust > Networks > Tunnels > Create a tunnel > Cloudflared.'
+  Write-Host 'Copie o token do comando mostrado e adicione um Public Hostname apontando para'
+  Write-Host 'http://localhost:8790. A digitacao fica oculta e o token nao aparece no resumo final.'
+  Write-Host ''
+  try { Start-Process 'https://one.dash.cloudflare.com/' } catch { }
+  $oculto = Read-Host 'Token do tunnel Cloudflare (Enter vazio = tunel temporario, sem conta)' -AsSecureString
+  $ponteiro = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($oculto)
+  try { $digitado = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($ponteiro) }
+  finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ponteiro) }
+  return $digitado
+}
+
+if (-not $tokenTunel) { $tokenTunel = Registrar-TokenCloudflare }
+if ($tokenTunel) {
+  Gravar $arquivoTokenCf $tokenTunel
+  Write-Host ('Token do tunnel guardado em ' + $arquivoTokenCf) -ForegroundColor Green
+  if (-not $hostPublico) {
+    Write-Host ''
+    Write-Host 'Informe o endereco publico do tunnel (Public Hostname no painel da Cloudflare).' -ForegroundColor Cyan
+    $hostPublico = (Read-Host 'Endereco publico (ex.: drive.seudominio.com)').Trim().ToLower()
+  }
+  if ($hostPublico) {
+    Gravar $arquivoHost $hostPublico
+    Write-Host ('Endereco publico guardado para as proximas subidas: https://' + $hostPublico) -ForegroundColor Green
+  }
+}
+
+# O arquivo abrir-tunel.cmd guarda o comando exato, para subir o tunel de novo
+# com dois cliques quando precisar (o token fica no arquivo ao lado dele).
 $arquivoTunel = Join-Path $pasta 'abrir-tunel.cmd'
-if ($ngrok -and $dominio) {
+if ($cloudflared -and $tokenTunel) {
   Gravar $arquivoTunel ((@(
     '@echo off',
-    'title FortesDrive - tunel do servidor',
+    'title FortesDrive - tunel do servidor (Cloudflare)',
     'cd /d "%~dp0"',
-    'echo Endereco publico: https://' + $dominio,
+    'echo Endereco publico: https://' + $hostPublico,
     'echo Deixe esta janela aberta enquanto quiser o servidor na internet.',
     'echo.',
-    '"' + $ngrok + '" http --domain=' + $dominio + ' 8790'
+    'set /p FD_TOKEN=<"%~dp0cloudflared-token.txt"',
+    '"' + $cloudflared + '" tunnel --no-autoupdate run --token %FD_TOKEN%'
+  )) -join "`r`n")
+} elseif ($cloudflared) {
+  Gravar $arquivoTunel ((@(
+    '@echo off',
+    'title FortesDrive - tunel temporario do servidor (Cloudflare)',
+    'cd /d "%~dp0"',
+    'echo TUNEL TEMPORARIO: copie o endereco https abaixo para STORAGE_SERVER_URL.',
+    'echo.',
+    '"' + $cloudflared + '" tunnel --no-autoupdate --url http://127.0.0.1:8790'
   )) -join "`r`n")
 }
 
 $publicoOk = $false
+$urlPublica = if ($hostPublico) { 'https://' + $hostPublico } else { '' }
 
-# Faltando o token, o assistente pede agora — uma unica vez. Depois disso o
-# endereco e a credencial ficam guardados e a subida automatica do Windows
-# levanta o tunel sem ninguem digitar nada de novo.
-if ($ngrok -and $dominio -and -not (Tem-TokenNgrok)) {
-  if (Registrar-TokenNgrok $ngrok) {
-    Write-Host 'Token registrado: o tunel entra no ar agora.' -ForegroundColor Green
-  } else {
-    Write-Host ''
-    Write-Host '[AVISO] Sem o token o tunel nao sobe.' -ForegroundColor Yellow
-    Write-Host 'Quando tiver o token em maos, use outra vez o atalho' -ForegroundColor Yellow
-    Write-Host '"FortesDrive - configurar servidor" no menu Iniciar: ele pede o token e sobe o tunel.' -ForegroundColor Yellow
-  }
-}
-
-if ($ngrok -and $dominio -and (Tem-TokenNgrok)) {
-  Garantir-ConfigNgrok $dominio | Out-Null
-  Get-Process ngrok -ErrorAction SilentlyContinue | Stop-Process -Force
+if ($cloudflared -and $tokenTunel -and $hostPublico) {
+  Get-Process cloudflared -ErrorAction SilentlyContinue | Stop-Process -Force
   Start-Sleep -Seconds 2
-  Write-Host ('Registrando o tunel como Servico do Windows (porta 8790 -> ' + $dominio + ') ...')
-  if (Instalar-ServicoNgrok $ngrok) {
-    Write-Host 'Servico do Windows no ar: o tunel roda em segundo plano e sobe junto com o Windows.' -ForegroundColor Green
-  } else {
-    Write-Host '[AVISO] O Servico do Windows nao pode ser registrado (ele exige administrador).' -ForegroundColor Yellow
-    Write-Host 'O tunel continua subindo com o Windows pela tarefa agendada, numa janela escondida.' -ForegroundColor Yellow
-    Write-Host 'Para usar o servico nativo, rode este instalador como administrador.' -ForegroundColor Yellow
-    Start-Process -FilePath 'cmd.exe' -WorkingDirectory $pasta -ArgumentList @('/k', 'abrir-tunel.cmd')
-  }
+  Write-Host ('Subindo o tunel Cloudflare (porta 8790 -> ' + $hostPublico + ') ...')
+  Start-Process -FilePath $cloudflared -ArgumentList @('tunnel', '--no-autoupdate', 'run', '--token', $tokenTunel) -WindowStyle Hidden | Out-Null
   for ($i = 1; $i -le 18; $i++) {
+    Start-Sleep -Seconds 5
     try {
-      $r = Invoke-RestMethod ('https://' + $dominio + '/health') -Headers @{ 'ngrok-skip-browser-warning' = '1' } -TimeoutSec 15
+      $r = Invoke-RestMethod ($urlPublica + '/health') -TimeoutSec 15
       if ($r.ok) { $publicoOk = $true; break }
     } catch { }
-    Start-Sleep -Seconds 5
   }
   if ($publicoOk) {
-    Write-Host ('Endereco publico respondendo: https://' + $dominio) -ForegroundColor Green
+    Write-Host ('Endereco publico respondendo: ' + $urlPublica) -ForegroundColor Green
   } else {
-    Write-Host '[AVISO] O endereco publico ainda nao respondeu. Veja a janela do ngrok.' -ForegroundColor Yellow
+    Write-Host '[AVISO] O endereco publico ainda nao respondeu.' -ForegroundColor Yellow
+    Write-Host 'No painel da Cloudflare confira o Public Hostname do tunnel: ele precisa apontar' -ForegroundColor Yellow
+    Write-Host 'para http://localhost:8790, e o tunnel precisa aparecer como Healthy.' -ForegroundColor Yellow
+  }
+} elseif ($cloudflared) {
+  # Sem token: tunel rapido do Cloudflare, sem conta. O endereco muda a cada
+  # subida e por isso serve para conferir, nao para uso diario.
+  Get-Process cloudflared -ErrorAction SilentlyContinue | Stop-Process -Force
+  Start-Sleep -Seconds 2
+  $logTunel = Join-Path $pasta 'tunel-cloudflare.log'
+  Write-Host 'Subindo um tunel temporario do Cloudflare (sem conta)...' -ForegroundColor Cyan
+  Start-Process -FilePath $cloudflared -ArgumentList @('tunnel', '--no-autoupdate', '--url', 'http://127.0.0.1:8790') -WindowStyle Hidden -RedirectStandardOutput $logTunel -RedirectStandardError ($logTunel + '.err') | Out-Null
+  $urlTemp = ''
+  for ($i = 1; $i -le 12; $i++) {
+    Start-Sleep -Seconds 5
+    $textoLog = ((Ler-TextoUtf8 $logTunel) + "`n" + (Ler-TextoUtf8 ($logTunel + '.err')))
+    $achado = [regex]::Match($textoLog, 'https://[a-z0-9-]+\.trycloudflare\.com')
+    if ($achado.Success) { $urlTemp = $achado.Value; break }
+  }
+  if ($urlTemp) {
+    Gravar (Join-Path $pasta 'cloudflare-temp-url.txt') $urlTemp
+    try { $r = Invoke-RestMethod ($urlTemp + '/health') -TimeoutSec 15; if ($r.ok) { $publicoOk = $true } } catch { }
+    Write-Host ('Endereco temporario: ' + $urlTemp) -ForegroundColor Yellow
+    Write-Host 'Cole este endereco em STORAGE_SERVER_URL (pagina Secrets): ele muda a cada subida.' -ForegroundColor Yellow
+    Write-Host 'Para um endereco fixo, crie um tunnel nomeado no painel da Cloudflare e rode' -ForegroundColor Yellow
+    Write-Host 'de novo o atalho "FortesDrive - configurar servidor" para guardar o token.' -ForegroundColor Yellow
+  } else {
+    Write-Host '[AVISO] O tunel temporario nao publicou um endereco. Veja tunel-cloudflare.log.' -ForegroundColor Yellow
   }
 } else {
-  $exeNgrok = if ($ngrok) { $ngrok } else { 'ngrok' }
   Write-Host ''
-  Write-Host 'CONFIGURACAO DO TUNEL (ngrok): etapa manual pendente' -ForegroundColor Yellow
-  Write-Host '  O ngrok ja esta instalado. O token e pessoal e nao pode ficar no instalador.'
-  Write-Host '  1) Crie a conta em https://dashboard.ngrok.com e copie o seu token.'
-  Write-Host '  2) Registre o token:'
-  Write-Host ('       ' + $exeNgrok + ' config add-authtoken SEU_TOKEN')
-  Write-Host ('  3) O endereco deste servidor ja esta guardado: ' + $dominio)
-  Write-Host '     Para subir o tunel para o GATEWAY, o comando e:'
-  Write-Host ('       ' + $exeNgrok + ' http --domain=' + $dominio + ' 8790')
-  Write-Host '     O tunel deve apontar sempre para a porta 8790 (gateway).'
-  Write-Host '     A porta 8790 e a unica que deve ser publicada; as demais ficam so no computador.'
-  Write-Host '  4) Copie o endereco https que o ngrok mostrar para o segredo STORAGE_SERVER_URL'
-  Write-Host '     no app (pagina Secrets) e clique em "Verificar conexao".'
-  Write-Host ('     O endereco ja ficou guardado em ' + (Join-Path $pasta 'ngrok-domain.txt') + ' e a subida automatica usa esse arquivo.')
+  Write-Host 'CONFIGURACAO DO TUNEL (Cloudflare): pendente' -ForegroundColor Yellow
+  Write-Host '  1) Crie a conta gratuita em https://one.dash.cloudflare.com'
+  Write-Host '  2) Em Zero Trust > Networks > Tunnels, crie um tunnel "Cloudflared".'
+  Write-Host '  3) No tunnel, adicione um Public Hostname apontando para http://localhost:8790'
+  Write-Host '     (a porta 8790 e a unica que deve ser publicada: so ela confere a assinatura).'
+  Write-Host '  4) Rode de novo o atalho "FortesDrive - configurar servidor" e cole o token.'
+  Write-Host '  5) Copie o endereco https do tunnel para o segredo STORAGE_SERVER_URL no app'
+  Write-Host '     (pagina Secrets) e clique em "Verificar conexao".'
 }
 
 # ---------------------------------------------------------------------
@@ -896,7 +809,7 @@ Gravar $scriptInicio @'
 
   Rodado pela tarefa agendada "FortesDrive - servidor de armazenamento" ao ligar
   o Windows e a cada entrada na sessao: sobe o Docker, garante os servicos
-  (gateway) e abre o tunel guardado em ngrok-domain.txt. Nada aqui
+  (gateway) e abre o tunel Cloudflare guardado em cloudflared-token.txt. Nada aqui
   apaga dados e
   nenhum segredo e escrito: o .env existente e usado como esta.
 
@@ -960,33 +873,29 @@ if ($dockerOk) {
 if (-not $localOk) { Anotar 'Gateway sem resposta na porta 8790. Tunel nao iniciado por esta tarefa.'; exit 1 }
 Anotar 'Gateway confirmado na porta 8790.'
 
-# 3) Tunel para a internet.
-$arquivoDominio = Join-Path $pasta 'ngrok-domain.txt'
-$dominio = if (Test-Path $arquivoDominio) { (Get-Content -Raw -LiteralPath $arquivoDominio).Trim() } else { '' }
-$arquivoExe = Join-Path $pasta 'ngrok-path.txt'
-$exeNgrok = if (Test-Path $arquivoExe) { (Get-Content -Raw -LiteralPath $arquivoExe).Trim() } else { '' }
-if (-not $exeNgrok -or -not (Test-Path $exeNgrok)) {
-  $cmdNgrok = Get-Command ngrok -ErrorAction SilentlyContinue
-  $exeNgrok = if ($cmdNgrok) { $cmdNgrok.Source } else { Join-Path $env:LOCALAPPDATA 'ngrok\ngrok.exe' }
+# 3) Tunel para a internet (Cloudflare).
+$arquivoHost = Join-Path $pasta 'cloudflare-hostname.txt'
+$arquivoToken = Join-Path $pasta 'cloudflared-token.txt'
+$arquivoExe = Join-Path $pasta 'cloudflared-path.txt'
+$hostPublico = if (Test-Path $arquivoHost) { (Get-Content -Raw -LiteralPath $arquivoHost).Trim() } else { '' }
+$exeCloudflared = if (Test-Path $arquivoExe) { (Get-Content -Raw -LiteralPath $arquivoExe).Trim() } else { '' }
+if (-not $exeCloudflared -or -not (Test-Path $exeCloudflared)) {
+  $cmdCf = Get-Command cloudflared -ErrorAction SilentlyContinue
+  $exeCloudflared = if ($cmdCf) { $cmdCf.Source } else { Join-Path $env:LOCALAPPDATA 'cloudflared\cloudflared.exe' }
 }
-$configNgrok = Join-Path $env:LOCALAPPDATA 'ngrok\ngrok.yml'
-$temToken = (Test-Path $configNgrok) -and ((Get-Content -Raw -LiteralPath $configNgrok) -match 'authtoken\s*:')
+$tokenTunel = if (Test-Path $arquivoToken) { (Get-Content -Raw -LiteralPath $arquivoToken).Trim() } else { '' }
 
-$servicoNgrokWindows = Get-Service -ErrorAction SilentlyContinue | Where-Object { $_.Name -match 'ngrok' -or $_.DisplayName -match 'ngrok' } | Select-Object -First 1
-if ($servicoNgrokWindows) {
-  # O tunel agora e um Servico do Windows: ele sobe sozinho com o computador.
-  Anotar ('Tunel entregue ao Servico do Windows "' + $servicoNgrokWindows.Name + '" (' + $servicoNgrokWindows.Status + ').')
-} elseif (-not $dominio) {
-  Anotar 'Sem ngrok-domain.txt: tunel nao iniciado.'
-} elseif (-not (Test-Path $exeNgrok)) {
-  Anotar 'ngrok.exe nao encontrado: tunel nao iniciado.'
-} elseif (-not $temToken) {
-  Anotar 'Token do ngrok nao configurado: tunel nao iniciado.'
+if (-not (Test-Path $exeCloudflared)) {
+  Anotar 'cloudflared nao encontrado: tunel nao iniciado.'
+} elseif (-not $tokenTunel) {
+  Anotar 'Token do tunnel Cloudflare nao configurado: tunel nao iniciado.'
 } else {
-  Get-Process ngrok -ErrorAction SilentlyContinue | Stop-Process -Force
+  Get-Process cloudflared -ErrorAction SilentlyContinue | Stop-Process -Force
   Start-Sleep -Seconds 2
-  $tunel = Start-Process -FilePath $exeNgrok -ArgumentList @('http', ('--domain=' + $dominio), '8790') -WindowStyle Hidden -PassThru
-  Anotar ('Tunel aberto: https://' + $dominio + ' -> porta 8790')
+  # O aplicativo FortesDrive tambem gerencia este tunel quando a subida
+  # automatica esta ligada: os dois usam os mesmos arquivos e o mesmo tunnel.
+  $tunel = Start-Process -FilePath $exeCloudflared -ArgumentList @('tunnel', '--no-autoupdate', 'run', '--token', $tokenTunel) -WindowStyle Hidden -PassThru
+  Anotar ('Tunel Cloudflare aberto: https://' + $hostPublico + ' -> porta 8790')
   # Fica vivo junto com o tunel: assim o Windows nao encerra o processo.
   $tunel.WaitForExit()
   Anotar 'Tunel encerrado.'
@@ -1069,7 +978,7 @@ if ($localOk -and $publicoOk -and $armazenaOk) {
 } elseif ($localOk -and -not $armazenaOk) {
   Write-Host '  O gateway responde, mas a pasta de dados nao aceita gravacao: veja as mensagens acima.' -ForegroundColor Red
 } elseif ($localOk) {
-  Write-Host '  Servidor local OK. Falta registrar o token do ngrok (acima) para o tunel subir.' -ForegroundColor Yellow
+  Write-Host '  Servidor local OK. Falta o token do tunnel Cloudflare (acima) para o tunel subir.' -ForegroundColor Yellow
 } else {
   Write-Host '  O servidor ainda nao respondeu. Detalhes:' -ForegroundColor Red
   Write-Host ('  cd ' + $pasta)
@@ -1082,10 +991,13 @@ Write-Host '  https://fortesdrive.base44.app/drive'
 Write-Host 'Na pagina Armazenamento, clique em "Verificar conexao".' -ForegroundColor Cyan
 Write-Host ''
 Write-Host 'Endereco do servidor (segredo STORAGE_SERVER_URL):' -ForegroundColor Cyan
-if ($dominio) {
-  Write-Host ('  https://' + $dominio)
+if ($urlPublica) {
+  Write-Host ('  ' + $urlPublica)
+} elseif (Test-Path (Join-Path $pasta 'cloudflare-temp-url.txt')) {
+  Write-Host ('  ' + (Ler-TextoUtf8 (Join-Path $pasta 'cloudflare-temp-url.txt')).Trim()) -ForegroundColor Yellow
+  Write-Host '  (tunel temporario: este endereco muda a cada subida)' -ForegroundColor Yellow
 } else {
-  Write-Host '  [pendente] conclua a configuracao manual do ngrok (instrucoes acima)' -ForegroundColor Yellow
+  Write-Host '  [pendente] conclua a configuracao do tunel Cloudflare (instrucoes acima)' -ForegroundColor Yellow
 }
 Write-Host ''
 Write-Host 'Segredo do servidor (segredo STORAGE_SIGNING_SECRET):' -ForegroundColor Cyan
