@@ -12,6 +12,10 @@ const QUICK_URL = /https:\/\/[a-z0-9-]+\.trycloudflare\.com/i;
 // desta instalação. Vale quando a pasta do servidor ainda não tem o arquivo
 // cloudflare-hostname.txt, para o app nunca cair num endereço temporário.
 const FIXED_HOSTNAME = "nuvem.fortesdrive.dpdns.org";
+// Espera máxima pela publicação do endereço depois de abrir o túnel.
+const LAUNCH_TIMEOUT_MS = 60000;
+// Tempo máximo de cada teste do diagnóstico (local e público).
+const PROBE_TIMEOUT_MS = 8000;
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -98,13 +102,12 @@ function tunnelPlan({ token, hostname, port = PORT }) {
  *
  * O gateway é conferido na porta 8790 e o cloudflared roda a partir da pasta
  * raiz do servidor, sem janela de CMD: o processo é filho do aplicativo e
- * continua vivo com a janela principal oculta na bandeja. Se o túnel cair, ele
- * volta sozinho algumas vezes e, se não voltar, o estado e o erro aparecem na
- * bandeja e no painel.
+ * continua vivo com a janela principal oculta na bandeja.
  *
- * Lê três arquivos que o assistente do servidor grava na pasta do servidor:
- * cloudflare-hostname.txt (endereço público), cloudflared-token.txt (token do
- * tunnel nomeado) e cloudflared-path.txt (onde o cloudflared.exe ficou).
+ * As ações (iniciar, parar, reiniciar, diagnosticar) devolvem sempre um
+ * resultado com o mesmo formato — { ok, action, message, state } — para o painel
+ * mostrar uma confirmação clara em vez de só um ícone girando, e nunca declarar
+ * "conectado" antes de o endereço público responder o gateway.
  */
 class ServerTunnel {
   constructor({ userDataDir, app, onState }) {
@@ -116,6 +119,10 @@ class ServerTunnel {
     this.tail = "";
     this.log = "";
     this.killedStray = false;
+    this.busy = "";
+    // Subida manual: o túnel roda mesmo com a subida automática desativada,
+    // até o usuário parar ou fechar o aplicativo.
+    this.manual = false;
     this.state = {
       enabled: false,
       status: "stopped",
@@ -126,6 +133,9 @@ class ServerTunnel {
       port: PORT,
       attempts: 0,
       error: "",
+      busy: "",
+      lastAction: null,
+      diagnosis: null,
     };
   }
 
@@ -134,6 +144,29 @@ class ServerTunnel {
   update(patch) {
     Object.assign(this.state, patch);
     this.onState(this.getStatus());
+  }
+
+  /** Uma operação por vez: o painel desabilita as outras enquanto isso. */
+  begin(kind) {
+    if (this.busy) return false;
+    this.busy = kind;
+    this.update({ busy: kind });
+    return true;
+  }
+
+  end() {
+    this.busy = "";
+    this.update({ busy: "" });
+  }
+
+  busyReply(kind) {
+    return { ok: false, action: kind, message: "Aguarde a operação em andamento terminar.", state: this.getStatus() };
+  }
+
+  /** Confirmação persistente: é o que o painel mostra até a próxima ação. */
+  finish(kind, ok, message) {
+    this.update({ lastAction: { kind, ok, message, at: new Date().toISOString() } });
+    return { ok, action: kind, message, state: this.getStatus() };
   }
 
   async init() {
@@ -162,41 +195,277 @@ class ServerTunnel {
     this.state.mode = this.token ? "named" : "quick";
   }
 
+  // ── Subida automática com o Windows (preferência, não conexão) ─────────
   async setEnabled(enabled) {
-    this.state.enabled = enabled === true;
-    await this.save();
-    if (!this.state.enabled) { await this.stop(); return this.getStatus(); }
-    this.app?.setLoginItemSettings?.({ openAtLogin: true, args: ["--background"] });
-    await this.removeLegacyTask();
-    void this.start();
-    return this.getStatus();
+    if (!this.begin("autostart")) return this.busyReply("autostart");
+    try {
+      const want = enabled === true;
+      this.state.enabled = want;
+      await this.save();
+      if (!want) {
+        this.manual = false;
+        await this.stop();
+        await this.killStray();
+        return this.finish("autostart", true, "Subida automática desativada. O túnel foi encerrado e continua parado até você iniciar de novo.");
+      }
+      this.app?.setLoginItemSettings?.({ openAtLogin: true, args: ["--background"] });
+      await this.removeLegacyTask();
+      this.manual = true;
+      void this.start({ force: true });
+      return this.finish("autostart", true, "Subida automática ativada: o servidor e o túnel sobem junto com o Windows.");
+    } catch (error) {
+      return this.finish("autostart", false, "Não foi possível salvar a subida automática: " + error.message);
+    } finally {
+      this.end();
+    }
   }
 
   async setServerRoot(root) {
-    if (!(await exists(root))) throw new Error("Escolha uma pasta que exista no computador.");
-    this.state.serverRoot = root;
-    await this.save();
-    await this.readTunnelFiles();
-    if (this.state.enabled) await this.restart();
-    return this.getStatus();
+    if (!this.begin("root")) return this.busyReply("root");
+    const wasRunning = Boolean(this.child) || ["online", "starting", "reconnecting"].includes(this.state.status);
+    try {
+      if (!(await exists(root))) throw new Error("Escolha uma pasta que exista no computador.");
+      this.state.serverRoot = root;
+      await this.save();
+      await this.readTunnelFiles();
+      if (wasRunning || this.state.enabled || this.manual) {
+        await this.stop();
+        void this.start({ force: true });
+      }
+      return this.finish("root", true, "Pasta do servidor atualizada.");
+    } catch (error) {
+      return this.finish("root", false, error.message);
+    } finally {
+      this.end();
+    }
   }
 
-  async restart() {
-    await this.stop();
-    // Reiniciar precisa valer de verdade: encerra também um túnel que a tarefa
-    // do Windows deixou no ar, para não continuar no estado antigo.
-    await this.killStray();
-    void this.start();
-    return this.getStatus();
+  // ── Ações do painel ────────────────────────────────────────────────────
+  async startTunnel() {
+    if (!this.begin("start")) return this.busyReply("start");
+    try {
+      this.manual = true;
+      if (this.state.status === "online" && this.child) {
+        return this.finish("start", true, "O túnel já está conectado em " + this.state.url + ".");
+      }
+      const result = await this.start({ force: true });
+      return this.finish("start", result.ok, result.message);
+    } catch (error) {
+      this.update({ status: "error", error: error.message, url: "" });
+      return this.finish("start", false, "Não foi possível iniciar o túnel: " + error.message);
+    } finally {
+      this.end();
+    }
   }
 
-  async start({ attempts = 0 } = {}) {
-    if (!this.state.enabled || this.child) return this.getStatus();
+  async stopTunnel() {
+    if (!this.begin("stop")) return this.busyReply("stop");
+    try {
+      this.manual = false;
+      const wasRunning = Boolean(this.child) || ["online", "starting", "reconnecting", "error"].includes(this.state.status);
+      await this.stop();
+      await this.killStray();
+      return this.finish(
+        "stop",
+        true,
+        wasRunning
+          ? "Túnel encerrado. O endereço público fica fora do ar até você iniciar de novo."
+          : "O túnel já estava parado."
+      );
+    } catch (error) {
+      return this.finish("stop", false, "Não foi possível parar o túnel: " + error.message);
+    } finally {
+      this.end();
+    }
+  }
+
+  async restartTunnel() {
+    if (!this.begin("restart")) return this.busyReply("restart");
+    try {
+      this.manual = true;
+      this.update({ status: "starting", error: "", url: "" });
+      await this.stop();
+      // Reiniciar precisa valer de verdade: encerra também um túnel que a tarefa
+      // do Windows deixou no ar, para não continuar no estado antigo.
+      await this.killStray();
+      const result = await this.start({ force: true });
+      return this.finish("restart", result.ok, result.message);
+    } catch (error) {
+      this.update({ status: "error", error: error.message, url: "" });
+      return this.finish("restart", false, "Não foi possível reiniciar o túnel: " + error.message);
+    } finally {
+      this.end();
+    }
+  }
+
+  /** Compatibilidade: a bandeja e chamadas antigas usam este nome. */
+  restart() { return this.restartTunnel(); }
+
+  // ── Diagnóstico: gateway local e acesso público, separados ─────────────
+  async diagnose() {
+    if (!this.begin("diagnose")) return this.busyReply("diagnose");
+    try {
+      const local = await this.probeLocal();
+      const publicUrl = this.state.url || (this.state.mode === "named" && this.state.hostname ? "https://" + this.state.hostname : "");
+      const pub = await this.probePublic(publicUrl);
+      const exe = await this.findCloudflared();
+      const diagnosis = {
+        at: new Date().toISOString(),
+        url: pub.url || null,
+        local,
+        public: pub,
+        tunnel: {
+          status: this.state.status,
+          mode: this.state.mode,
+          hostname: this.state.hostname,
+          error: this.state.error || "",
+          cloudflared: Boolean(exe),
+        },
+        summary: this.summarize(local, pub),
+        advice: this.adviceFor(local, pub, Boolean(exe)),
+      };
+      this.update({ diagnosis });
+      return this.finish("diagnose", local.ok && pub.ok, diagnosis.summary);
+    } catch (error) {
+      return this.finish("diagnose", false, "Não foi possível concluir o diagnóstico: " + error.message);
+    } finally {
+      this.end();
+    }
+  }
+
+  /** O gateway responde na porta 8790 deste computador? */
+  async probeLocal() {
+    const at = new Date().toISOString();
+    const started = Date.now();
+    try {
+      const response = await fetch("http://127.0.0.1:" + PORT + "/health", { signal: AbortSignal.timeout(PROBE_TIMEOUT_MS) });
+      const raw = await response.text().catch(() => "");
+      let body = null;
+      try { body = JSON.parse(raw); } catch { /* corpo não é JSON */ }
+      const latencyMs = Date.now() - started;
+      if (response.ok && body?.ok === true) {
+        const storage = body.storage || {};
+        const writable = storage.writable !== false;
+        return {
+          ok: writable,
+          at,
+          latencyMs,
+          status: response.status,
+          version: body.version || null,
+          message: writable
+            ? "O gateway respondeu no computador (versão " + (body.version || "?") + ")."
+            : "O gateway respondeu, mas o armazenamento não aceitou gravação (" + (storage.reason || "motivo não informado") + ").",
+        };
+      }
+      return {
+        ok: false,
+        at,
+        latencyMs,
+        status: response.status,
+        version: null,
+        message: response.status === 404
+          ? "A porta 8790 respondeu, mas não é o gateway FortesDrive (rota /health não encontrada)."
+          : "A porta 8790 respondeu " + response.status + " em /health e não é o gateway FortesDrive.",
+      };
+    } catch (error) {
+      return {
+        ok: false,
+        at,
+        latencyMs: Date.now() - started,
+        status: 0,
+        version: null,
+        message: error?.name === "TimeoutError"
+          ? "O gateway não respondeu em 8 segundos na porta 8790."
+          : "Não há gateway respondendo na porta 8790 deste computador (" + (error?.message || "falha de rede") + ").",
+      };
+    }
+  }
+
+  /** O endereço público entrega o gateway FortesDrive? */
+  async probePublic(url) {
+    const at = new Date().toISOString();
+    if (!url) {
+      return { ok: false, at, url: null, latencyMs: 0, status: 0, message: "O túnel ainda não publicou um endereço público." };
+    }
+    const started = Date.now();
+    try {
+      const response = await fetch(url + "/health", { signal: AbortSignal.timeout(PROBE_TIMEOUT_MS) });
+      const raw = await response.text().catch(() => "");
+      let body = null;
+      try { body = JSON.parse(raw); } catch { /* corpo não é JSON */ }
+      const latencyMs = Date.now() - started;
+      if (response.ok && body?.ok === true) {
+        return {
+          ok: true, at, url, latencyMs, status: response.status,
+          message: "O endereço público responde o gateway FortesDrive (versão " + (body.version || "?") + ").",
+        };
+      }
+      const fromCloudflare = Boolean(response.headers.get("cf-ray")) || response.status >= 500;
+      return {
+        ok: false, at, url, latencyMs, status: response.status,
+        message: fromCloudflare
+          ? "A borda do Cloudflare respondeu " + response.status + " em vez do servidor: o túnel existe, mas não está entregando a porta 8790."
+          : "O endereço respondeu " + response.status + " em /health e não é o gateway FortesDrive.",
+      };
+    } catch (error) {
+      return {
+        ok: false, at, url, latencyMs: Date.now() - started, status: 0,
+        message: error?.name === "TimeoutError"
+          ? "O endereço público não respondeu em 8 segundos."
+          : "Não foi possível alcançar o endereço público a partir deste computador: " + (error?.message || "falha de rede") + ".",
+      };
+    }
+  }
+
+  summarize(local, pub) {
+    if (local.ok && pub.ok) return "Gateway e acesso público respondendo.";
+    if (!local.ok && !pub.ok) return "Nada respondendo: o gateway local e o acesso público falharam.";
+    if (local.ok) return "Gateway local OK, acesso público com falha.";
+    return "Gateway local com falha; o acesso público respondeu " + (pub.status || "sem resposta") + ".";
+  }
+
+  adviceFor(local, pub, hasCloudflared) {
+    if (local.ok && pub.ok) return ["Nada a corrigir: o gateway e o acesso público estão respondendo."];
+    const advice = [];
+    if (!local.ok) {
+      advice.push("O gateway não está respondendo na porta 8790 deste computador.");
+      advice.push('Abra o atalho "FortesDrive - configurar servidor" no menu Iniciar para subir o Docker e o gateway, e faça o diagnóstico de novo.');
+    } else {
+      advice.push("O gateway responde neste computador, então a falha está no túnel do Cloudflare.");
+      if (pub.status >= 500 || /Cloudflare/.test(pub.message)) {
+        advice.push("O conector do túnel está ativo, mas não alcança a porta 8790: ele precisa rodar no mesmo computador do gateway, porque 127.0.0.1 é local a ele.");
+      }
+      advice.push("Feche outros programas que usam cloudflared e clique em Reiniciar túnel aqui neste computador.");
+      advice.push("No painel da Cloudflare (Zero Trust > Networks > Tunnels), confira se o Public Hostname do túnel aponta para http://localhost:8790 e se o tunnel aparece como Healthy.");
+    }
+    if (!hasCloudflared) {
+      advice.push('O cloudflared não foi encontrado: rode o atalho "FortesDrive - configurar servidor" do menu Iniciar.');
+    }
+    if (this.state.mode === "quick") {
+      advice.push("O túnel atual é temporário: o endereço muda a cada subida. Guarde o token do túnel nomeado pelo atalho de configuração para ter endereço fixo.");
+    }
+    return advice;
+  }
+
+  // ── Máquina de estados do túnel ────────────────────────────────────────
+  async start({ attempts = 0, force = false } = {}) {
+    if (!this.state.enabled && !this.manual && !force) {
+      return { ok: false, message: "A subida automática está desativada." };
+    }
+    if (this.child) {
+      return this.state.status === "online"
+        ? { ok: true, message: "O túnel já está conectado em " + this.state.url + "." }
+        : { ok: false, message: "O túnel já está sendo iniciado." };
+    }
     clearTimeout(this.retry);
     this.state.attempts = attempts;
     this.update({ status: "starting", error: "", url: "" });
-    if (!(await this.ensureServer())) return this.getStatus();
-    if (!this.state.enabled) return this.getStatus();
+
+    const server = await this.ensureServer();
+    if (!server.ok) return server;
+    if (!this.state.enabled && !this.manual) {
+      return { ok: false, message: "A subida automática foi desativada." };
+    }
     await this.readTunnelFiles();
 
     // O assistente do servidor já pode ter deixado o túnel no ar (tarefa do
@@ -204,14 +473,13 @@ class ServerTunnel {
     const plan = tunnelPlan({ token: this.token, hostname: this.state.hostname, port: PORT });
     if (plan.url && (await answers(plan.url + "/health"))) {
       this.update({ status: "online", url: plan.url, error: "", attempts: 0 });
-      return this.getStatus();
+      return { ok: true, message: "Túnel conectado e validado em " + plan.url + "." };
     }
-    await this.launch(plan);
-    return this.getStatus();
+    return this.launch(plan);
   }
 
   async ensureServer() {
-    if (await answers(`http://127.0.0.1:${PORT}/health`)) return true;
+    if (await answers(`http://127.0.0.1:${PORT}/health`)) return { ok: true };
     if (!(await exists(path.join(this.state.serverRoot, "docker-compose.yml")))) {
       return this.fail("A pasta raiz do servidor não foi encontrada neste computador. Escolha a pasta onde o servidor foi instalado.");
     }
@@ -219,16 +487,16 @@ class ServerTunnel {
     await run("docker", ["compose", "up", "-d"], this.state.serverRoot);
     for (let i = 0; i < 24; i++) {
       await sleep(5000);
-      if (!this.state.enabled) return false;
-      if (await answers(`http://127.0.0.1:${PORT}/health`)) { this.update({ error: "" }); return true; }
+      if (!this.state.enabled && !this.manual) return { ok: false, message: "A subida automática foi desativada." };
+      if (await answers(`http://127.0.0.1:${PORT}/health`)) { this.update({ error: "" }); return { ok: true }; }
     }
-    return this.fail("O servidor local não respondeu na porta 8790. Abra o Docker Desktop e reinicie o túnel.");
+    return this.fail("O servidor local não respondeu na porta 8790. Abra o Docker Desktop e inicie o túnel de novo.");
   }
 
   async launch(plan) {
     const exe = await this.findCloudflared();
     if (!exe) {
-      return this.fail('O cloudflared não está instalado neste computador. Use o atalho "FortesDrive — configurar servidor" do menu Iniciar.');
+      return this.fail('O cloudflared não está instalado neste computador. Use o atalho "FortesDrive - configurar servidor" do menu Iniciar.');
     }
     if (plan.mode === "named") {
       const problema = hostnameProblem(plan.host);
@@ -251,22 +519,35 @@ class ServerTunnel {
     });
     child.on("exit", () => this.exited(child));
 
-    for (let i = 0; i < 60; i++) {
+    for (let i = 0; i < LAUNCH_TIMEOUT_MS / 1000; i++) {
       await sleep(1000);
-      if (this.child !== child) return this.getStatus();
+      if (this.child !== child) {
+        return { ok: false, message: this.state.error || "O túnel encerrou antes de conectar." };
+      }
       // Túnel rápido: o cloudflared anuncia o endereço publicado no log e ele
       // muda a cada subida — é esse o endereço a conferir.
       const quick = plan.mode === "quick" ? (this.log.match(QUICK_URL) || [])[0] : "";
       const url = plan.mode === "named" ? plan.url : quick;
       if (url && (await answers(url + "/health"))) {
         this.update({ status: "online", url, mode: plan.mode, error: "", attempts: 0 });
-        return this.getStatus();
+        return {
+          ok: true,
+          message: plan.mode === "named"
+            ? "Túnel conectado e validado em " + url + "."
+            : "Túnel temporário conectado em " + url + " (o endereço muda a cada subida).",
+        };
       }
     }
     this.child = null;
     await this.kill(child);
+    const last = this.tail.trim().split(/\r?\n/).pop();
+    this.update({ status: "error", error: last || "O túnel não respondeu no endereço público.", url: "" });
     this.schedule();
-    return this.getStatus();
+    return {
+      ok: false,
+      message: "O túnel abriu, mas " + (plan.url || "o endereço público") + " não respondeu em " + LAUNCH_TIMEOUT_MS / 1000 + " segundos." +
+        (last ? " Última mensagem: " + last : ""),
+    };
   }
 
   async exited(child) {
@@ -274,7 +555,7 @@ class ServerTunnel {
     this.child = null;
     // Um agente anterior (tarefa antiga do assistente) publicando o mesmo túnel:
     // encerra o processo duplicado e sobe o túnel de novo.
-    if (!this.killedStray && /already|in use|conflict|failed to start|unable to|connection refused/i.test(this.tail)) {
+    if (!this.killedStray && /already|in use|conflict|failed to start|unable to/i.test(this.tail)) {
       this.killedStray = true;
       await this.killStray();
       return void this.start({ attempts: this.state.attempts });
@@ -284,6 +565,7 @@ class ServerTunnel {
   }
 
   schedule() {
+    if (!this.state.enabled && !this.manual) return;
     const attempts = this.state.attempts + 1;
     if (attempts > MAX_ATTEMPTS) {
       const last = this.tail.trim().split(/\r?\n/).pop();
@@ -296,7 +578,7 @@ class ServerTunnel {
 
   fail(message) {
     this.update({ status: "error", error: message, url: "" });
-    return false;
+    return { ok: false, message };
   }
 
   async stop() {

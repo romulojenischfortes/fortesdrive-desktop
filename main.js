@@ -202,7 +202,10 @@ function registerHandlers() {
     },
     getServerTunnel: () => serverTunnel.getStatus(),
     setServerTunnelEnabled: enabled => serverTunnel.setEnabled(enabled),
-    restartServerTunnel: () => serverTunnel.restart(),
+    startServerTunnel: () => serverTunnel.startTunnel(),
+    stopServerTunnel: () => serverTunnel.stopTunnel(),
+    restartServerTunnel: () => serverTunnel.restartTunnel(),
+    diagnoseServerTunnel: () => serverTunnel.diagnose(),
     chooseServerRoot: async () => {
       const result = await dialog.showOpenDialog(mainWindow, { properties: ["openDirectory"], title: "Pasta raiz do servidor FortesDrive", defaultPath: serverTunnel.getStatus().serverRoot });
       return result.canceled ? null : serverTunnel.setServerRoot(result.filePaths[0]);

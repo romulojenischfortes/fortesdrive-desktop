@@ -15,7 +15,9 @@ const channels = {
   downloadUpdate: "downloadUpdate", installUpdate: "installUpdate",
   launchInstaller: "launchInstaller", verifyUpdateSignature: "verifyUpdateSignature",
   getServerTunnel: "getServerTunnel", setServerTunnelEnabled: "setServerTunnelEnabled",
-  restartServerTunnel: "restartServerTunnel", chooseServerRoot: "chooseServerRoot",
+  startServerTunnel: "startServerTunnel", stopServerTunnel: "stopServerTunnel",
+  restartServerTunnel: "restartServerTunnel", diagnoseServerTunnel: "diagnoseServerTunnel",
+  chooseServerRoot: "chooseServerRoot",
 };
 const api = { isDesktop: true };
 for (const [method, channel] of Object.entries(channels)) {

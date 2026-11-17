@@ -16,7 +16,7 @@ jobs:
       - run: npm install
       - run: node generate-icon.js
       - name: Test native transfers and updater
-        run: node --test tests/native.test.cjs tests/native-streams.test.cjs tests/updater.test.cjs tests/badge-setup.test.cjs tests/packaging.test.cjs tests/server-package.test.cjs tests/setup-handoff.test.cjs tests/installer-folder.test.cjs tests/transfer-history.test.cjs tests/gateway-uploads.test.cjs tests/storage-folder.test.cjs tests/install-health.test.cjs
+        run: node --test tests/native.test.cjs tests/native-streams.test.cjs tests/updater.test.cjs tests/badge-setup.test.cjs tests/packaging.test.cjs tests/server-package.test.cjs tests/setup-handoff.test.cjs tests/installer-folder.test.cjs tests/transfer-history.test.cjs tests/gateway-uploads.test.cjs tests/storage-folder.test.cjs tests/install-health.test.cjs tests/storage-diagnostics.test.cjs tests/cloudflare-tunnel.test.cjs
       - name: Build and test Explorer badges
         shell: cmd
         run: |
@@ -90,6 +90,8 @@ jobs:
           tag_name: v${{ steps.version.outputs.version }}
           name: FortesDrive Desktop ${{ steps.version.outputs.version }}
           body: |
+            Tunel do servidor sob controle no proprio cliente: botoes Iniciar, Parar, Reiniciar e Diagnosticar conexao, com confirmacao na tela do que cada acao fez.
+            Diagnostico separa gateway local, tunel e acesso publico, com latencia, horario da verificacao e orientacao para o erro 502.
             Instalador unificado: escolha Cliente ou Servidor; o cliente nao instala dependencias do servidor.
             Verificacao da atualizacao no instalador: confere os componentes desta versao e mostra um alerta quando algum nao foi aplicado, com registro em verificacao-instalacao.log.
             Verificacao no cliente ao abrir: confere versao em execucao, componentes do instalador, servidor de armazenamento e sincronizacao, avisa na tela e no sistema as etapas que falharam e oferece verificar de novo ou baixar o instalador.
