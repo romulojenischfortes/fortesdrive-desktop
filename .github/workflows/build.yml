@@ -16,7 +16,7 @@ jobs:
       - run: npm install
       - run: node generate-icon.js
       - name: Test native transfers and updater
-        run: node --test tests/native.test.cjs tests/native-streams.test.cjs tests/updater.test.cjs tests/badge-setup.test.cjs tests/packaging.test.cjs tests/server-package.test.cjs tests/setup-handoff.test.cjs tests/installer-folder.test.cjs tests/transfer-history.test.cjs tests/gateway-uploads.test.cjs tests/storage-folder.test.cjs tests/install-health.test.cjs tests/storage-diagnostics.test.cjs tests/cloudflare-tunnel.test.cjs
+        run: node --test tests/native.test.cjs tests/native-streams.test.cjs tests/updater.test.cjs tests/badge-setup.test.cjs tests/packaging.test.cjs tests/server-package.test.cjs tests/setup-handoff.test.cjs tests/installer-folder.test.cjs tests/transfer-history.test.cjs tests/gateway-uploads.test.cjs tests/storage-folder.test.cjs tests/install-health.test.cjs tests/storage-diagnostics.test.cjs tests/cloudflare-tunnel.test.cjs tests/docker-tunnel.test.cjs
       - name: Build and test Explorer badges
         shell: cmd
         run: |
