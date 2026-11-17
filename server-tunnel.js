@@ -8,6 +8,10 @@ const LEGACY_TASK = "FortesDrive - servidor de armazenamento";
 const DEFAULT_ROOT = path.join(process.env.USERPROFILE || process.env.HOME || "", "Desktop", "storage-server");
 // Túnel rápido do Cloudflare (sem conta): o endereço muda a cada subida.
 const QUICK_URL = /https:\/\/[a-z0-9-]+\.trycloudflare\.com/i;
+// Hostname público fixo do servidor: o Public Hostname do tunnel Cloudflare
+// desta instalação. Vale quando a pasta do servidor ainda não tem o arquivo
+// cloudflare-hostname.txt, para o app nunca cair num endereço temporário.
+const FIXED_HOSTNAME = "nuvem.fortesdrive.dpdns.org";
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -32,9 +36,38 @@ async function answers(url) {
 function normalizeHost(value) {
   return String(value || "")
     .trim()
-    .replace(/^https?:\/\//i, "")
+    .replace(/^[a-z][a-z0-9+.-]*:\/\//i, "")
     .replace(/\/.*$/, "")
+    .replace(/\.$/, "")
     .toLowerCase();
+}
+
+// Túnel antigo e o endereço do próprio app: nenhum dos dois é o servidor de
+// armazenamento, e publicar um deles faria todo envio falhar. O FortesDrive usa
+// o Cloudflare Tunnel com o hostname fixo acima.
+const LEGACY_TUNNEL_HOST = /(^|\.)n[g]rok(-free)?\.(dev|io|app)$/i;
+const APP_DOMAIN_HOST = /(^|\.)base44\.app$/i;
+// Nome DNS puro: rótulos sem começar/terminar em hífen, com pelo menos um ponto.
+const HOSTNAME_SHAPE = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/;
+
+/**
+ * O valor serve como Public Hostname do túnel? Devolve o motivo da recusa ou
+ * uma string vazia quando está bom — assim a mensagem na tela diz o que
+ * corrigir em vez de só "endereço inválido".
+ */
+function hostnameProblem(value) {
+  const host = normalizeHost(value);
+  if (!host) return "Informe o endereço público do túnel (o Public Hostname da Cloudflare).";
+  if (LEGACY_TUNNEL_HOST.test(host)) {
+    return "Este é um endereço de túnel antigo, que o FortesDrive não usa mais. O servidor usa o Cloudflare Tunnel com o hostname fixo " + FIXED_HOSTNAME + ".";
+  }
+  if (APP_DOMAIN_HOST.test(host)) {
+    return "Este é o endereço do próprio app FortesDrive, não o do seu servidor. Crie o Public Hostname do túnel num domínio que esteja na sua conta Cloudflare.";
+  }
+  if (!HOSTNAME_SHAPE.test(host)) {
+    return "Endereço inválido: informe apenas o nome do host, sem esquema, sem caminho e sem barra no final (exemplo: drive.seudominio.com).";
+  }
+  return "";
 }
 
 /**
@@ -124,7 +157,7 @@ class ServerTunnel {
   /** Endereço e token gravados pelo assistente do servidor. */
   async readTunnelFiles() {
     const host = await fs.readFile(path.join(this.state.serverRoot, "cloudflare-hostname.txt"), "utf8").catch(() => "");
-    this.state.hostname = normalizeHost(host);
+    this.state.hostname = normalizeHost(host) || FIXED_HOSTNAME;
     this.token = (await fs.readFile(path.join(this.state.serverRoot, "cloudflared-token.txt"), "utf8").catch(() => "")).trim();
     this.state.mode = this.token ? "named" : "quick";
   }
@@ -197,8 +230,9 @@ class ServerTunnel {
     if (!exe) {
       return this.fail('O cloudflared não está instalado neste computador. Use o atalho "FortesDrive — configurar servidor" do menu Iniciar.');
     }
-    if (plan.mode === "named" && !plan.host) {
-      return this.fail("O túnel do Cloudflare está configurado, mas falta o endereço público. No assistente do servidor, informe o Public Hostname do túnel (por exemplo drive.seudominio.com).");
+    if (plan.mode === "named") {
+      const problema = hostnameProblem(plan.host);
+      if (problema) return this.fail(problema);
     }
 
     // O comando do túnel roda a partir da pasta raiz do servidor.
@@ -306,4 +340,7 @@ class ServerTunnel {
   }
 }
 
-module.exports = { ServerTunnel, PORT, DEFAULT_ROOT, QUICK_URL, normalizeHost, tunnelPlan };
+module.exports = {
+  ServerTunnel, PORT, DEFAULT_ROOT, QUICK_URL, FIXED_HOSTNAME, normalizeHost, tunnelPlan,
+  hostnameProblem, LEGACY_TUNNEL_HOST, APP_DOMAIN_HOST,
+};

@@ -48,10 +48,11 @@ $areaTrabalho = [Environment]::GetFolderPath('Desktop')
 if (-not $areaTrabalho) { $areaTrabalho = Join-Path $env:USERPROFILE 'Desktop' }
 $pasta = if ($Folder) { $Folder } else { Join-Path $areaTrabalho 'storage-server' }
 
-# Endereço público do túnel deste servidor (o Public Hostname definido no painel
-# da Cloudflare). Fica gravado em cloudflare-hostname.txt e é ele que o app usa;
-# sem ele o túnel sobe no modo temporário (trycloudflare), que muda a cada subida.
-$dominioPadrao = ''
+# Endereço público fixo do servidor: o Public Hostname do tunnel Cloudflare
+# desta instalação (Docker + Cloudflare Tunnel). É gravado em
+# cloudflare-hostname.txt e é ele que o app usa em STORAGE_SERVER_URL — não muda
+# quando o servidor reinicia.
+$dominioPadrao = 'nuvem.fortesdrive.dpdns.org'
 
 function Passo($texto) {
   Write-Host ''
@@ -730,21 +731,49 @@ $arquivoHost = Join-Path $pasta 'cloudflare-hostname.txt'
 $arquivoTokenCf = Join-Path $pasta 'cloudflared-token.txt'
 $arquivoExeCf = Join-Path $pasta 'cloudflared-path.txt'
 
+# O Public Hostname e um nome DNS puro: sem esquema, sem caminho e sem barra no
+# fim. Um valor colado com "https://" ou com o endereco do app (base44.app) nao
+# aponta para o tunel do dono, e todo envio falharia com ele guardado.
+function Limpar-HostPublico($valor) {
+  if (-not $valor) { return '' }
+  $host = ([string]$valor).Trim().Trim('"')
+  $host = $host -replace '^\s*[A-Za-z][A-Za-z0-9+.-]*://', ''
+  $host = $host -replace '/.*$', ''
+  return $host.Trim().TrimEnd('.').ToLower()
+}
+
+function Problema-HostPublico($host) {
+  if (-not $host) { return 'Informe o endereco publico do tunnel (o Public Hostname).' }
+  if ($host -match '(^|\.)n[g]rok(-free)?\.(dev|io|app)$') {
+    return ('Este e um endereco de tunel antigo, que o FortesDrive nao usa mais. O servidor usa o Cloudflare Tunnel com o hostname fixo ' + $dominioPadrao + '.')
+  }
+  if ($host -match '(^|\.)base44\.app$') {
+    return 'Este e o endereco do proprio app FortesDrive, nao o do seu servidor. Crie o Public Hostname num dominio que esteja na sua conta Cloudflare.'
+  }
+  if ($host -notmatch '^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$') {
+    return 'Endereco invalido: informe apenas o nome do host, sem esquema, sem caminho e sem barra no final (ex.: drive.seudominio.com).'
+  }
+  return ''
+}
+
 # Endereco publico do tunel: o Public Hostname configurado no painel da
 # Cloudflare para este tunnel (por exemplo drive.seudominio.com).
-$hostPublico = [string]$env:FD_HOSTNAME
-if (-not $hostPublico -and (Test-Path -LiteralPath $arquivoHost)) { $hostPublico = (Ler-TextoUtf8 $arquivoHost).Trim() }
-$hostPublico = ($hostPublico -replace '^\s*https?://', '').Trim().TrimEnd('/').ToLower()
-if (-not $hostPublico -and $dominioPadrao) { $hostPublico = $dominioPadrao }
+$hostPublico = Limpar-HostPublico ([string]$env:FD_HOSTNAME)
+if (-not $hostPublico -and (Test-Path -LiteralPath $arquivoHost)) { $hostPublico = Limpar-HostPublico (Ler-TextoUtf8 $arquivoHost) }
+if (-not $hostPublico -and $dominioPadrao) { $hostPublico = Limpar-HostPublico $dominioPadrao }
 
-# Endereco ngrok de uma instalacao antiga nao serve mais: o app nao envia o
-# cabecalho que o ngrok gratuito exige, entao ele so devolve a pagina de aviso
-# (404/HTML) e o app acusa "endereco incorreto". Melhor recomecar o tunel.
-if ($hostPublico -match 'ngrok') {
-  Write-Host ('[AVISO] O endereco guardado (' + $hostPublico + ') e um tunel ngrok antigo.') -ForegroundColor Yellow
-  Write-Host 'O servidor agora e publicado pelo Cloudflare Tunnel: o ngrok nao serve mais para este app.' -ForegroundColor Yellow
-  Write-Host 'Informe o Public Hostname do tunnel Cloudflare (ex.: drive.seudominio.com) abaixo.' -ForegroundColor Yellow
-  $hostPublico = ''
+# Endereco guardado que nao serve mais (tunel antigo, o dominio do app ou algo
+# que nao e um nome DNS) e trocado pelo hostname fixo, com o motivo na tela: o
+# tunel volta a publicar no endereco certo em vez de subir num endereco que o
+# app nao consegue usar.
+if ($hostPublico) {
+  $problemaHost = Problema-HostPublico $hostPublico
+  if ($problemaHost) {
+    Write-Host ('[AVISO] O endereco guardado (' + $hostPublico + ') nao serve.') -ForegroundColor Yellow
+    Write-Host ('  ' + $problemaHost) -ForegroundColor Yellow
+    $hostPublico = Limpar-HostPublico $dominioPadrao
+    Write-Host ('  Usando o hostname fixo: ' + $hostPublico) -ForegroundColor Green
+  }
 }
 
 function Achar-Cloudflared {
@@ -818,11 +847,21 @@ if ($tokenTunel) {
   if (-not $hostPublico) {
     Write-Host ''
     Write-Host 'Informe o endereco publico do tunnel (Public Hostname no painel da Cloudflare).' -ForegroundColor Cyan
-    $hostPublico = (Read-Host 'Endereco publico (ex.: drive.seudominio.com)').Trim().ToLower()
+    Write-Host 'E o endereco que voce criou em "Add published application", apontando para http://localhost:8790.'
+    Write-Host 'Digite apenas o nome do host (ex.: drive.seudominio.com).'
+    for ($tentativa = 1; $tentativa -le 5; $tentativa++) {
+      $digitado = Limpar-HostPublico (Read-Host 'Endereco publico (ex.: drive.seudominio.com)')
+      if (-not $digitado) { break }
+      $problemaHost = Problema-HostPublico $digitado
+      if (-not $problemaHost) { $hostPublico = $digitado; break }
+      Write-Host ('  ' + $problemaHost) -ForegroundColor Yellow
+    }
   }
   if ($hostPublico) {
     Gravar $arquivoHost $hostPublico
-    Write-Host ('Endereco publico guardado para as proximas subidas: https://' + $hostPublico) -ForegroundColor Green
+    Write-Host ('Endereco publico guardado para as proximas subidas: https://' + $hostPublico + '  [fixo]') -ForegroundColor Green
+  } else {
+    Write-Host 'Sem um endereco publico valido o tunel nao sobe agora: rode de novo este atalho e informe o Public Hostname.' -ForegroundColor Yellow
   }
 }
 
@@ -830,11 +869,15 @@ if ($tokenTunel) {
 # com dois cliques quando precisar (o token fica no arquivo ao lado dele).
 $arquivoTunel = Join-Path $pasta 'abrir-tunel.cmd'
 if ($cloudflared -and $tokenTunel) {
+  # O atalho mostra o endereco guardado; sem ele, diz que quem define o
+  # endereco e o Public Hostname no painel (nunca inventa um endereco).
+  $linhaHost = 'echo Endereco publico: nao informado (quem define e o Public Hostname no painel)'
+  if ($hostPublico) { $linhaHost = 'echo Endereco publico: https://' + $hostPublico }
   Gravar $arquivoTunel ((@(
     '@echo off',
     'title FortesDrive - tunel do servidor (Cloudflare)',
     'cd /d "%~dp0"',
-    'echo Endereco publico: https://' + $hostPublico,
+    $linhaHost,
     'echo Deixe esta janela aberta enquanto quiser o servidor na internet.',
     'echo.',
     'set /p FD_TOKEN=<"%~dp0cloudflared-token.txt"',
@@ -924,9 +967,10 @@ if ($cloudflared -and $tokenTunel -and $hostPublico) {
     Gravar (Join-Path $pasta 'cloudflare-temp-url.txt') $urlTemp
     try { $r = Invoke-RestMethod ($urlTemp + '/health') -TimeoutSec 15; if ($r.ok) { $publicoOk = $true } } catch { }
     Write-Host ('Endereco temporario: ' + $urlTemp) -ForegroundColor Yellow
-    Write-Host 'Cole este endereco em STORAGE_SERVER_URL (pagina Secrets): ele muda a cada subida.' -ForegroundColor Yellow
-    Write-Host 'Para um endereco fixo, crie um tunnel nomeado no painel da Cloudflare e rode' -ForegroundColor Yellow
-    Write-Host 'de novo o atalho "FortesDrive - configurar servidor" para guardar o token.' -ForegroundColor Yellow
+    Write-Host ('O FortesDrive usa o hostname fixo ' + $dominioPadrao + ': para publicar nele,') -ForegroundColor Yellow
+    Write-Host 'crie o tunnel nomeado no painel da Cloudflare (Public Hostname apontando para' -ForegroundColor Yellow
+    Write-Host 'http://localhost:8790) e rode de novo o atalho "FortesDrive - configurar servidor"' -ForegroundColor Yellow
+    Write-Host 'para guardar o token. O endereco temporario acima nao serve em STORAGE_SERVER_URL.' -ForegroundColor Yellow
   } else {
     Write-Host '[AVISO] O tunel temporario nao publicou um endereco. Veja tunel-cloudflare.log.' -ForegroundColor Yellow
   }
@@ -1137,6 +1181,8 @@ if ($localOk -and $publicoOk -and $armazenaOk) {
 }
 Write-Host '=====================================================' -ForegroundColor Cyan
 Write-Host ''
+Write-Host ('Hostname fixo do servidor (Cloudflare Tunnel): https://' + $dominioPadrao) -ForegroundColor Cyan
+Write-Host 'Docker + Cloudflare Tunnel: nenhum outro tunel e usado pelo FortesDrive.' -ForegroundColor Cyan
 Write-Host 'Dashboard do FortesDrive (abra no navegador para comecar a usar):' -ForegroundColor Cyan
 Write-Host '  https://fortesdrive.base44.app/drive'
 Write-Host 'Na pagina Armazenamento, clique em "Verificar conexao".' -ForegroundColor Cyan
@@ -1151,6 +1197,15 @@ if ($urlPublica -and $publicoOk) {
   Write-Host '  (tunel temporario: este endereco muda a cada subida)' -ForegroundColor Yellow
 } else {
   Write-Host '  [pendente] conclua a configuracao do tunel Cloudflare (instrucoes acima)' -ForegroundColor Yellow
+}
+Write-Host ''
+Write-Host 'Tipo de endereco publicado:' -ForegroundColor Cyan
+if ($tokenTunel -and $publicoOk) {
+  Write-Host '  fixo (tunel nomeado Cloudflare: o endereco nao muda a cada subida)'
+} elseif (-not $tokenTunel -and $publicoOk) {
+  Write-Host '  temporario (tunel rapido do Cloudflare: o endereco muda a cada subida)' -ForegroundColor Yellow
+} else {
+  Write-Host '  ainda nao publicado' -ForegroundColor Yellow
 }
 Write-Host ''
 Write-Host 'Segredo do servidor (segredo STORAGE_SIGNING_SECRET):' -ForegroundColor Cyan
