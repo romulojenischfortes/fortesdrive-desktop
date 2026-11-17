@@ -143,6 +143,7 @@ async function ensureParents(key) {
  * Traduz uma resposta do Nextcloud no motivo, em vez de um "falhou" genérico.
  *   webdav-auth          credenciais recusadas (conta ou senha de aplicativo)
  *   quota                cota da conta esgotada
+ *   nextcloud-busy       o Nextcloud limitou as tentativas (429, proteção contra força bruta)
  *   nextcloud-starting   o Nextcloud respondeu, mas ainda não está pronto
  *   nextcloud-unreachable não respondeu (rede, container parado, DNS)
  *   webdav-error         qualquer outro erro do WebDAV
@@ -150,7 +151,12 @@ async function ensureParents(key) {
 function reasonFor(status, detail) {
   if (status === 401 || status === 403) return 'webdav-auth';
   if (status === 507) return 'quota';
-  if (status === 502 || status === 503 || status === 504 || status === 404 || status === 405) return 'nextcloud-starting';
+  if (status === 429) return 'nextcloud-busy';
+  // 409/423 e os 5xx são o que um Nextcloud recém-instalado devolve enquanto
+  // cria o banco e as pastas da conta: é inicialização, não falha de configuração.
+  if (!status || status >= 500 || status === 404 || status === 405 || status === 409 || status === 423) {
+    return 'nextcloud-starting';
+  }
   return 'webdav-error';
 }
 
@@ -165,13 +171,18 @@ async function probe() {
   const falha = (status, detail) => ({
     writable: false,
     reason: reasonFor(status, detail),
-    detail: detail || (status ? 'O Nextcloud respondeu ' + status + '.' : null),
+    // O código HTTP viaja junto: é ele que diz se o Nextcloud ainda está
+    // instalando (409/423/5xx), se recusou a conta (401/403) ou se limitou as
+    // tentativas (429) — sem ele, tudo isso aparecia como "erro desconhecido".
+    code: status || null,
+    detail: (status ? 'HTTP ' + status + ' — ' : '') + (detail || 'O Nextcloud não confirmou a gravação.'),
   });
 
   if (!cfg.enabled) {
     return {
       writable: false,
       reason: 'not-configured',
+      code: null,
       detail: 'Faltam NEXTCLOUD_URL, NEXTCLOUD_USER e NEXTCLOUD_APP_PASSWORD no .env do servidor.',
     };
   }

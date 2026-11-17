@@ -120,6 +120,9 @@ class ServerTunnel {
     this.log = "";
     this.killedStray = false;
     this.busy = "";
+    // Já existe uma escolha salva (ligada ou desligada) pelo usuário. Sem esse
+    // registro, esta é a primeira abertura na função de servidor.
+    this.configured = false;
     // Subida manual: o túnel roda mesmo com a subida automática desativada,
     // até o usuário parar ou fechar o aplicativo.
     this.manual = false;
@@ -171,6 +174,7 @@ class ServerTunnel {
 
   async init() {
     const raw = await fs.readFile(this.file, "utf8").catch(() => "");
+    this.configured = raw.trim().length > 0;
     try {
       const saved = JSON.parse(raw || "{}");
       if (saved.serverRoot) this.state.serverRoot = saved.serverRoot;

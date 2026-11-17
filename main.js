@@ -385,6 +385,13 @@ app.whenReady().then(async () => {
   await createTray();
   refreshTrayMenu();
   updater.start();
+  // Modo servidor: na primeira abertura depois da instalação o túnel sobe junto,
+  // sem ninguém precisar ligar a subida automática na mão. Uma escolha já salva
+  // pelo usuário (ligada ou desligada) é sempre respeitada.
+  const serverRole = syncEngine.store.get("machineRole") === "server";
+  if (serverRole && !serverTunnel.configured && !serverTunnel.getStatus().enabled) {
+    serverTunnel.setEnabled(true).catch(error => console.error("Túnel:", error.message));
+  }
   // Servidor e tunel sobem sozinhos quando o inicio automatico esta ligado.
   if (serverTunnel.getStatus().enabled) serverTunnel.start().catch(error => console.error("Túnel:", error.message));
 });

@@ -11,6 +11,10 @@
   Var FortesMachineRole
   Var FortesRoleClient
   Var FortesRoleServer
+  ; Codigo de instalacao do servidor (opcional): gerado na pagina Armazenamento
+  ; do app. Com ele o app cria o tunel Cloudflare e o endereco publico sozinho.
+  Var FortesInstallCode
+  Var FortesInstallCodeInput
 !endif
 
 ; Pagina extra do instalador (depois da pasta de instalacao): aqui o usuario
@@ -41,7 +45,11 @@ Function FortesRolePageCreate
   ${EndIf}
   !insertmacro MUI_HEADER_TEXT "Tipo de instalação" "Escolha Cliente ou Servidor."
   SetShellVarContext current
+  ; O papel e gravado na visao de registro de 64 bits; ler so a visao padrao
+  ; fazia uma instalacao nova sobre um servidor existente voltar como cliente.
+  SetRegView 64
   ReadRegStr $FortesMachineRole HKLM "Software\FortesDrive" "MachineRole"
+  SetRegView lastused
   ${If} "$FortesMachineRole" != "server"
     StrCpy $FortesMachineRole "client"
   ${EndIf}
@@ -62,7 +70,18 @@ Function FortesRolePageCreate
   ${Else}
     ${NSD_Check} $FortesRoleClient
   ${EndIf}
-  ${NSD_CreateLabel} 0 64u 100% 40u "Cliente: somente sincronizacao, sem dependencias extras. Servidor: configura o armazenamento neste computador. Pastas, arquivos e segredo existentes sao preservados."
+  ${NSD_CreateLabel} 0 64u 100% 24u "Cliente: somente sincronizacao, sem dependencias extras. Servidor: configura o armazenamento neste computador. Pastas, arquivos e segredo existentes sao preservados."
+  Pop $0
+
+  ; Codigo de instalacao: e o caminho curto para o servidor ficar pronto sem
+  ; abrir o painel da Cloudflare. Sem ele, o assistente pede o codigo ao abrir.
+  ${NSD_CreateLabel} 0 90u 100% 10u "Código de instalação do servidor (opcional — gerado em Armazenamento, no app):"
+  Pop $0
+  ${NSD_CreateText} 0 102u -110u 14u "$FortesInstallCode"
+  Pop $FortesInstallCodeInput
+  ${NSD_CreateLabel} -106u 103u 106u 12u "8 caracteres"
+  Pop $0
+  ${NSD_CreateLabel} 0 120u 100% 24u "Somente no modo servidor. Com o código, o túnel Cloudflare e o endereço público são criados automaticamente; em branco, o assistente pergunta depois."
   Pop $0
 
   nsDialogs::Show
@@ -75,6 +94,7 @@ Function FortesRolePageLeave
   ${Else}
     StrCpy $FortesMachineRole "client"
   ${EndIf}
+  ${NSD_GetText} $FortesInstallCodeInput $FortesInstallCode
 FunctionEnd
 
 Function FortesSyncPageCreate
@@ -197,6 +217,16 @@ FunctionEnd
       Exec '"$INSTDIR\FortesDrive.exe" "--sync-folder=$FortesSyncDir"'
     ${EndIf}
     ${If} "$FortesMachineRole" == "server"
+      ; Codigo de instalacao digitado aqui: o assistente do servidor le este
+      ; arquivo e ja cria o tunel e o endereco publico pelo app, sem pedir nada.
+      ClearErrors
+      ${If} "$FortesInstallCode" != ""
+        FileOpen $1 "$APPDATA\FortesDrive\codigo-instalacao.txt" w
+        ${IfNot} ${Errors}
+          FileWrite $1 "$FortesInstallCode"
+          FileClose $1
+        ${EndIf}
+      ${EndIf}
       CreateShortCut "$SMPROGRAMS\FortesDrive - configurar servidor.lnk" "$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" '-NoProfile -ExecutionPolicy Bypass -File "$INSTDIR\resources\server\setup-server.ps1"'
       ; Executado apenas no modo servidor, usando o pacote incluido no .exe.
       ExecWait '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File "$INSTDIR\resources\server\setup-server.ps1"' $0
@@ -268,9 +298,23 @@ FunctionEnd
   ${EndIf}
 !macroend
 
+; O servidor precisa subir com o Windows: sem isso, o computador reinicia e o
+; armazenamento (gateway e tunel) fica fora do ar ate alguem abrir o programa.
+; Vale tambem para atualizacoes, que nao passam pelas paginas do instalador.
+!macro FortesRoleAutostart
+  SetShellVarContext current
+  ReadRegStr $R4 HKLM "Software\FortesDrive" "MachineRole"
+  ${If} "$R4" == "server"
+    CreateShortCut "$SMSTARTUP\FortesDrive.lnk" "$INSTDIR\FortesDrive.exe" "--background"
+  ${Else}
+    Delete "$SMSTARTUP\FortesDrive.lnk"
+  ${EndIf}
+!macroend
+
 !macro customInstall
   SetRegView 64
   !insertmacro FortesWriteSyncFolder
+  !insertmacro FortesRoleAutostart
   !insertmacro FortesVerifyInstall
   !insertmacro RegisterFortesOverlay 1 Synced
   !insertmacro RegisterFortesOverlay 2 Pending
@@ -291,6 +335,9 @@ FunctionEnd
 !macroend
 !macro customUnInstall
   SetRegView 64
+  SetShellVarContext current
+  Delete "$SMSTARTUP\FortesDrive.lnk"
+  Delete "$SMPROGRAMS\FortesDrive - configurar servidor.lnk"
   !insertmacro UnregisterFortesOverlay 1 Synced
   !insertmacro UnregisterFortesOverlay 2 Pending
   !insertmacro UnregisterFortesOverlay 3 Error

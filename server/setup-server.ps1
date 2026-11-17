@@ -34,7 +34,11 @@
 param(
   # Pasta de trabalho do servidor. Padrão: Desktop\storage-server (a mesma
   # usada pelo instalador .bat, para reaproveitar dados e segredo existentes).
-  [string]$Folder = ''
+  [string]$Folder = '',
+  # Código de instalação gerado na página Armazenamento do app. Com ele o túnel
+  # Cloudflare, o endereço público e o segredo do servidor são criados pelo
+  # próprio app — nada de painel da Cloudflare nem segredo copiado à mão.
+  [string]$InstallCode = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -575,6 +579,10 @@ function Classificar-Falha($status, $texto) {
   $t = [string]$texto
   if ($status -eq 401 -or $t -match 'Assinatura') { return 'segredo-divergente' }
   if ($status -eq 413) { return 'arquivo-grande' }
+  # O gateway devolve o codigo do Nextcloud na resposta ("HTTP 409 — ..."): e ele
+  # que diz se o Nextcloud ainda esta instalando ou se recusou a conta.
+  if ($t -match 'HTTP 429') { return 'nextcloud-ocupado' }
+  if ($t -match 'HTTP (409|423|500|501|502|503|504)') { return 'nextcloud-indisponivel' }
   if ($t -match '\(401\)|\(403\)|credenciais') { return 'webdav-auth' }
   if ($status -eq 507 -or $t -match 'cota|quota') { return 'cota' }
   if ($t -match '\(502\)|\(503\)|\(504\)|iniciando|indispon') { return 'nextcloud-indisponivel' }
@@ -648,6 +656,13 @@ function Explicar-Falha($resultado) {
       Write-Host '  O gateway respondeu, mas o Nextcloud nao entregou a gravacao.' -ForegroundColor Yellow
       Write-Host '  Rode: docker compose logs nextcloud   (na pasta do servidor) para ver o que ele informou.'
       Write-Host '  Na primeira subida isso e normal por alguns minutos: ele cria o banco e a conta.'
+      Write-Host '  Se passar de 15 minutos, rode: docker compose restart nextcloud-db nextcloud'
+    }
+    'nextcloud-ocupado' {
+      Write-Host '  O Nextcloud limitou as tentativas (HTTP 429): a protecao contra forca bruta entrou' -ForegroundColor Yellow
+      Write-Host '  em acao, normalmente porque as credenciais ainda nao estavam prontas na primeira subida.'
+      Write-Host '  Espere alguns minutos e rode este atalho de novo. Se continuar, rode:'
+      Write-Host '  docker compose exec -u www-data nextcloud php occ security:bruteforce:reset <seu IP>'
     }
     'pasta-sem-permissao' {
       Write-Host ('  A pasta de dados (' + $pastaDados + ') nao aceitou gravacao.') -ForegroundColor Yellow
@@ -686,7 +701,7 @@ if ($localOk) {
   # e mostra o motivo de cada tentativa — antes, qualquer falha aparecia como a
   # mesma frase generica e nao dizia o que corrigir.
   Write-Host 'Conferindo o armazenamento com um envio de teste real (na primeira vez o Nextcloud leva alguns minutos)...'
-  for ($i = 1; $i -le 120; $i++) {
+  for ($i = 1; $i -le 240; $i++) {
     $teste = Testar-Armazenamento
     if ($teste.ok) { $armazenaOk = $true; break }
     $ultimoTeste = $teste
@@ -825,6 +840,66 @@ if ($cloudflared) {
 $tokenTunel = ''
 if (Test-Path -LiteralPath $arquivoTokenCf) { $tokenTunel = (Ler-TextoUtf8 $arquivoTokenCf).Trim() }
 
+# --- Criacao automatica do tunel pelo proprio app ---------------------------
+# Com o codigo de instalacao (pagina Armazenamento do app), o app cria o tunel
+# Cloudflare, configura o Public Hostname para a porta 8790, cria o DNS com um
+# endereco novo e guarda o segredo de assinatura deste computador. O instalador
+# recebe apenas o token do tunel e o endereco: nenhuma etapa no painel da
+# Cloudflare e nenhum segredo copiado para os secrets do app.
+$script:servidorProvisionado = $false
+
+function Provisionar-Servidor($codigo) {
+  $resultado = @{ ok = $false; mensagem = ''; hostname = ''; token = '' }
+  $corpo = @{ code = $codigo; signingSecret = $segredo; label = $env:COMPUTERNAME } | ConvertTo-Json -Compress
+  try {
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($corpo)
+    $resposta = Invoke-RestMethod -Uri 'https://fortesdrive.base44.app/functions/provisionServer' -Method Post -ContentType 'application/json; charset=utf-8' -Body $bytes -TimeoutSec 180
+  } catch {
+    $detalhe = $_.Exception.Message
+    try {
+      $fluxo = $_.Exception.Response.GetResponseStream()
+      if ($fluxo) {
+        $leitor = New-Object System.IO.StreamReader($fluxo)
+        $texto = $leitor.ReadToEnd()
+        $leitor.Dispose()
+        if ($texto) {
+          $erro = $texto | ConvertFrom-Json
+          if ($erro.message) { $detalhe = [string]$erro.message }
+        }
+      }
+    } catch { }
+    $resultado.mensagem = 'Nao consegui criar o tunel automaticamente: ' + $detalhe
+    return $resultado
+  }
+  if ($resposta.ok -and $resposta.tunnelToken -and $resposta.hostname) {
+    $resultado.ok = $true
+    $resultado.hostname = [string]$resposta.hostname
+    $resultado.token = [string]$resposta.tunnelToken
+    $resultado.mensagem = [string]$resposta.message
+    return $resultado
+  }
+  $resultado.mensagem = if ($resposta.message) { [string]$resposta.message } else { 'O app nao conseguiu preparar este servidor agora.' }
+  return $resultado
+}
+
+function Ler-CodigoInstalacao {
+  if ($InstallCode) { return ([string]$InstallCode).Trim() }
+  # Pasta do servidor e, depois, o codigo digitado no instalador (que fica na
+  # pasta do FortesDrive em %APPDATA%). Assim o modo servidor fica pronto sem
+  # ninguem digitar o codigo de novo.
+  $arquivos = @(
+    (Join-Path $pasta 'codigo-instalacao.txt'),
+    (Join-Path $env:APPDATA 'FortesDrive\codigo-instalacao.txt')
+  )
+  foreach ($arquivoCodigo in $arquivos) {
+    if (Test-Path -LiteralPath $arquivoCodigo) {
+      $lido = (Ler-TextoUtf8 $arquivoCodigo).Trim()
+      if ($lido) { return $lido }
+    }
+  }
+  return ''
+}
+
 function Registrar-TokenCloudflare {
   Write-Host ''
   Write-Host 'O tunel precisa do token do tunnel da SUA conta Cloudflare (o plano gratuito serve).' -ForegroundColor Cyan
@@ -840,7 +915,44 @@ function Registrar-TokenCloudflare {
   return $digitado
 }
 
-if (-not $tokenTunel) { $tokenTunel = Registrar-TokenCloudflare }
+# O codigo de instalacao vem do parametro, do arquivo deixado por uma execucao
+# anterior ou e pedido agora. Ele sempre vale mais que o token guardado: e o app
+# que cria o tunel desta instalacao, com o endereco certo. Assim, rodar o
+# instalador de novo com um codigo novo nao fica preso a um endereco antigo.
+$codigoInstalacao = Ler-CodigoInstalacao
+if (-not $codigoInstalacao -and -not $tokenTunel) {
+  Write-Host ''
+  Write-Host 'Codigo de instalacao do servidor (pagina Armazenamento do app).' -ForegroundColor Cyan
+  Write-Host 'Com ele o tunel, o endereco publico e o segredo sao criados sozinhos.'
+  Write-Host 'Enter vazio = configurar o tunel manualmente (como antes).'
+  $codigoInstalacao = ([string](Read-Host 'Codigo de instalacao (8 caracteres)')).Trim()
+}
+
+if ($codigoInstalacao) {
+  Write-Host ''
+  Write-Host 'Preparando o tunel e o endereco publico pelo app...' -ForegroundColor Cyan
+  $provisao = Provisionar-Servidor $codigoInstalacao
+  if ($provisao.ok) {
+    $tokenTunel = $provisao.token
+    $hostPublico = Limpar-HostPublico $provisao.hostname
+    $script:servidorProvisionado = $true
+    # O codigo vale uma vez: apagado o arquivo, uma nova execucao sem codigo novo
+    # mantem o tunel que ja funciona em vez de tentar usar o codigo ja usado.
+    Remove-Item -LiteralPath (Join-Path $pasta 'codigo-instalacao.txt') -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath (Join-Path $env:APPDATA 'FortesDrive\codigo-instalacao.txt') -ErrorAction SilentlyContinue
+    Write-Host ('Servidor criado pelo app em https://' + $hostPublico) -ForegroundColor Green
+  } else {
+    Write-Host ('[AVISO] ' + $provisao.mensagem) -ForegroundColor Yellow
+    if ($tokenTunel) {
+      Write-Host 'Mantendo o tunel que ja estava configurado neste computador.' -ForegroundColor Yellow
+    } else {
+      Write-Host 'Seguindo com a configuracao manual do tunel.' -ForegroundColor Yellow
+      $tokenTunel = Registrar-TokenCloudflare
+    }
+  }
+} elseif (-not $tokenTunel) {
+  $tokenTunel = Registrar-TokenCloudflare
+}
 if ($tokenTunel) {
   Gravar $arquivoTokenCf $tokenTunel
   Write-Host ('Token do tunnel guardado em ' + $arquivoTokenCf) -ForegroundColor Green
@@ -1217,8 +1329,15 @@ Write-Host ('  senha: ' + $senhaNextcloud)
 Write-Host '  A interface web do Nextcloud fica apenas neste computador.'
 Write-Host '  Os segredos do Nextcloud ficam no .env e sao reaproveitados nas proximas execucoes.'
 Write-Host ''
-Write-Host 'Se os segredos do app estiverem diferentes destes dois valores,' -ForegroundColor Yellow
-Write-Host 'atualize-os na pagina Secrets e clique em "Verificar conexao" de novo.' -ForegroundColor Yellow
+if ($servidorProvisionado) {
+  Write-Host 'Servidor criado pelo app: endereco publico e segredo ja estao ligados a sua conta.' -ForegroundColor Green
+  Write-Host 'Nada a copiar: abra a pagina Armazenamento e clique em "Verificar conexao".' -ForegroundColor Green
+} else {
+  Write-Host 'Se os segredos do app estiverem diferentes destes dois valores,' -ForegroundColor Yellow
+  Write-Host 'atualize-os na pagina Secrets e clique em "Verificar conexao" de novo.' -ForegroundColor Yellow
+  Write-Host 'Na proxima instalacao, use um codigo de instalacao (pagina Armazenamento)' -ForegroundColor Yellow
+  Write-Host 'para o app fazer tudo sozinho, sem copiar segredo nenhum.' -ForegroundColor Yellow
+}
 Write-Host ''
 Write-Host 'Pasta de trabalho do servidor:' -ForegroundColor Cyan
 Write-Host ('  ' + $pasta)

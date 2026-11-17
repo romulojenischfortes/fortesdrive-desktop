@@ -221,6 +221,7 @@ let storageCache = {
   backend: useNextcloud ? 'nextcloud' : 'disk',
   writable: null,
   reason: 'unknown',
+  code: null,
   detail: null,
 };
 let storageCheck = null;
@@ -235,6 +236,9 @@ function storageSnapshotNow() {
         backend: useNextcloud ? 'nextcloud' : 'disk',
         writable: result.writable,
         reason: result.reason,
+        // Código HTTP do armazenamento: distingue "Nextcloud ainda instalando"
+        // de conta recusada sem precisar abrir o log do servidor.
+        code: result.code ?? null,
         detail: result.detail ?? null,
       };
     } catch (error) {
@@ -243,6 +247,7 @@ function storageSnapshotNow() {
         backend: useNextcloud ? 'nextcloud' : 'disk',
         writable: false,
         reason: 'disk-error',
+        code: null,
         detail: error.message,
       };
     } finally {
@@ -492,6 +497,7 @@ async function handleStatus(res) {
       storage: {
         writable: probe.writable,
         reason: probe.reason,
+        code: probe.code ?? null,
         detail: probe.detail,
         backend: 'nextcloud',
         root: process.env.NEXTCLOUD_ROOT || 'FortesDrive',
@@ -674,7 +680,7 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, {
         ok: true,
         version: VERSION,
-        storage: { backend: storage.backend, writable: storage.writable, reason: storage.reason },
+        storage: { backend: storage.backend, writable: storage.writable, reason: storage.reason, code: storage.code ?? null },
       });
     }
 
