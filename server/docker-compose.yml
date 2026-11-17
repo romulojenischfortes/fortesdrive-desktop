@@ -1,10 +1,11 @@
 # FortesDrive — servidor de armazenamento (Nextcloud + gateway)
 #
 # O Nextcloud é o armazenamento: ele guarda os arquivos, as versões e a lixeira,
-# e tem a própria interface web. O gateway do FortesDrive fica na frente dele e
-# é o único serviço publicado (porta local 8790): autentica cada pedido do app,
-# confere o SHA-256 do envio e grava no Nextcloud por WebDAV. Quem publica para
-# a internet é o túnel/proxy descrito no README (HTTPS obrigatório).
+# e tem a própria interface web. O gateway do FortesDrive fica na frente dele:
+# autentica cada pedido do app, confere o SHA-256 do envio e grava no Nextcloud
+# por WebDAV. Quem publica para a internet é o serviço cloudflared, também aqui
+# dentro: o túnel fala com o gateway por http://gateway:8790, o nome do serviço
+# na rede deste Compose.
 #
 # Todos os dados ficam dentro da pasta escolhida no assistente (FD_DATA_DIR):
 #   <pasta>/nextcloud  arquivos e configuração do Nextcloud
@@ -85,10 +86,34 @@ services:
       # de segurança é copiar esta pasta.
       - ${FD_DATA_DIR:-./data}:/data
     ports:
-      # Publicado só no próprio computador: o túnel fala com ele por aqui.
+      # Publicado só no próprio computador: serve para conferir o gateway e para
+      # o aplicativo desktop. Quem publica na internet é o serviço cloudflared.
       - "127.0.0.1:8790:8790"
     depends_on:
       - nextcloud
+    restart: unless-stopped
+    networks:
+      - fd-storage
+
+  # Túnel do Cloudflare dentro do Docker: é ele que publica o gateway na
+  # internet, e nada é instalado no Windows.
+  #
+  # O destino é http://gateway:8790 (o nome do serviço acima), nunca
+  # http://localhost:8790: dentro do contêiner, "localhost" é o próprio
+  # contêiner do túnel, sem gateway nenhum, e o endereço público responde 502.
+  #
+  # Fica no perfil "tunnel": sobe só quando existe token, gravado pelo
+  # assistente como CLOUDFLARE_TUNNEL_TOKEN no .env. Sem token, o resto do
+  # servidor sobe normalmente — é o assistente que liga o perfil.
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    command: tunnel --no-autoupdate run
+    environment:
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:-}
+    depends_on:
+      - gateway
+    profiles:
+      - tunnel
     restart: unless-stopped
     networks:
       - fd-storage
