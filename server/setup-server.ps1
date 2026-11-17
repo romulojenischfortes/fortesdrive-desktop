@@ -12,16 +12,17 @@
     2. grava os arquivos do servidor (gateway) na pasta de trabalho;
     3. reaproveita ou cria o segredo de assinatura (.env) e prepara a pasta de
        dados do Nextcloud, que é o que os volumes do Docker usam;
-    4. libera a porta 8790 (encerrando servidor anterior) e sobe o Nextcloud e
+    4. confere a Cloudflare (token, zona e endereço) antes de mexer nos serviços,
+       quando o código de instalação está disponível;
+    5. libera a porta 8790 (encerrando servidor anterior) e sobe o Nextcloud e
        o gateway em contêineres, esperando os dois responderem;
-    5. instala o cloudflared (túnel do Cloudflare) e pede o token do tunnel uma
-       única vez, guardando o endereço público para as próximas subidas;
-    6. mostra o endereço e o segredo que devem ser colados no app;
-    7. registra a subida automática com o Windows (servidor + túnel), ao ligar
+    6. cria o túnel, grava o token no .env e sobe o serviço cloudflared DENTRO do
+       Docker, já apontado para http://gateway:8790 — nada é instalado no Windows;
+    7. mostra o endereço e o segredo que devem ser colados no app;
+    8. registra a subida automática com o Windows (servidor + túnel), ao ligar
        o computador e a cada entrada na sessão;
-    8. guarda o endereço público (cloudflare-hostname.txt), o token do tunnel
-       (cloudflared-token.txt) e o caminho do cloudflared (cloudflared-path.txt),
-       que é o que a subida automática e o aplicativo usam.
+    9. guarda o endereço público (cloudflare-hostname.txt) e o token do tunnel
+       (cloudflared-token.txt), que é o que a subida automática e o aplicativo usam.
 
   Nada aqui apaga arquivos já gravados: a pasta ./data e o .env
   existentes são mantidos.
@@ -125,6 +126,69 @@ function Escolher-Pasta($titulo, $inicial) {
   return $inicial
 }
 
+# --- Provisionamento do tunel pelo proprio app ------------------------------
+# Com o codigo de instalacao (pagina Armazenamento do app), o app cria o tunel
+# Cloudflare, aponta o Public Hostname para o gateway do Docker, cria o DNS e
+# guarda o segredo de assinatura deste computador. O instalador recebe apenas o
+# token do tunel e o endereco: nenhuma etapa no painel da Cloudflare.
+#
+# A acao "validate" so confere (token, zona e endereco) e nao altera nada: e a
+# checagem feita antes de os servicos subirem. A acao "provision" cria ou
+# reaproveita o tunel e devolve o token do conector.
+$script:servidorProvisionado = $false
+
+function Provisionar-Servidor($codigo, $acao) {
+  $resultado = @{ ok = $false; mensagem = ''; hostname = ''; token = '' }
+  $corpo = @{ action = $acao; code = $codigo; signingSecret = $segredo; label = $env:COMPUTERNAME } | ConvertTo-Json -Compress
+  try {
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($corpo)
+    $resposta = Invoke-RestMethod -Uri 'https://fortesdrive.base44.app/functions/provisionServer' -Method Post -ContentType 'application/json; charset=utf-8' -Body $bytes -TimeoutSec 180
+  } catch {
+    $detalhe = $_.Exception.Message
+    try {
+      $fluxo = $_.Exception.Response.GetResponseStream()
+      if ($fluxo) {
+        $leitor = New-Object System.IO.StreamReader($fluxo)
+        $texto = $leitor.ReadToEnd()
+        $leitor.Dispose()
+        if ($texto) {
+          $erro = $texto | ConvertFrom-Json
+          if ($erro.message) { $detalhe = [string]$erro.message }
+        }
+      }
+    } catch { }
+    $resultado.mensagem = 'Nao consegui falar com o app agora: ' + $detalhe
+    return $resultado
+  }
+  if ($resposta.ok -and $resposta.hostname) {
+    $resultado.ok = $true
+    $resultado.hostname = [string]$resposta.hostname
+    if ($resposta.tunnelToken) { $resultado.token = [string]$resposta.tunnelToken }
+    $resultado.mensagem = [string]$resposta.message
+    return $resultado
+  }
+  $resultado.mensagem = if ($resposta.message) { [string]$resposta.message } else { 'O app nao conseguiu preparar este servidor agora.' }
+  return $resultado
+}
+
+function Ler-CodigoInstalacao {
+  if ($InstallCode) { return ([string]$InstallCode).Trim() }
+  # Pasta do servidor e, depois, o codigo digitado no instalador (que fica na
+  # pasta do FortesDrive em %APPDATA%). Assim o modo servidor fica pronto sem
+  # ninguem digitar o codigo de novo.
+  $arquivos = @(
+    (Join-Path $pasta 'codigo-instalacao.txt'),
+    (Join-Path $env:APPDATA 'FortesDrive\codigo-instalacao.txt')
+  )
+  foreach ($arquivoCodigo in $arquivos) {
+    if (Test-Path -LiteralPath $arquivoCodigo) {
+      $lido = (Ler-TextoUtf8 $arquivoCodigo).Trim()
+      if ($lido) { return $lido }
+    }
+  }
+  return ''
+}
+
 Write-Host ''
 Write-Host '=====================================================' -ForegroundColor Cyan
 Write-Host '  FortesDrive - servidor de armazenamento' -ForegroundColor Cyan
@@ -183,7 +247,11 @@ if (-not $script:dockerCli) {
   }
   if ($baixouDocker) {
     Write-Host 'Instalando o Docker Desktop (pode levar alguns minutos)...' -ForegroundColor Cyan
-    Start-Process -FilePath $instaladorDocker -ArgumentList 'install', '--accept-license' -Wait
+    # Instalacao silenciosa ja com o backend WSL 2: e esse backend que dispensa
+    # o compartilhamento manual de pastas e deixa o disco dos dados visivel para
+    # os containers. Sem --backend, o Docker pode escolher o Hyper-V e a gravacao
+    # falharia com "Access is denied" ate alguem configurar isso na mao.
+    Start-Process -FilePath $instaladorDocker -ArgumentList 'install', '--quiet', '--accept-license', '--backend=wsl-2' -Wait
     $script:dockerCli = Achar-Docker
     if (-not $script:dockerCli) {
       # Instalacao silenciosa sem caminho: abre o assistente, para o usuario
@@ -270,6 +338,36 @@ if ((Invoke-DockerSilencioso info) -ne 0) {
   }
 }
 Write-Host 'Docker respondendo.' -ForegroundColor Green
+
+# --- Configuracao do Docker que o servidor exige ---------------------------
+# Nextcloud, banco, cache e tunel sao imagens Linux. Conferir isso agora evita
+# a instalacao ir longe e parar no "docker compose" com uma mensagem que nao diz
+# o que fazer.
+function Garantir-MotorLinux {
+  $atual = Invoke-DockerComSaida info --format '{{.OSType}}'
+  if ($atual.codigo -eq 0 -and $atual.saida -match 'linux') { return $true }
+  # Contexto da linha de comando: e a troca possivel sem clicar no icone.
+  Invoke-DockerSilencioso context use desktop-linux | Out-Null
+  Start-Sleep -Seconds 3
+  $depois = Invoke-DockerComSaida info --format '{{.OSType}}'
+  return ($depois.codigo -eq 0 -and $depois.saida -match 'linux')
+}
+
+if (Garantir-MotorLinux) {
+  Write-Host 'Docker no modo de conteineres Linux.' -ForegroundColor Green
+} else {
+  Write-Host '[ATENCAO] O Docker Desktop esta no modo de conteineres Windows.' -ForegroundColor Yellow
+  Write-Host '  O armazenamento e o tunel sao imagens Linux. Na bandeja do Windows, clique' -ForegroundColor Yellow
+  Write-Host '  no icone do Docker e escolha "Switch to Linux containers"; a instalacao' -ForegroundColor Yellow
+  Write-Host '  continua e esta conferencia se repete na proxima execucao do atalho.' -ForegroundColor Yellow
+}
+
+if ((Invoke-DockerComSaida compose version).codigo -eq 0) {
+  Write-Host 'Docker Compose disponivel.' -ForegroundColor Green
+} else {
+  Write-Host '[ATENCAO] O Docker Compose nao respondeu. Atualize o Docker Desktop' -ForegroundColor Yellow
+  Write-Host '  (Settings > Software updates) e rode este atalho de novo.' -ForegroundColor Yellow
+}
 
 # ---------------------------------------------------------------------
 #  2/6 Arquivos do servidor (vem do proprio instalador)
@@ -447,6 +545,32 @@ if (-not (Ler-TextoUtf8 $composeAtual).Contains('FD_DATA_DIR') -and -not $legado
 Gravar $envFile ($linhasEnv -join "`r`n")
 Write-Host ('Pasta dos dados do armazenamento: ' + $pastaDados) -ForegroundColor Green
 
+# --- Conferencia da Cloudflare, antes de mexer em qualquer servico ----------
+# Com o codigo de instalacao, o app confere agora se consegue publicar este
+# servidor (token, zona e endereco). Um problema na Cloudflare aparece antes de o
+# instalador reiniciar qualquer servico, e o tunel que ja funciona neste
+# computador nunca e trocado por causa de uma configuracao incompleta.
+$script:tunelOk = $true
+$codigoInstalacao = Ler-CodigoInstalacao
+if ($codigoInstalacao) {
+  Write-Host ''
+  Write-Host 'Conferindo a Cloudflare (token, dominio e endereco) antes de subir os servicos...' -ForegroundColor Cyan
+  $conferencia = Provisionar-Servidor $codigoInstalacao 'validate'
+  if ($conferencia.ok) {
+    Write-Host ('Cloudflare pronta: o servidor sera publicado em https://' + $conferencia.hostname) -ForegroundColor Green
+  } else {
+    $script:tunelOk = $false
+    Write-Host '[AVISO] A Cloudflare ainda nao pode publicar este servidor:' -ForegroundColor Yellow
+    Write-Host ('  ' + $conferencia.mensagem) -ForegroundColor Yellow
+    if ($tokenTunel) {
+      Write-Host '  O tunel que ja esta configurado neste computador continua como esta.' -ForegroundColor Yellow
+    } else {
+      Write-Host '  O servidor de arquivos sobe normalmente; o tunel fica pendente.' -ForegroundColor Yellow
+      Write-Host '  Corrija o que faltar no app (Armazenamento > Diagnosticar) e rode este atalho de novo.' -ForegroundColor Yellow
+    }
+  }
+}
+
 # ---------------------------------------------------------------------
 #  4/6 Sobe os servicos
 # ---------------------------------------------------------------------
@@ -458,7 +582,9 @@ Passo '4/6 Subindo o servidor e o Nextcloud (a primeira vez baixa as imagens e l
 # subir o novo. Nada e apagado: os dados continuam em ./data e o segredo no .env.
 function Liberar-Porta8790 {
   Push-Location $pasta
-  Invoke-DockerSilencioso compose down --remove-orphans | Out-Null
+  # O perfil "tunnel" entra no down: sem ele, o container do túnel ficaria de pé
+  # segurando a conexão antiga enquanto o resto sobe de novo.
+  Invoke-DockerSilencioso compose --profile tunnel down --remove-orphans | Out-Null
   Pop-Location
 
   # Nomes usados por instalacoes antigas do servidor.
@@ -744,28 +870,31 @@ if ($localOk) {
 
 $arquivoHost = Join-Path $pasta 'cloudflare-hostname.txt'
 $arquivoTokenCf = Join-Path $pasta 'cloudflared-token.txt'
-$arquivoExeCf = Join-Path $pasta 'cloudflared-path.txt'
 
 # O Public Hostname e um nome DNS puro: sem esquema, sem caminho e sem barra no
 # fim. Um valor colado com "https://" ou com o endereco do app (base44.app) nao
 # aponta para o tunel do dono, e todo envio falharia com ele guardado.
+# ATENCAO: $host e uma variavel automatica do PowerShell (o computador) e nao
+# aceita ser gravada. Usar $host aqui encerrava a instalacao logo depois do
+# teste de armazenamento, com "Nao e possivel substituir a variavel Host porque
+# ela e somente leitura". A variavel do endereco publico chama-se $nomeHost.
 function Limpar-HostPublico($valor) {
   if (-not $valor) { return '' }
-  $host = ([string]$valor).Trim().Trim('"')
-  $host = $host -replace '^\s*[A-Za-z][A-Za-z0-9+.-]*://', ''
-  $host = $host -replace '/.*$', ''
-  return $host.Trim().TrimEnd('.').ToLower()
+  $nomeHost = ([string]$valor).Trim().Trim('"')
+  $nomeHost = $nomeHost -replace '^\s*[A-Za-z][A-Za-z0-9+.-]*://', ''
+  $nomeHost = $nomeHost -replace '/.*$', ''
+  return $nomeHost.Trim().TrimEnd('.').ToLower()
 }
 
-function Problema-HostPublico($host) {
-  if (-not $host) { return 'Informe o endereco publico do tunnel (o Public Hostname).' }
-  if ($host -match '(^|\.)n[g]rok(-free)?\.(dev|io|app)$') {
+function Problema-HostPublico($nomeHost) {
+  if (-not $nomeHost) { return 'Informe o endereco publico do tunnel (o Public Hostname).' }
+  if ($nomeHost -match '(^|\.)n[g]rok(-free)?\.(dev|io|app)$') {
     return ('Este e um endereco de tunel antigo, que o FortesDrive nao usa mais. O servidor usa o Cloudflare Tunnel com o hostname fixo ' + $dominioPadrao + '.')
   }
-  if ($host -match '(^|\.)base44\.app$') {
+  if ($nomeHost -match '(^|\.)base44\.app$') {
     return 'Este e o endereco do proprio app FortesDrive, nao o do seu servidor. Crie o Public Hostname num dominio que esteja na sua conta Cloudflare.'
   }
-  if ($host -notmatch '^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$') {
+  if ($nomeHost -notmatch '^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$') {
     return 'Endereco invalido: informe apenas o nome do host, sem esquema, sem caminho e sem barra no final (ex.: drive.seudominio.com).'
   }
   return ''
@@ -791,121 +920,39 @@ if ($hostPublico) {
   }
 }
 
-function Achar-Cloudflared {
-  $cmd = Get-Command cloudflared -ErrorAction SilentlyContinue
-  if ($cmd) { return $cmd.Source }
-  $candidatos = @(
-    (Join-Path $env:ProgramFiles 'cloudflared\cloudflared.exe'),
-    (Join-Path $env:LOCALAPPDATA 'cloudflared\cloudflared.exe'),
-    (Join-Path $env:USERPROFILE 'cloudflared.exe')
-  )
-  foreach ($p in $candidatos) { if ($p -and (Test-Path -LiteralPath $p)) { return $p } }
-  return $null
-}
-
-# O cloudflared e o binario oficial do Cloudflare. A copia fica na pasta do
-# usuario e o caminho e guardado para as proximas subidas (inclusive a do
-# aplicativo, que rele esse arquivo ao ligar o Windows).
-function Instalar-Cloudflared {
-  $destino = Join-Path $env:LOCALAPPDATA 'cloudflared'
-  New-Item -ItemType Directory -Force $destino | Out-Null
-  $exe = Join-Path $destino 'cloudflared.exe'
-  try {
-    Invoke-WebRequest 'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe' -OutFile $exe -UseBasicParsing -TimeoutSec 900
-    if (-not (Test-Path -LiteralPath $exe)) { throw 'o download nao gerou o cloudflared.exe' }
-    Write-Host ('  cloudflared pronto em ' + $exe) -ForegroundColor Green
-    return $exe
-  } catch {
-    Write-Host ('  [AVISO] ' + $_.Exception.Message) -ForegroundColor Yellow
-    return $null
-  }
-}
-
-$cloudflared = Achar-Cloudflared
-if (-not $cloudflared) {
-  Write-Host 'cloudflared nao encontrado: baixando o binario oficial do Cloudflare...'
-  $cloudflared = Instalar-Cloudflared
-}
-if ($cloudflared) {
-  Write-Host ('cloudflared instalado: ' + $cloudflared) -ForegroundColor Green
-  Gravar $arquivoExeCf $cloudflared
-} else {
-  Write-Host '[AVISO] Nao consegui instalar o cloudflared automaticamente.' -ForegroundColor Yellow
-  Write-Host 'Baixe em https://github.com/cloudflare/cloudflared/releases e rode de novo este atalho.'
-}
+# O tunel do Cloudflare roda como servico do Docker Compose (servico
+# "cloudflared"): nada e instalado no Windows e nada roda fora do container. O
+# destino e http://gateway:8790, o nome do servico do gateway na rede do
+# Compose — dentro do container, "localhost" e o proprio container do tunel, e
+# era isso que respondia 502 no endereco publico.
+$servicoTunel = 'cloudflared'
+$destinoTunel = 'http://gateway:8790'
 
 # O token do tunnel e pessoal: fica ligado a conta Cloudflare de quem criou o
 # tunel e por isso nunca vem dentro do instalador. Ele e pedido UMA vez aqui
-# (digitacao oculta), guardado em cloudflared-token.txt e reaproveitado depois.
+# (digitacao oculta), guardado em cloudflared-token.txt e copiado para o .env
+# como CLOUDFLARE_TUNNEL_TOKEN, que e a variavel lida pelo servico do Docker.
 $tokenTunel = ''
 if (Test-Path -LiteralPath $arquivoTokenCf) { $tokenTunel = (Ler-TextoUtf8 $arquivoTokenCf).Trim() }
 
-# --- Criacao automatica do tunel pelo proprio app ---------------------------
-# Com o codigo de instalacao (pagina Armazenamento do app), o app cria o tunel
-# Cloudflare, configura o Public Hostname para a porta 8790, cria o DNS com um
-# endereco novo e guarda o segredo de assinatura deste computador. O instalador
-# recebe apenas o token do tunel e o endereco: nenhuma etapa no painel da
-# Cloudflare e nenhum segredo copiado para os secrets do app.
-$script:servidorProvisionado = $false
-
-function Provisionar-Servidor($codigo) {
-  $resultado = @{ ok = $false; mensagem = ''; hostname = ''; token = '' }
-  $corpo = @{ code = $codigo; signingSecret = $segredo; label = $env:COMPUTERNAME } | ConvertTo-Json -Compress
-  try {
-    $bytes = [System.Text.Encoding]::UTF8.GetBytes($corpo)
-    $resposta = Invoke-RestMethod -Uri 'https://fortesdrive.base44.app/functions/provisionServer' -Method Post -ContentType 'application/json; charset=utf-8' -Body $bytes -TimeoutSec 180
-  } catch {
-    $detalhe = $_.Exception.Message
-    try {
-      $fluxo = $_.Exception.Response.GetResponseStream()
-      if ($fluxo) {
-        $leitor = New-Object System.IO.StreamReader($fluxo)
-        $texto = $leitor.ReadToEnd()
-        $leitor.Dispose()
-        if ($texto) {
-          $erro = $texto | ConvertFrom-Json
-          if ($erro.message) { $detalhe = [string]$erro.message }
-        }
-      }
-    } catch { }
-    $resultado.mensagem = 'Nao consegui criar o tunel automaticamente: ' + $detalhe
-    return $resultado
-  }
-  if ($resposta.ok -and $resposta.tunnelToken -and $resposta.hostname) {
-    $resultado.ok = $true
-    $resultado.hostname = [string]$resposta.hostname
-    $resultado.token = [string]$resposta.tunnelToken
-    $resultado.mensagem = [string]$resposta.message
-    return $resultado
-  }
-  $resultado.mensagem = if ($resposta.message) { [string]$resposta.message } else { 'O app nao conseguiu preparar este servidor agora.' }
-  return $resultado
+# Acrescenta ou troca uma linha do .env sem tocar nas outras: o resto do arquivo
+# e relido e regravado como esta, para nenhum segredo se perder.
+function Definir-VariavelEnv($nome, $valor) {
+  $restantes = @((Ler-TextoUtf8 $envFile) -split "\r?\n" | Where-Object { $_ -ne '' -and $_ -notmatch ('^\s*' + [regex]::Escape($nome) + '\s*=') })
+  Gravar $envFile ((@($nome + '=' + $valor) + $restantes) -join "`r`n")
 }
 
-function Ler-CodigoInstalacao {
-  if ($InstallCode) { return ([string]$InstallCode).Trim() }
-  # Pasta do servidor e, depois, o codigo digitado no instalador (que fica na
-  # pasta do FortesDrive em %APPDATA%). Assim o modo servidor fica pronto sem
-  # ninguem digitar o codigo de novo.
-  $arquivos = @(
-    (Join-Path $pasta 'codigo-instalacao.txt'),
-    (Join-Path $env:APPDATA 'FortesDrive\codigo-instalacao.txt')
-  )
-  foreach ($arquivoCodigo in $arquivos) {
-    if (Test-Path -LiteralPath $arquivoCodigo) {
-      $lido = (Ler-TextoUtf8 $arquivoCodigo).Trim()
-      if ($lido) { return $lido }
-    }
-  }
-  return ''
-}
+# As funcoes de provisionamento (Provisionar-Servidor e Ler-CodigoInstalacao)
+# ficam no topo do script: a conferencia da Cloudflare acontece ANTES de os
+# servicos subirem, para nenhum servico em producao ser reiniciado por causa de
+# uma configuracao incompleta.
 
 function Registrar-TokenCloudflare {
   Write-Host ''
   Write-Host 'O tunel precisa do token do tunnel da SUA conta Cloudflare (o plano gratuito serve).' -ForegroundColor Cyan
   Write-Host 'No painel: Zero Trust > Networks > Tunnels > Create a tunnel > Cloudflared.'
   Write-Host 'Copie o token do comando mostrado e adicione um Public Hostname apontando para'
-  Write-Host 'http://localhost:8790. A digitacao fica oculta e o token nao aparece no resumo final.'
+  Write-Host ($destinoTunel + ' (o gateway dentro do Docker). A digitacao fica oculta e o token nao aparece no resumo final.')
   Write-Host ''
   try { Start-Process 'https://one.dash.cloudflare.com/' } catch { }
   $oculto = Read-Host 'Token do tunnel Cloudflare (Enter vazio = tunel temporario, sem conta)' -AsSecureString
@@ -920,7 +967,10 @@ function Registrar-TokenCloudflare {
 # que cria o tunel desta instalacao, com o endereco certo. Assim, rodar o
 # instalador de novo com um codigo novo nao fica preso a um endereco antigo.
 $codigoInstalacao = Ler-CodigoInstalacao
-if (-not $codigoInstalacao -and -not $tokenTunel) {
+if (-not $script:tunelOk) {
+  # A conferencia da Cloudflare reprovou: nesta rodada o tunel nao muda.
+} elseif (-not $codigoInstalacao -and -not $tokenTunel) {
+  # (so pergunta o codigo quando a Cloudflare passou na conferencia)
   Write-Host ''
   Write-Host 'Codigo de instalacao do servidor (pagina Armazenamento do app).' -ForegroundColor Cyan
   Write-Host 'Com ele o tunel, o endereco publico e o segredo sao criados sozinhos.'
@@ -931,7 +981,7 @@ if (-not $codigoInstalacao -and -not $tokenTunel) {
 if ($codigoInstalacao) {
   Write-Host ''
   Write-Host 'Preparando o tunel e o endereco publico pelo app...' -ForegroundColor Cyan
-  $provisao = Provisionar-Servidor $codigoInstalacao
+  $provisao = Provisionar-Servidor $codigoInstalacao 'provision'
   if ($provisao.ok) {
     $tokenTunel = $provisao.token
     $hostPublico = Limpar-HostPublico $provisao.hostname
@@ -950,7 +1000,7 @@ if ($codigoInstalacao) {
       $tokenTunel = Registrar-TokenCloudflare
     }
   }
-} elseif (-not $tokenTunel) {
+} elseif (-not $tokenTunel -and $script:tunelOk) {
   $tokenTunel = Registrar-TokenCloudflare
 }
 if ($tokenTunel) {
@@ -959,7 +1009,7 @@ if ($tokenTunel) {
   if (-not $hostPublico) {
     Write-Host ''
     Write-Host 'Informe o endereco publico do tunnel (Public Hostname no painel da Cloudflare).' -ForegroundColor Cyan
-    Write-Host 'E o endereco que voce criou em "Add published application", apontando para http://localhost:8790.'
+    Write-Host ('E o endereco que voce criou em "Add published application", apontando para ' + $destinoTunel + '.')
     Write-Host 'Digite apenas o nome do host (ex.: drive.seudominio.com).'
     for ($tentativa = 1; $tentativa -le 5; $tentativa++) {
       $digitado = Limpar-HostPublico (Read-Host 'Endereco publico (ex.: drive.seudominio.com)')
@@ -977,32 +1027,23 @@ if ($tokenTunel) {
   }
 }
 
-# O arquivo abrir-tunel.cmd guarda o comando exato, para subir o tunel de novo
-# com dois cliques quando precisar (o token fica no arquivo ao lado dele).
+# O arquivo abrir-tunel.cmd sobe o tunel do Docker e acompanha as mensagens dele
+# com dois cliques, para quando precisar reiniciar so o tunel.
 $arquivoTunel = Join-Path $pasta 'abrir-tunel.cmd'
-if ($cloudflared -and $tokenTunel) {
+if ($tokenTunel) {
   # O atalho mostra o endereco guardado; sem ele, diz que quem define o
   # endereco e o Public Hostname no painel (nunca inventa um endereco).
   $linhaHost = 'echo Endereco publico: nao informado (quem define e o Public Hostname no painel)'
   if ($hostPublico) { $linhaHost = 'echo Endereco publico: https://' + $hostPublico }
   Gravar $arquivoTunel ((@(
     '@echo off',
-    'title FortesDrive - tunel do servidor (Cloudflare)',
+    'title FortesDrive - tunel do servidor (Docker)',
     'cd /d "%~dp0"',
     $linhaHost,
-    'echo Deixe esta janela aberta enquanto quiser o servidor na internet.',
+    'echo Deixe esta janela aberta para acompanhar o tunel.',
     'echo.',
-    'set /p FD_TOKEN=<"%~dp0cloudflared-token.txt"',
-    '"' + $cloudflared + '" tunnel --no-autoupdate run --token %FD_TOKEN%'
-  )) -join "`r`n")
-} elseif ($cloudflared) {
-  Gravar $arquivoTunel ((@(
-    '@echo off',
-    'title FortesDrive - tunel temporario do servidor (Cloudflare)',
-    'cd /d "%~dp0"',
-    'echo TUNEL TEMPORARIO: copie o endereco https abaixo para STORAGE_SERVER_URL.',
-    'echo.',
-    '"' + $cloudflared + '" tunnel --no-autoupdate --url http://127.0.0.1:8790'
+    'docker compose --profile tunnel up -d --no-deps ' + $servicoTunel,
+    'docker compose logs -f ' + $servicoTunel
   )) -join "`r`n")
 }
 
@@ -1030,13 +1071,25 @@ function Testar-GatewayPublico($url) {
 $publicoOk = $false
 $urlPublica = if ($hostPublico) { 'https://' + $hostPublico } else { '' }
 
-if ($cloudflared -and $tokenTunel -and $hostPublico) {
+if ($tokenTunel -and $hostPublico) {
+  # O token vira variavel do .env: e por ela que o servico do Docker sabe qual
+  # tunel atender. As outras linhas do .env sao mantidas como estao.
+  Definir-VariavelEnv 'CLOUDFLARE_TUNNEL_TOKEN' $tokenTunel
+  # Um conector antigo aberto no Windows disputaria o mesmo tunel com o do
+  # Docker — e ele nao resolve "gateway", por isso responde 502. Encerra antes.
   Get-Process cloudflared -ErrorAction SilentlyContinue | Stop-Process -Force
-  Start-Sleep -Seconds 2
-  Write-Host ('Subindo o tunel Cloudflare (porta 8790 -> ' + $hostPublico + ') ...')
-  Start-Process -FilePath $cloudflared -ArgumentList @('tunnel', '--no-autoupdate', 'run', '--token', $tokenTunel) -WindowStyle Hidden | Out-Null
+  Write-Host ('Subindo o tunel dentro do Docker (' + $destinoTunel + ' -> ' + $hostPublico + ') ...')
+  Push-Location $pasta
+  $codigoTunel = Invoke-DockerSilencioso compose --profile tunnel up -d --no-deps $servicoTunel
+  Pop-Location
+  if ($codigoTunel -ne 0) {
+    Write-Host '[AVISO] Nao consegui subir o servico do tunel no Docker.' -ForegroundColor Yellow
+    Write-Host ('  Na pasta ' + $pasta + ', rode: docker compose --profile tunnel up -d ' + $servicoTunel) -ForegroundColor Yellow
+    Write-Host ('  e veja as mensagens com: docker compose logs --tail 40 ' + $servicoTunel) -ForegroundColor Yellow
+  }
   $ultimoPublico = $null
-  for ($i = 1; $i -le 24; $i++) {
+  $voltas = if ($codigoTunel -eq 0) { 24 } else { 0 }
+  for ($i = 1; $i -le $voltas; $i++) {
     Start-Sleep -Seconds 5
     $ultimoPublico = Testar-GatewayPublico $urlPublica
     if ($ultimoPublico.ok) { $publicoOk = $true; break }
@@ -1050,52 +1103,33 @@ if ($cloudflared -and $tokenTunel -and $hostPublico) {
     if ($st -eq 404) {
       Write-Host ('  O endereco respondeu 404 em /health: o Public Hostname "' + $hostPublico + '" nao chega ao gateway.')
       Write-Host '  No painel da Cloudflare (Zero Trust > Networks > Tunnels), confira se o Public Hostname'
-      Write-Host '  aponta para http://localhost:8790 e se o tunnel aparece como Healthy.'
+      Write-Host ('  aponta para ' + $destinoTunel + ' e se o tunnel aparece como Healthy.')
     } elseif ($st -ge 500) {
       Write-Host '  A borda do Cloudflare respondeu no lugar do servidor (502/530/1033): o tunnel existe,'
-      Write-Host '  mas o cloudflared nao esta conectado a ele ou publica outra porta.'
+      Write-Host '  mas o conector nao entrega o gateway. Confira se o Public Hostname aponta para'
+      Write-Host ('  ' + $destinoTunel + ' — com "localhost" ali responde 502, porque dentro do container')
+      Write-Host '  "localhost" e o proprio container do tunel. Para reaplicar o destino, use o botao'
+      Write-Host '  "Corrigir tunel" na pagina Armazenamento do app.'
     } else {
       Write-Host '  No painel da Cloudflare, confira o Public Hostname do tunnel: ele precisa apontar para'
-      Write-Host '  http://localhost:8790, e o tunnel precisa aparecer como Healthy.'
+      Write-Host ('  ' + $destinoTunel + ', e o tunnel precisa aparecer como Healthy.')
     }
     Write-Host '  Nao informe este endereco no app (STORAGE_SERVER_URL) enquanto ele nao responder o gateway.' -ForegroundColor Yellow
   }
-} elseif ($cloudflared) {
-  # Sem token: tunel rapido do Cloudflare, sem conta. O endereco muda a cada
-  # subida e por isso serve para conferir, nao para uso diario.
-  Get-Process cloudflared -ErrorAction SilentlyContinue | Stop-Process -Force
-  Start-Sleep -Seconds 2
-  $logTunel = Join-Path $pasta 'tunel-cloudflare.log'
-  Write-Host 'Subindo um tunel temporario do Cloudflare (sem conta)...' -ForegroundColor Cyan
-  Start-Process -FilePath $cloudflared -ArgumentList @('tunnel', '--no-autoupdate', '--url', 'http://127.0.0.1:8790') -WindowStyle Hidden -RedirectStandardOutput $logTunel -RedirectStandardError ($logTunel + '.err') | Out-Null
-  $urlTemp = ''
-  for ($i = 1; $i -le 12; $i++) {
-    Start-Sleep -Seconds 5
-    $textoLog = ((Ler-TextoUtf8 $logTunel) + "`n" + (Ler-TextoUtf8 ($logTunel + '.err')))
-    $achado = [regex]::Match($textoLog, 'https://[a-z0-9-]+\.trycloudflare\.com')
-    if ($achado.Success) { $urlTemp = $achado.Value; break }
-  }
-  if ($urlTemp) {
-    Gravar (Join-Path $pasta 'cloudflare-temp-url.txt') $urlTemp
-    try { $r = Invoke-RestMethod ($urlTemp + '/health') -TimeoutSec 15; if ($r.ok) { $publicoOk = $true } } catch { }
-    Write-Host ('Endereco temporario: ' + $urlTemp) -ForegroundColor Yellow
-    Write-Host ('O FortesDrive usa o hostname fixo ' + $dominioPadrao + ': para publicar nele,') -ForegroundColor Yellow
-    Write-Host 'crie o tunnel nomeado no painel da Cloudflare (Public Hostname apontando para' -ForegroundColor Yellow
-    Write-Host 'http://localhost:8790) e rode de novo o atalho "FortesDrive - configurar servidor"' -ForegroundColor Yellow
-    Write-Host 'para guardar o token. O endereco temporario acima nao serve em STORAGE_SERVER_URL.' -ForegroundColor Yellow
-  } else {
-    Write-Host '[AVISO] O tunel temporario nao publicou um endereco. Veja tunel-cloudflare.log.' -ForegroundColor Yellow
-  }
+} elseif ($tokenTunel) {
+  Write-Host 'Sem um endereco publico valido o tunel nao sobe agora: rode de novo este atalho e informe o Public Hostname.' -ForegroundColor Yellow
+} elseif (-not $script:tunelOk) {
+  Write-Host 'TUNEL DA INTERNET: pendente (a Cloudflare precisa ser corrigida no app antes).' -ForegroundColor Yellow
 } else {
   Write-Host ''
-  Write-Host 'CONFIGURACAO DO TUNEL (Cloudflare): pendente' -ForegroundColor Yellow
-  Write-Host '  1) Crie a conta gratuita em https://one.dash.cloudflare.com'
-  Write-Host '  2) Em Zero Trust > Networks > Tunnels, crie um tunnel "Cloudflared".'
-  Write-Host '  3) No tunnel, adicione um Public Hostname apontando para http://localhost:8790'
-  Write-Host '     (a porta 8790 e a unica que deve ser publicada: so ela confere a assinatura).'
-  Write-Host '  4) Rode de novo o atalho "FortesDrive - configurar servidor" e cole o token.'
-  Write-Host '  5) Copie o endereco https do tunnel para o segredo STORAGE_SERVER_URL no app'
-  Write-Host '     (pagina Secrets) e clique em "Verificar conexao".'
+  Write-Host 'TUNEL DA INTERNET: pendente' -ForegroundColor Yellow
+  Write-Host '  O tunel roda no Docker, mas precisa do token do tunnel da sua conta Cloudflare.'
+  Write-Host '  1) No app, em Armazenamento, clique em "Gerar codigo de instalacao".'
+  Write-Host '  2) Rode de novo este atalho e digite o codigo: o app cria o tunel, o endereco'
+  Write-Host '     publico e o DNS sozinho, sem abrir o painel da Cloudflare.'
+  Write-Host '  Alternativa manual: em Zero Trust > Networks > Tunnels crie um tunnel "Cloudflared",'
+  Write-Host ('  copie o token e, no Public Hostname, use ' + $destinoTunel + ' como destino')
+  Write-Host '  (e o nome do servico dentro do Docker; "localhost" ali responde 502).'
 }
 
 # ---------------------------------------------------------------------
@@ -1180,70 +1214,99 @@ if ($dockerOk) {
 if (-not $localOk) { Anotar 'Gateway sem resposta na porta 8790. Tunel nao iniciado por esta tarefa.'; exit 1 }
 Anotar 'Gateway confirmado na porta 8790.'
 
-# 3) Tunel para a internet (Cloudflare).
+# 3) Tunel para a internet: o servico "cloudflared" do Docker Compose, que fala
+#    com o gateway por http://gateway:8790 dentro da rede do proprio Compose.
 $arquivoHost = Join-Path $pasta 'cloudflare-hostname.txt'
 $arquivoToken = Join-Path $pasta 'cloudflared-token.txt'
-$arquivoExe = Join-Path $pasta 'cloudflared-path.txt'
 $hostPublico = if (Test-Path $arquivoHost) { (Get-Content -Raw -LiteralPath $arquivoHost).Trim() } else { '' }
-$exeCloudflared = if (Test-Path $arquivoExe) { (Get-Content -Raw -LiteralPath $arquivoExe).Trim() } else { '' }
-if (-not $exeCloudflared -or -not (Test-Path $exeCloudflared)) {
-  $cmdCf = Get-Command cloudflared -ErrorAction SilentlyContinue
-  $exeCloudflared = if ($cmdCf) { $cmdCf.Source } else { Join-Path $env:LOCALAPPDATA 'cloudflared\cloudflared.exe' }
-}
 $tokenTunel = if (Test-Path $arquivoToken) { (Get-Content -Raw -LiteralPath $arquivoToken).Trim() } else { '' }
 
-if (-not (Test-Path $exeCloudflared)) {
-  Anotar 'cloudflared nao encontrado: tunel nao iniciado.'
-} elseif (-not $tokenTunel) {
+if (-not $tokenTunel) {
   Anotar 'Token do tunnel Cloudflare nao configurado: tunel nao iniciado.'
+} elseif ($dockerOk) {
+  Push-Location $pasta
+  & docker compose --profile tunnel up -d --no-deps cloudflared 2>&1 | Out-Null
+  $tunelOk = ($LASTEXITCODE -eq 0)
+  Pop-Location
+  if ($tunelOk) {
+    Anotar ('Tunel garantido no Docker: https://' + $hostPublico + ' -> http://gateway:8790')
+  } else {
+    Anotar 'Falha ao subir o tunel: veja docker compose logs cloudflared.'
+  }
 } else {
-  Get-Process cloudflared -ErrorAction SilentlyContinue | Stop-Process -Force
-  Start-Sleep -Seconds 2
-  # O aplicativo FortesDrive tambem gerencia este tunel quando a subida
-  # automatica esta ligada: os dois usam os mesmos arquivos e o mesmo tunnel.
-  $tunel = Start-Process -FilePath $exeCloudflared -ArgumentList @('tunnel', '--no-autoupdate', 'run', '--token', $tokenTunel) -WindowStyle Hidden -PassThru
-  Anotar ('Tunel Cloudflare aberto: https://' + $hostPublico + ' -> porta 8790')
-  # Fica vivo junto com o tunel: assim o Windows nao encerra o processo.
-  $tunel.WaitForExit()
-  Anotar 'Tunel encerrado.'
+  Anotar 'O Docker nao ficou pronto a tempo; tunel nao iniciado.'
 }
 '@
 
-# O Docker Desktop precisa subir sozinho: sem ele a tarefa nao teria o que
-# iniciar. A opcao fica no arquivo de configuracao do proprio Docker; as outras
-# chaves sao mantidas como estao e uma copia de seguranca fica guardada ao lado.
-function Habilitar-DockerNoInicio {
+# O Docker Desktop precisa subir sozinho: sem ele a tarefa agendada nao teria o
+# que iniciar, e o servidor nao voltaria depois de reiniciar o Windows. As
+# opcoes ficam no arquivo de configuracao do proprio Docker; as outras chaves sao
+# mantidas como estao e uma copia de seguranca fica guardada ao lado.
+function Habilitar-DockerNoInicio($dados) {
   $arquivo = Join-Path $env:APPDATA 'Docker\settings-store.json'
   if (-not (Test-Path $arquivo)) { $arquivo = Join-Path $env:APPDATA 'Docker\settings.json' }
   if (-not (Test-Path $arquivo)) {
-    Write-Host '[AVISO] Nao encontrei as configuracoes do Docker Desktop.' -ForegroundColor Yellow
-    Write-Host 'Abra o Docker Desktop, entre em Settings > General e marque para ele subir com o Windows.' -ForegroundColor Yellow
+    # O arquivo de configuracao nasce no primeiro inicio do Docker Desktop.
+    Abrir-DockerDesktop | Out-Null
+    for ($i = 1; $i -le 36; $i++) {
+      Start-Sleep -Seconds 5
+      if (Test-Path (Join-Path $env:APPDATA 'Docker\settings-store.json')) {
+        $arquivo = Join-Path $env:APPDATA 'Docker\settings-store.json'
+        break
+      }
+      if (Test-Path (Join-Path $env:APPDATA 'Docker\settings.json')) {
+        $arquivo = Join-Path $env:APPDATA 'Docker\settings.json'
+        break
+      }
+    }
+  }
+  if (-not (Test-Path $arquivo)) {
+    Write-Host '[AVISO] O Docker Desktop ainda nao gravou as configuracoes dele.' -ForegroundColor Yellow
+    Write-Host 'Abra o Docker Desktop, entre em Settings > General, marque para ele subir' -ForegroundColor Yellow
+    Write-Host 'com o Windows e rode este atalho de novo.' -ForegroundColor Yellow
     return
   }
-  $texto = Get-Content -Raw -LiteralPath $arquivo
-  if ($texto -match '"(autoStart|AutoStart)"\s*:\s*true') {
+
+  # Le como JSON e regrava o objeto inteiro: assim nenhuma opcao do usuario se
+  # perde e a chave de subida automatica fica no lugar certo.
+  $config = $null
+  try { $config = (Ler-TextoUtf8 $arquivo) | ConvertFrom-Json } catch { $config = $null }
+  if (-not $config) {
+    Write-Host '[AVISO] Nao consegui ler as configuracoes do Docker Desktop.' -ForegroundColor Yellow
+    return
+  }
+
+  $mudou = $false
+  if ($config.PSObject.Properties.Name -contains 'AutoStart') {
+    if (-not $config.AutoStart) { $config.AutoStart = $true; $mudou = $true }
+  } elseif ($config.PSObject.Properties.Name -contains 'autoStart') {
+    if (-not $config.autoStart) { $config.autoStart = $true; $mudou = $true }
+  } else {
+    $config | Add-Member -NotePropertyName 'autoStart' -NotePropertyValue $true -Force
+    $mudou = $true
+  }
+
+  # Instalacoes que ainda usam compartilhamento de pastas precisam do disco dos
+  # dados liberado; no WSL 2 isso ja e automatico e a chave nem existe.
+  if ($dados -and ($config.PSObject.Properties.Name -contains 'filesharingDirectories')) {
+    $raizDisco = Split-Path -Qualifier $dados
+    if ($raizDisco -and (@($config.filesharingDirectories) -notcontains $raizDisco)) {
+      $config.filesharingDirectories = @($config.filesharingDirectories) + $raizDisco
+      $mudou = $true
+      Write-Host ('Disco dos dados liberado para o Docker: ' + $raizDisco + '\') -ForegroundColor Green
+    }
+  }
+
+  if (-not $mudou) {
     Write-Host 'O Docker Desktop ja estava configurado para subir sozinho.' -ForegroundColor Green
     return
   }
   Copy-Item -LiteralPath $arquivo -Destination ($arquivo + '.fortesdrive.bak') -Force
-  $novo = $texto
-  if ($texto -match '"(autoStart|AutoStart)"\s*:\s*false') {
-    $novo = $texto -replace '"(autoStart|AutoStart)"\s*:\s*false', '"autoStart": true'
-  } elseif ($texto -match '^\s*\{\s*\}\s*$') {
-    $novo = '{ "autoStart": true }'
-  } elseif ($texto -match '^\s*\{') {
-    $novo = $texto -replace '^\s*\{', "{`r`n  `"autoStart`": true,"
-  }
-  if ($novo -eq $texto) {
-    Write-Host '[AVISO] Nao consegui alterar sozinho a configuracao do Docker Desktop.' -ForegroundColor Yellow
-    Write-Host 'Abra o Docker Desktop, entre em Settings > General e marque para ele subir com o Windows.' -ForegroundColor Yellow
-    return
-  }
-  Gravar $arquivo $novo
+  Gravar $arquivo ($config | ConvertTo-Json -Depth 12)
   Write-Host 'Docker Desktop configurado para subir sozinho com o Windows.' -ForegroundColor Green
 }
 
-Habilitar-DockerNoInicio
+Habilitar-DockerNoInicio $pastaDados
 
 $nomeTarefa = 'FortesDrive - servidor de armazenamento'
 
