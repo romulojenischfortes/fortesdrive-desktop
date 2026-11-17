@@ -129,8 +129,11 @@ inteiro:
 2. grava o gateway (SeaweedFS + Docker Compose) na pasta de trabalho do servidor;
 3. reaproveita ou cria o segredo de assinatura;
 4. sobe os serviços e espera o gateway responder na porta 8790;
-5. instala o cloudflared e explica a etapa manual do token (Cloudflare Tunnel);
-6. mostra o endereço e o segredo que devem ser colados no app.
+5. confere a Cloudflare (token, zona e endereço) antes de reiniciar qualquer
+   serviço e, com o código de instalação, cria o túnel sozinho;
+6. sobe o túnel como serviço `cloudflared` **dentro do Docker**, já apontado para
+   `http://gateway:8790` — nada é instalado no Windows;
+7. mostra o endereço e o segredo que devem ser colados no app.
 
 A pasta padrão é a mesma do instalador avulso `instalar-servidor.bat`
 (`Desktop\storage-server`), então dados já gravados, versões e o segredo existente
