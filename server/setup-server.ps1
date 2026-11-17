@@ -391,7 +391,7 @@ if (-not $dadosExistentes) { $dadosExistentes = (Ler-TextoUtf8 (Join-Path $pasta
 $pastaDados = Resolver-CaminhoPasta $dadosExistentes $pastaDados
 # New-Item nao tem parametro LiteralPath. A API cria sem interpretar curingas.
 [IO.Directory]::CreateDirectory($pastaDados) | Out-Null
-$linhasEnv = @($linhas | Where-Object { $_ -match '\S' -and $_ -notmatch '^\s*(STORAGE_SIGNING_SECRET|FD_DATA_DIR|MAX_UPLOAD_BYTES|MAX_CONCURRENT_UPLOADS|RATE_LIMIT_PER_MINUTE|NEXTCLOUD_ADMIN_USER|NEXTCLOUD_ADMIN_PASSWORD|NEXTCLOUD_DB_PASSWORD|NEXTCLOUD_DB_ROOT_PASSWORD|NEXTCLOUD_APP_PASSWORD)\s*=' })
+$linhasEnv = @($linhas | Where-Object { $_ -match '\S' -and $_ -notmatch '^\s*(STORAGE_SIGNING_SECRET|FD_DATA_DIR|MAX_UPLOAD_BYTES|MAX_CONCURRENT_UPLOADS|RATE_LIMIT_PER_MINUTE|NEXTCLOUD_USER|NEXTCLOUD_ADMIN_USER|NEXTCLOUD_ADMIN_PASSWORD|NEXTCLOUD_DB_PASSWORD|NEXTCLOUD_DB_ROOT_PASSWORD|NEXTCLOUD_APP_PASSWORD)\s*=' })
 
 # --- Nextcloud: credenciais do armazenamento ---------------------------
 # A conta do Nextcloud é a dona dos arquivos e é ela que o gateway usa por
@@ -421,6 +421,9 @@ $linhasEnv = @(
   'RATE_LIMIT_PER_MINUTE=1800',
   ('NEXTCLOUD_ADMIN_USER=' + $usuarioNextcloud),
   ('NEXTCLOUD_ADMIN_PASSWORD=' + $senhaNextcloud),
+  # NEXTCLOUD_USER é o nome que o gateway lê. Sem esta linha ele não se
+  # considerava configurado e gravava na pasta local em vez do Nextcloud.
+  ('NEXTCLOUD_USER=' + $usuarioNextcloud),
   ('NEXTCLOUD_APP_PASSWORD=' + $senhaAppNextcloud),
   ('NEXTCLOUD_DB_PASSWORD=' + $senhaBanco),
   ('NEXTCLOUD_DB_ROOT_PASSWORD=' + $senhaBancoRaiz),
@@ -562,8 +565,29 @@ if ($localOk) {
 # --- O armazenamento grava de verdade? ---------------------------------
 # Responder em /health só diz que o gateway está de pé. Aqui o teste é um envio
 # real de poucos bytes, assinado do mesmo jeito que o app assina: é isso que
-# prova que o arquivo chega ao disco deste computador. Se não gravar, o serviço
-# é recriado antes de o assistente seguir.
+# prova que o arquivo chega ao armazenamento. Cada falha vem com o motivo
+# (credencial, cota, Nextcloud iniciando, permissão), e o serviço só é recriado
+# quando a causa pode mesmo ser do container.
+function Classificar-Falha($status, $texto) {
+  # Traduz status + resposta do servidor em um motivo com nome, para a mensagem
+  # final dizer o que corrigir em vez de "nao gravou".
+  $t = [string]$texto
+  if ($status -eq 401 -or $t -match 'Assinatura') { return 'segredo-divergente' }
+  if ($status -eq 413) { return 'arquivo-grande' }
+  if ($t -match '\(401\)|\(403\)|credenciais') { return 'webdav-auth' }
+  if ($status -eq 507 -or $t -match 'cota|quota') { return 'cota' }
+  if ($t -match '\(502\)|\(503\)|\(504\)|iniciando|indispon') { return 'nextcloud-indisponivel' }
+  if ($status -eq 500 -and $t -match 'EACCES|EPERM|EROFS|permiss|Access is denied') { return 'pasta-sem-permissao' }
+  if ($status -eq 0) { return 'sem-resposta' }
+  return 'desconhecida'
+}
+
+function Resumir-Detalhe($texto) {
+  $t = ([string]$texto -replace '\s+', ' ').Trim()
+  if ($t.Length -gt 160) { return $t.Substring(0, 160) + '...' }
+  return $t
+}
+
 function Testar-Armazenamento {
   $chave = 'u/teste-instalador/' + [guid]::NewGuid().ToString() + '.txt'
   $conteudo = [System.Text.Encoding]::UTF8.GetBytes('teste ' + (Get-Date).ToString('s'))
@@ -575,45 +599,130 @@ function Testar-Armazenamento {
   $assinatura = ([System.BitConverter]::ToString($hmac.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($alvo)))).Replace('-', '').ToLower()
   $caminho = ($chave.Split('/') | ForEach-Object { [uri]::EscapeDataString($_) }) -join '/'
   $url = 'http://127.0.0.1:8790/v1/objects/' + $caminho + '?op=put&expires=' + $expira + '&sig=' + $assinatura
+  # Devolve o resultado real: o status e o corpo dizem se o Nextcloud recusou a
+  # credencial, se a cota acabou, se ele ainda esta instalando ou se a pasta nao
+  # aceita gravacao.
+  $resultado = @{ ok = $false; status = 0; causa = 'sem-resposta'; detalhe = '' }
   try {
     $r = Invoke-WebRequest -Uri $url -Method Put -Body $conteudo -ContentType 'text/plain' -Headers @{ 'x-fd-sha256' = $digest } -UseBasicParsing -TimeoutSec 180
-    return ($r.StatusCode -ge 200 -and $r.StatusCode -lt 300 -and $r.Content -match '"ok":true')
+    $resultado.status = [int]$r.StatusCode
+    $resultado.detalhe = [string]$r.Content
+    $resultado.ok = ($r.StatusCode -ge 200 -and $r.StatusCode -lt 300 -and $r.Content -match '"ok"\s*:\s*true')
+    if (-not $resultado.ok) { $resultado.causa = Classificar-Falha $resultado.status $resultado.detalhe }
   } catch {
-    return $false
+    $resposta = $null
+    try { $resposta = $_.Exception.Response } catch { }
+    if ($resposta) {
+      try { $resultado.status = [int]$resposta.StatusCode } catch { }
+      try {
+        $fluxo = $resposta.GetResponseStream()
+        if ($fluxo) {
+          $leitor = New-Object System.IO.StreamReader($fluxo)
+          $resultado.detalhe = $leitor.ReadToEnd()
+          $leitor.Dispose()
+        }
+      } catch { }
+    }
+    $resultado.causa = Classificar-Falha $resultado.status ($resultado.detalhe + ' ' + $_.Exception.Message)
+  }
+  return $resultado
+}
+
+function Explicar-Falha($resultado) {
+  Write-Host ('  motivo: ' + $resultado.causa + ' (HTTP ' + $resultado.status + ')') -ForegroundColor Yellow
+  if ($resultado.detalhe) { Write-Host ('  resposta do servidor: ' + (Resumir-Detalhe $resultado.detalhe)) -ForegroundColor DarkGray }
+  switch ($resultado.causa) {
+    'webdav-auth' {
+      Write-Host '  O gateway falou com o Nextcloud, mas a conta foi recusada (401/403).' -ForegroundColor Yellow
+      Write-Host ('  No .env do servidor, NEXTCLOUD_USER=' + $usuarioNextcloud + ' precisa ser a mesma conta de')
+      Write-Host '  NEXTCLOUD_ADMIN_USER, e NEXTCLOUD_APP_PASSWORD a senha dela. Se a conta do Nextcloud'
+      Write-Host '  foi criada com outra senha, apague SOMENTE as linhas NEXTCLOUD_* do .env e rode este'
+      Write-Host '  atalho de novo: seus arquivos e o banco continuam onde estao.'
+    }
+    'cota' {
+      Write-Host '  O Nextcloud recusou por cota (507): a conta ja usou todo o espaco reservado.' -ForegroundColor Yellow
+      Write-Host '  Libere espaco na interface do Nextcloud (ou aumente a cota da conta) e rode este atalho de novo.'
+    }
+    'nextcloud-indisponivel' {
+      Write-Host '  O gateway respondeu, mas o Nextcloud nao entregou a gravacao.' -ForegroundColor Yellow
+      Write-Host '  Rode: docker compose logs nextcloud   (na pasta do servidor) para ver o que ele informou.'
+      Write-Host '  Na primeira subida isso e normal por alguns minutos: ele cria o banco e a conta.'
+    }
+    'pasta-sem-permissao' {
+      Write-Host ('  A pasta de dados (' + $pastaDados + ') nao aceitou gravacao.') -ForegroundColor Yellow
+      Write-Host '  Confira se o disco esta ligado e compartilhado no Docker Desktop (Settings > Resources > File sharing).'
+    }
+    'segredo-divergente' {
+      Write-Host '  O gateway recusou o pedido assinado: o segredo do .env nao e o que o container recebeu.' -ForegroundColor Yellow
+      Write-Host '  Rode este atalho de novo (ele reaproveita o .env) e depois copie o "Segredo do servidor"'
+      Write-Host '  mostrado no fim para o segredo STORAGE_SIGNING_SECRET do app.'
+    }
+    'sem-resposta' {
+      Write-Host '  O gateway nao respondeu ao envio de teste.' -ForegroundColor Yellow
+      Write-Host '  Rode: docker compose ps -a   e   docker compose logs --tail 60 gateway'
+    }
+    default {
+      Write-Host '  O servidor recusou o envio de teste. Veja as mensagens do gateway abaixo.' -ForegroundColor Yellow
+    }
   }
 }
 
+# O que o proprio gateway informa sobre o armazenamento (backend e motivo).
+function Ler-EstadoArmazenamento {
+  try {
+    $r = Invoke-RestMethod 'http://127.0.0.1:8790/health' -TimeoutSec 10
+    if ($r.storage) { return ([string]$r.storage.backend + ' / ' + [string]$r.storage.reason) }
+  } catch { }
+  return 'sem informacao'
+}
+
 $armazenaOk = $false
+$ultimoTeste = $null
+$recriado = $false
 if ($localOk) {
-  # Na primeira subida o Nextcloud leva alguns minutos para instalar e criar a
-  # conta: o envio de teste é repetido com paciencia antes de acusar falha.
-  Write-Host 'Conferindo o armazenamento com um envio de teste (o Nextcloud pode levar alguns minutos na primeira vez)...'
-  for ($i = 1; $i -le 48; $i++) {
-    if (Testar-Armazenamento) { $armazenaOk = $true; break }
-    Write-Host ('  aguardando o Nextcloud... (' + ($i * 5) + 's)')
-    Start-Sleep -Seconds 5
-  }
-  if (-not $armazenaOk) {
-    Write-Host '[AVISO] O gateway respondeu, mas a pasta de dados nao aceitou a gravacao. Recriando o servico...' -ForegroundColor Yellow
-    Push-Location $pasta
-    Invoke-DockerSilencioso compose up -d --force-recreate gateway | Out-Null
-    Invoke-DockerSilencioso compose up -d | Out-Null
-    Pop-Location
-    for ($i = 1; $i -le 18; $i++) {
-      Start-Sleep -Seconds 5
-      if (Testar-Armazenamento) { $armazenaOk = $true; break }
-      Write-Host ('  aguardando o armazenamento... (' + ($i * 5) + 's)')
+  # Na primeira subida o Nextcloud instala o proprio banco e cria a conta, e em
+  # um computador comum isso passa de 4 minutos. O teste se repete com paciencia
+  # e mostra o motivo de cada tentativa — antes, qualquer falha aparecia como a
+  # mesma frase generica e nao dizia o que corrigir.
+  Write-Host 'Conferindo o armazenamento com um envio de teste real (na primeira vez o Nextcloud leva alguns minutos)...'
+  for ($i = 1; $i -le 120; $i++) {
+    $teste = Testar-Armazenamento
+    if ($teste.ok) { $armazenaOk = $true; break }
+    $ultimoTeste = $teste
+
+    # Falhas que reiniciar servico nao resolvem: para e explica o que fazer.
+    if (@('webdav-auth', 'cota', 'pasta-sem-permissao', 'segredo-divergente', 'arquivo-grande') -contains $teste.causa) { break }
+
+    # Uma unica recriacao, e so quando a causa pode mesmo ser do container.
+    if (-not $recriado -and $i -eq 24 -and @('sem-resposta', 'nextcloud-indisponivel', 'desconhecida') -contains $teste.causa) {
+      Write-Host '  O gateway nao gravou: recriando o servico uma vez...' -ForegroundColor Yellow
+      Push-Location $pasta
+      Invoke-DockerSilencioso compose up -d --force-recreate gateway | Out-Null
+      Invoke-DockerSilencioso compose up -d | Out-Null
+      Pop-Location
+      $recriado = $true
+      Start-Sleep -Seconds 8
+      continue
     }
+
+    if ($i -eq 1 -or $i % 6 -eq 0) {
+      Write-Host ('  aguardando o armazenamento... (' + ($i * 5) + 's) ' + $teste.causa + ' | ' + (Ler-EstadoArmazenamento))
+    }
+    Start-Sleep -Seconds 5
   }
   if ($armazenaOk) {
     Write-Host 'Armazenamento respondendo: um arquivo de teste foi gravado e conferido.' -ForegroundColor Green
   } else {
-    Write-Host '[ERRO] O armazenamento continua sem gravar. Ultimas mensagens do gateway:' -ForegroundColor Red
+    Write-Host '[ERRO] O armazenamento nao gravou.' -ForegroundColor Red
+    if ($ultimoTeste) { Explicar-Falha $ultimoTeste }
+    Write-Host 'Estado dos servicos:' -ForegroundColor Red
     Push-Location $pasta
+    docker compose ps -a
+    Write-Host 'Mensagens do gateway:' -ForegroundColor Red
     docker compose logs --tail 60 gateway
+    Write-Host 'Mensagens do Nextcloud:' -ForegroundColor Red
+    docker compose logs --tail 40 nextcloud
     Pop-Location
-    Write-Host ('Se a pasta de dados (' + $pastaDados + ') estiver em outro disco, confira se ele esta ligado') -ForegroundColor Yellow
-    Write-Host 'e compartilhado no Docker Desktop (Settings > Resources > File sharing).' -ForegroundColor Yellow
   }
 }
 
@@ -627,6 +736,16 @@ $hostPublico = [string]$env:FD_HOSTNAME
 if (-not $hostPublico -and (Test-Path -LiteralPath $arquivoHost)) { $hostPublico = (Ler-TextoUtf8 $arquivoHost).Trim() }
 $hostPublico = ($hostPublico -replace '^\s*https?://', '').Trim().TrimEnd('/').ToLower()
 if (-not $hostPublico -and $dominioPadrao) { $hostPublico = $dominioPadrao }
+
+# Endereco ngrok de uma instalacao antiga nao serve mais: o app nao envia o
+# cabecalho que o ngrok gratuito exige, entao ele so devolve a pagina de aviso
+# (404/HTML) e o app acusa "endereco incorreto". Melhor recomecar o tunel.
+if ($hostPublico -match 'ngrok') {
+  Write-Host ('[AVISO] O endereco guardado (' + $hostPublico + ') e um tunel ngrok antigo.') -ForegroundColor Yellow
+  Write-Host 'O servidor agora e publicado pelo Cloudflare Tunnel: o ngrok nao serve mais para este app.' -ForegroundColor Yellow
+  Write-Host 'Informe o Public Hostname do tunnel Cloudflare (ex.: drive.seudominio.com) abaixo.' -ForegroundColor Yellow
+  $hostPublico = ''
+}
 
 function Achar-Cloudflared {
   $cmd = Get-Command cloudflared -ErrorAction SilentlyContinue
@@ -732,6 +851,27 @@ if ($cloudflared -and $tokenTunel) {
   )) -join "`r`n")
 }
 
+# Quem responde no endereco publico e o gateway do FortesDrive? So conta como
+# validado quando a resposta e o proprio JSON do gateway ({"ok":true,...,"version":"..."}):
+# uma pagina de erro, um 404 do tunel ou outro servico no mesmo endereco nao valem.
+function Testar-GatewayPublico($url) {
+  $r = @{ ok = $false; versao = ''; status = 0; detalhe = '' }
+  try {
+    $resposta = Invoke-WebRequest ($url + '/health') -TimeoutSec 15 -UseBasicParsing
+    $r.status = [int]$resposta.StatusCode
+    $r.detalhe = [string]$resposta.Content
+    if ($resposta.Content -match '"ok"\s*:\s*true') {
+      $m = [regex]::Match($resposta.Content, '"version"\s*:\s*"([^"]+)"')
+      if ($m.Success) { $r.versao = $m.Groups[1].Value }
+      $r.ok = $true
+    }
+  } catch {
+    try { $r.status = [int]$_.Exception.Response.StatusCode } catch { }
+    if (-not $r.status) { $r.detalhe = $_.Exception.Message }
+  }
+  return $r
+}
+
 $publicoOk = $false
 $urlPublica = if ($hostPublico) { 'https://' + $hostPublico } else { '' }
 
@@ -740,19 +880,30 @@ if ($cloudflared -and $tokenTunel -and $hostPublico) {
   Start-Sleep -Seconds 2
   Write-Host ('Subindo o tunel Cloudflare (porta 8790 -> ' + $hostPublico + ') ...')
   Start-Process -FilePath $cloudflared -ArgumentList @('tunnel', '--no-autoupdate', 'run', '--token', $tokenTunel) -WindowStyle Hidden | Out-Null
-  for ($i = 1; $i -le 18; $i++) {
+  $ultimoPublico = $null
+  for ($i = 1; $i -le 24; $i++) {
     Start-Sleep -Seconds 5
-    try {
-      $r = Invoke-RestMethod ($urlPublica + '/health') -TimeoutSec 15
-      if ($r.ok) { $publicoOk = $true; break }
-    } catch { }
+    $ultimoPublico = Testar-GatewayPublico $urlPublica
+    if ($ultimoPublico.ok) { $publicoOk = $true; break }
   }
   if ($publicoOk) {
-    Write-Host ('Endereco publico respondendo: ' + $urlPublica) -ForegroundColor Green
+    Write-Host ('Endereco publico validado: ' + $urlPublica + ' responde o gateway ' + $ultimoPublico.versao) -ForegroundColor Green
   } else {
-    Write-Host '[AVISO] O endereco publico ainda nao respondeu.' -ForegroundColor Yellow
-    Write-Host 'No painel da Cloudflare confira o Public Hostname do tunnel: ele precisa apontar' -ForegroundColor Yellow
-    Write-Host 'para http://localhost:8790, e o tunnel precisa aparecer como Healthy.' -ForegroundColor Yellow
+    Write-Host '[AVISO] O endereco publico nao entregou o gateway do FortesDrive.' -ForegroundColor Yellow
+    $st = 0
+    if ($ultimoPublico) { $st = $ultimoPublico.status }
+    if ($st -eq 404) {
+      Write-Host ('  O endereco respondeu 404 em /health: o Public Hostname "' + $hostPublico + '" nao chega ao gateway.')
+      Write-Host '  No painel da Cloudflare (Zero Trust > Networks > Tunnels), confira se o Public Hostname'
+      Write-Host '  aponta para http://localhost:8790 e se o tunnel aparece como Healthy.'
+    } elseif ($st -ge 500) {
+      Write-Host '  A borda do Cloudflare respondeu no lugar do servidor (502/530/1033): o tunnel existe,'
+      Write-Host '  mas o cloudflared nao esta conectado a ele ou publica outra porta.'
+    } else {
+      Write-Host '  No painel da Cloudflare, confira o Public Hostname do tunnel: ele precisa apontar para'
+      Write-Host '  http://localhost:8790, e o tunnel precisa aparecer como Healthy.'
+    }
+    Write-Host '  Nao informe este endereco no app (STORAGE_SERVER_URL) enquanto ele nao responder o gateway.' -ForegroundColor Yellow
   }
 } elseif ($cloudflared) {
   # Sem token: tunel rapido do Cloudflare, sem conta. O endereco muda a cada
@@ -991,8 +1142,10 @@ Write-Host '  https://fortesdrive.base44.app/drive'
 Write-Host 'Na pagina Armazenamento, clique em "Verificar conexao".' -ForegroundColor Cyan
 Write-Host ''
 Write-Host 'Endereco do servidor (segredo STORAGE_SERVER_URL):' -ForegroundColor Cyan
-if ($urlPublica) {
+if ($urlPublica -and $publicoOk) {
   Write-Host ('  ' + $urlPublica)
+} elseif ($urlPublica) {
+  Write-Host ('  ' + $urlPublica + '  [ainda NAO validado: nao informe no app ate responder o gateway]') -ForegroundColor Yellow
 } elseif (Test-Path (Join-Path $pasta 'cloudflare-temp-url.txt')) {
   Write-Host ('  ' + (Ler-TextoUtf8 (Join-Path $pasta 'cloudflare-temp-url.txt')).Trim()) -ForegroundColor Yellow
   Write-Host '  (tunel temporario: este endereco muda a cada subida)' -ForegroundColor Yellow

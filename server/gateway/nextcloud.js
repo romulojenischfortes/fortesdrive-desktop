@@ -41,7 +41,11 @@ const CONTENT_TYPES = {
 
 function config() {
   const url = String(process.env.NEXTCLOUD_URL || '').trim().replace(/\/+$/, '');
-  const user = String(process.env.NEXTCLOUD_USER || '').trim();
+  // NEXTCLOUD_USER e o nome documentado; NEXTCLOUD_ADMIN_USER e o que o
+  // assistente grava no .env. Sem esta equivalencia o gateway nao se
+  // considerava configurado e gravava na pasta local em vez do Nextcloud,
+  // sem avisar ninguem.
+  const user = String(process.env.NEXTCLOUD_USER || process.env.NEXTCLOUD_ADMIN_USER || '').trim();
   const password = String(process.env.NEXTCLOUD_APP_PASSWORD || '').trim();
   const root = String(process.env.NEXTCLOUD_ROOT || 'FortesDrive').trim().replace(/^\/+|\/+$/g, '') || 'FortesDrive';
   return { url, user, password, root, enabled: Boolean(url && user && password) };
@@ -126,30 +130,88 @@ async function ensureParents(key) {
     if (result.status >= 400 && result.status !== 405) {
       // 409 = ainda faltava uma pasta acima; 423 = bloqueado por outra operação.
       if (result.status !== 409) {
-        throw new Error('Não foi possível preparar a pasta no Nextcloud (' + result.status + ').');
+        const error = new Error('Não foi possível preparar a pasta no Nextcloud (' + result.status + ').');
+        // O status viaja junto para o diagnóstico dizer o motivo real.
+        error.status = result.status;
+        throw error;
       }
     }
   }
 }
 
-/** O Nextcloud está aceitando gravação agora? (envio e remoção de um arquivo real) */
-async function writable() {
-  const probeKey = '.fd-probe-' + Date.now() + '-' + Math.random().toString(16).slice(2);
-  try {
-    await ensureParents(probeKey + '/x');
-    await send('PUT', davTarget(config(), probeKey), {
-      headers: { 'Content-Type': 'text/plain', 'Content-Length': 2 },
-      body: 'ok',
-      timeoutMs: 30000,
-    }).then((result) => {
-      if (result.status >= 400) throw new Error('resposta ' + result.status);
-    });
-    await send('DELETE', davTarget(config(), probeKey), { timeoutMs: 30000 });
-    return true;
-  } catch (error) {
-    console.error('[nextcloud] teste de gravação falhou: ' + error.message);
-    return false;
+/**
+ * Traduz uma resposta do Nextcloud no motivo, em vez de um "falhou" genérico.
+ *   webdav-auth          credenciais recusadas (conta ou senha de aplicativo)
+ *   quota                cota da conta esgotada
+ *   nextcloud-starting   o Nextcloud respondeu, mas ainda não está pronto
+ *   nextcloud-unreachable não respondeu (rede, container parado, DNS)
+ *   webdav-error         qualquer outro erro do WebDAV
+ */
+function reasonFor(status, detail) {
+  if (status === 401 || status === 403) return 'webdav-auth';
+  if (status === 507) return 'quota';
+  if (status === 502 || status === 503 || status === 504 || status === 404 || status === 405) return 'nextcloud-starting';
+  return 'webdav-error';
+}
+
+/**
+ * O Nextcloud está aceitando gravação agora?
+ * Envia um arquivo real, confere o conteúdo lido de volta e apaga — assim
+ * "gravável" significa que o arquivo entra, sai inteiro e o objeto de teste
+ * não fica para trás. Devolve sempre { writable, reason, detail }.
+ */
+async function probe() {
+  const cfg = config();
+  const falha = (status, detail) => ({
+    writable: false,
+    reason: reasonFor(status, detail),
+    detail: detail || (status ? 'O Nextcloud respondeu ' + status + '.' : null),
+  });
+
+  if (!cfg.enabled) {
+    return {
+      writable: false,
+      reason: 'not-configured',
+      detail: 'Faltam NEXTCLOUD_URL, NEXTCLOUD_USER e NEXTCLOUD_APP_PASSWORD no .env do servidor.',
+    };
   }
+
+  const probeKey = '.fd-probe-' + Date.now() + '-' + Math.random().toString(16).slice(2) + '.txt';
+  const body = 'ok';
+  let passo = 'criar a pasta';
+  try {
+    await ensureParents(probeKey);
+    passo = 'gravar';
+    const put = await send('PUT', davTarget(cfg, probeKey), {
+      headers: { 'Content-Type': 'text/plain', 'Content-Length': body.length },
+      body,
+      timeoutMs: 30000,
+    });
+    if (put.status >= 400) return falha(put.status, 'O Nextcloud recusou a gravação (' + put.status + '). ' + put.text.slice(0, 200));
+    passo = 'ler de volta';
+    const read = await send('GET', davTarget(cfg, probeKey), { timeoutMs: 30000 });
+    if (read.status >= 400) return falha(read.status, 'O Nextcloud não devolveu o arquivo gravado (' + read.status + ').');
+    if (read.text !== body) {
+      return { writable: false, reason: 'webdav-error', detail: 'O Nextcloud devolveu conteúdo diferente do que foi gravado.' };
+    }
+    return { writable: true, reason: 'ok', detail: null };
+  } catch (error) {
+    const status = Number(error.status) || 0;
+    const detail = passo + ': ' + error.message;
+    if (status) return falha(status, detail);
+    return { writable: false, reason: 'nextcloud-unreachable', detail };
+  } finally {
+    // O objeto de teste nunca fica no armazenamento.
+    try {
+      await send('DELETE', davTarget(cfg, probeKey), { timeoutMs: 20000 });
+    } catch { /* melhor sobrar um .fd-probe do que perder o diagnóstico */ }
+  }
+}
+
+/** Atalho usado por quem só precisa saber sim ou não. */
+async function writable() {
+  const result = await probe();
+  return result.writable;
 }
 
 /** Espaço do Nextcloud: usado e disponível (null quando não há limite). */
@@ -220,8 +282,11 @@ async function putFile(key, filePath, sha256Hex) {
       response.on('end', () => {
         const status = response.statusCode || 0;
         if (status >= 400) {
-          return reject(new Error('O Nextcloud recusou o arquivo (' + status + '). ' +
-            Buffer.concat(chunks).toString('utf8').slice(0, 200)));
+          const corpo = Buffer.concat(chunks).toString('utf8').slice(0, 200);
+          const motivo = status === 401 || status === 403
+            ? 'O Nextcloud recusou as credenciais do gateway (' + status + '): confira NEXTCLOUD_USER e NEXTCLOUD_APP_PASSWORD no .env do servidor.'
+            : 'O Nextcloud recusou o arquivo (' + status + '). ' + corpo;
+          return reject(Object.assign(new Error(motivo), { status: 502, upstreamStatus: status }));
         }
         resolve({ size });
       });
@@ -317,6 +382,7 @@ async function legacyFiles(legacyDir) {
 module.exports = {
   isConfigured,
   contentTypeFor,
+  probe,
   writable,
   quota,
   objectSize,

@@ -62,7 +62,7 @@ const MAX_CONCURRENT_UPLOADS = Number(process.env.MAX_CONCURRENT_UPLOADS || 30);
 const RATE_LIMIT_PER_MINUTE = Number(process.env.RATE_LIMIT_PER_MINUTE || 1800);
 // Tempo máximo que um arquivo espera por uma vaga antes de o cliente tentar de novo.
 const UPLOAD_SLOT_WAIT_MS = Number(process.env.UPLOAD_SLOT_WAIT_MS || 120000);
-const VERSION = '2.1.0';
+const VERSION = '2.2.0';
 const STARTED_AT = Date.now();
 const MAX_SIGNATURE_LIFETIME_MS = 25 * 3600 * 1000;
 // Pasta onde estão os arquivos gravados antes da migração (o volume da pasta
@@ -192,17 +192,70 @@ function contentTypeFor(key) {
   return CONTENT_TYPES[extension] || 'application/octet-stream';
 }
 
-/** A pasta de dados aceita gravação agora? (teste real, arquivo minúsculo) */
-async function storageWritable() {
+/**
+ * A pasta de dados aceita gravação agora? (teste real, arquivo minúsculo)
+ * Devolve o motivo junto: "não gravou" sem causa não diz o que corrigir.
+ */
+async function diskStorageProbe() {
   const probe = path.join(TMP_DIR, 'probe-' + crypto.randomUUID());
   try {
     await fsp.writeFile(probe, 'ok');
     await fsp.unlink(probe);
-    return true;
+    return { writable: true, reason: 'ok', detail: null };
   } catch (error) {
     console.error('[gateway] pasta de dados não aceita gravação: ' + error.message);
-    return false;
+    const permissao = ['EACCES', 'EPERM', 'EROFS', 'ENOTDIR'].includes(error.code);
+    return {
+      writable: false,
+      reason: error.code === 'ENOSPC' ? 'disk-full' : permissao ? 'disk-permission' : 'disk-error',
+      detail: DATA_DIR + ': ' + error.message,
+    };
   }
+}
+
+// Último resultado conhecido do armazenamento. O /health responde na hora com
+// ele (atualizado no máximo a cada minuto); o /v1/status faz o teste real, que
+// é o que confirma a gravação para o app e para o instalador.
+let storageCache = {
+  checkedAt: 0,
+  backend: useNextcloud ? 'nextcloud' : 'disk',
+  writable: null,
+  reason: 'unknown',
+  detail: null,
+};
+let storageCheck = null;
+
+function storageSnapshotNow() {
+  if (storageCheck) return storageCheck;
+  storageCheck = (async () => {
+    try {
+      const result = useNextcloud ? await nextcloud.probe() : await diskStorageProbe();
+      storageCache = {
+        checkedAt: Date.now(),
+        backend: useNextcloud ? 'nextcloud' : 'disk',
+        writable: result.writable,
+        reason: result.reason,
+        detail: result.detail ?? null,
+      };
+    } catch (error) {
+      storageCache = {
+        checkedAt: Date.now(),
+        backend: useNextcloud ? 'nextcloud' : 'disk',
+        writable: false,
+        reason: 'disk-error',
+        detail: error.message,
+      };
+    } finally {
+      storageCheck = null;
+    }
+    return storageCache;
+  })();
+  return storageCheck;
+}
+
+function cachedStorage(maxAgeMs) {
+  if (Date.now() - storageCache.checkedAt < maxAgeMs) return Promise.resolve(storageCache);
+  return storageSnapshotNow();
 }
 
 /** Confere a assinatura da requisição. Devolve a mensagem de erro ou null. */
@@ -427,15 +480,19 @@ async function handleStatus(res) {
 
   if (useNextcloud) {
     // Quem manda no espaço agora é o Nextcloud: a cota informada é a dele.
-    const [quota, writable] = await Promise.all([nextcloud.quota(), nextcloud.writable()]);
+    const [quota, probe] = await Promise.all([nextcloud.quota(), storageSnapshotNow()]);
     disk = { freeBytes: quota.freeBytes, totalBytes: quota.totalBytes, usedBytes: quota.usedBytes };
     return sendJson(res, 200, {
       ok: true,
       version: VERSION,
       uptimeSec: Math.round((Date.now() - STARTED_AT) / 1000),
-      filer: { reachable: writable, backend: 'nextcloud' },
+      // reachable=false com o motivo ao lado: cota, credencial, Nextcloud ainda
+      // iniciando ou fora do ar. É isto que o app mostra em vez de "falhou".
+      filer: { reachable: probe.writable, backend: 'nextcloud', reason: probe.reason },
       storage: {
-        writable,
+        writable: probe.writable,
+        reason: probe.reason,
+        detail: probe.detail,
         backend: 'nextcloud',
         root: process.env.NEXTCLOUD_ROOT || 'FortesDrive',
         url: process.env.NEXTCLOUD_URL || null,
@@ -457,7 +514,7 @@ async function handleStatus(res) {
     console.error('[gateway] não foi possível ler o disco: ' + error.message);
   }
 
-  const writable = await storageWritable();
+  const probe = await storageSnapshotNow();
 
   sendJson(res, 200, {
     ok: true,
@@ -465,8 +522,8 @@ async function handleStatus(res) {
     uptimeSec: Math.round((Date.now() - STARTED_AT) / 1000),
     // O app consulta "filer.reachable" para saber se há onde gravar. Aqui a
     // gravação acontece na própria pasta de dados: é ela que responde.
-    filer: { reachable: writable, backend: 'disk' },
-    storage: { writable, backend: 'disk', dataDir: DATA_DIR },
+    filer: { reachable: probe.writable, backend: 'disk', reason: probe.reason },
+    storage: { writable: probe.writable, reason: probe.reason, detail: probe.detail, backend: 'disk', dataDir: DATA_DIR },
     disk,
     limits: {
       maxUploadBytes: MAX_UPLOAD_BYTES,
@@ -611,7 +668,14 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (url.pathname === '/health') {
-      return sendJson(res, 200, { ok: true, version: VERSION });
+      // O gateway está de pé (ok) e, junto, como está o armazenamento: o app e
+      // o instalador precisam das duas respostas sem esperar a assinatura.
+      const storage = await cachedStorage(60000);
+      return sendJson(res, 200, {
+        ok: true,
+        version: VERSION,
+        storage: { backend: storage.backend, writable: storage.writable, reason: storage.reason },
+      });
     }
 
     if (rateLimited(clientIp(req))) {

@@ -59,3 +59,28 @@ test("o gateway grava no Nextcloud e continua conferindo cada envio", () => {
   assert.match(gateway, /\/v1\/migrate/, "o gateway precisa migrar os arquivos antigos para o Nextcloud");
   assert.doesNotMatch(gateway, /seaweedfs/i, "o gateway nao pode depender de outro servico para gravar");
 });
+
+test("o gateway so se considera pronto com o armazenamento gravavel", () => {
+  const gateway = read("server/gateway/server.js");
+  assert.match(gateway, /'\/health'[\s\S]{0,600}storage:/, "o /health informa o estado do armazenamento");
+  assert.match(gateway, /storageSnapshotNow/, "o estado do armazenamento e testado de verdade");
+
+  const nextcloud = read("server/gateway/nextcloud.js");
+  assert.match(nextcloud, /NEXTCLOUD_USER \|\| process\.env\.NEXTCLOUD_ADMIN_USER/, "o gateway aceita a conta que o assistente grava no .env");
+  assert.match(nextcloud, /webdav-auth/, "a falha de gravacao informa o motivo");
+  assert.match(nextcloud, /async function probe/, "o teste de gravacao grava, le de volta e apaga");
+
+  const assistant = read("server/setup-server.ps1");
+  assert.match(assistant, /NEXTCLOUD_USER=/, "o assistente grava NEXTCLOUD_USER no .env");
+  assert.match(assistant, /Classificar-Falha/, "o assistente informa o motivo da falha de gravacao");
+  assert.match(assistant, /Testar-GatewayPublico/, "o assistente valida o endereco publico");
+});
+
+test("o instalador publicado nao distribui mais o pacote antigo", () => {
+  const published = path.join(root, "..", "public/instalar-servidor.bat");
+  if (!fs.existsSync(published)) return;
+  const source = fs.readFileSync(published, "utf8");
+  assert.doesNotMatch(source, /seaweedfs/i, "o armazenamento antigo nao e mais distribuido");
+  assert.doesNotMatch(source, /ngrok/i, "o tunel ngrok nao e mais distribuido");
+  assert.match(source, /desktopInstaller/, "entrega o instalador unico do FortesDrive Desktop");
+});

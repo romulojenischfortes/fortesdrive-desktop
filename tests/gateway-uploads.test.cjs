@@ -80,7 +80,6 @@ const variants = [
   ['disk gateway', prefix + 'server/gateway/server.js'],
   ['legacy gateway', 'storage-server/gateway/server.js'],
   ['public legacy gateway', 'public/storage-server/gateway/server.js'],
-  ['embedded installer gateway', 'public/instalar-servidor.bat'],
 ];
 for (const [name, file] of variants) test(name, async t => {
   const raw = await readOptional(file);
