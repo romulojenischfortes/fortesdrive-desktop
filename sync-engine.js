@@ -34,27 +34,63 @@ class SyncEngine {
     await this.start();
   }
   async start() {
-    if (!this.watchFolder || !this.folderConfigured || this.state.running) return;
-    await fs.access(this.watchFolder);
-    await this.badges.start(this.watchFolder).catch(error => { this.state.badgeError = error.message; });
-    this.state.running = true;
-    this.watcher = chokidar.watch(this.watchFolder, {
-      ignored: /(^|[/\\])(?:\.fortesdrive([/\\]|$)|\.fortesdrive-transfer-)/,
-      ignoreInitial: true, followSymlinks: false,
-      awaitWriteFinish: { stabilityThreshold: 1000, pollInterval: 200 },
-    });
-    this.watcher.on("all", (event, absolute) => {
-      this.badges.dirty(absolute);
-      clearTimeout(this.debounce);
-      this.debounce = setTimeout(() => this.notify(), 800);
-    }).on("error", error => { this.state.error = error.message; });
-    this.timer = setInterval(() => this.notify(), 60000);
-    this.notify();
+    if (!this.watchFolder || !this.folderConfigured) return;
+    // O pulso continua mesmo se o disco ou o monitor falhar. Não depende da janela.
+    if (!this.timer) this.timer = setInterval(() => {
+      this.start().catch(error => { this.state.error = error.message; });
+      this.notify();
+    }, 30000);
+    if (this.state.running || this.starting) return this.starting;
+    this.starting = (async () => {
+      await this.closing;
+      await fs.access(this.watchFolder);
+      await this.badges.start(this.watchFolder).catch(error => { this.state.badgeError = error.message; });
+      const watcher = chokidar.watch(this.watchFolder, {
+        ignored: /(^|[/\\])(?:\.fortesdrive([/\\]|$)|\.fortesdrive-transfer-)/,
+        ignoreInitial: true, followSymlinks: false,
+        usePolling: !!this.pollingFallback, interval: 1000, binaryInterval: 1000,
+        awaitWriteFinish: { stabilityThreshold: 1000, pollInterval: 200 },
+      });
+      this.watcher = watcher;
+      this.state.running = true;
+      watcher.on("all", (event, absolute) => {
+        if (this.watcher !== watcher) return;
+        this.badges.dirty(absolute);
+        // Janela limitada: uma cópia contínua não adia o aviso indefinidamente.
+        if (!this.debounce) this.debounce = setTimeout(() => {
+          this.debounce = null;
+          this.notify();
+        }, 800);
+      }).on("ready", () => {
+        if (this.watcher !== watcher) return;
+        this.state.watcherError = "";
+        this.notify(); // Inclui arquivos criados durante a leitura inicial.
+      }).on("error", error => {
+        if (this.watcher !== watcher) return;
+        this.state.watcherError = "Monitoramento da pasta: " + error.message;
+        this.state.running = false;
+        this.watcher = null;
+        this.pollingFallback = true;
+        this.closing = watcher.close().catch(closeError => { this.state.watcherError = closeError.message; });
+        this.restartTimer = setTimeout(() => {
+          this.restartTimer = null;
+          this.start().catch(startError => { this.state.error = startError.message; });
+        }, 3000);
+        this.notify();
+      });
+      this.notify();
+    })().finally(() => { this.starting = null; });
+    return this.starting;
   }
   async stop() {
+    clearInterval(this.timer); clearTimeout(this.debounce); clearTimeout(this.restartTimer);
+    this.timer = this.debounce = this.restartTimer = null;
+    await this.starting?.catch(() => {});
     this.state.running = false;
-    clearInterval(this.timer); clearTimeout(this.debounce);
-    await this.watcher?.close();
+    const watcher = this.watcher;
+    this.watcher = null;
+    await watcher?.close();
+    await this.closing;
   }
   getStatus() { return { ...this.state, machineRole: this.store.get("machineRole", "client"), nativeStreaming: true, watchFolder: this.watchFolder, folderConfigured: this.folderConfigured, deviceId: this.deviceId }; }
   manifestKey(userId) {

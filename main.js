@@ -223,6 +223,7 @@ function registerHandlers() {
     launchInstaller: () => updater.launchInstaller(),
     verifyUpdateSignature: () => updater.verifyUpdateSignature(),
     syncNow: () => { requestSync(); return true; },
+    rendererReady: () => { requestSync(); return true; },
     snapshot: userId => syncEngine.snapshot(userId),
     uploadFileStream: (relative, authorization, expected) => transfers.upload(syncEngine.watchFolder, relative, authorization, expected, (loaded, total) => mainWindow?.webContents.send("sync:transferProgress", { path: relative, direction: "upload", loaded, total })),
     downloadFileStream: (relative, url, file, expected) => transfers.download(syncEngine.watchFolder, relative, url, file, expected, (loaded, total) => mainWindow?.webContents.send("sync:transferProgress", { path: relative, direction: "download", loaded, total })),
@@ -300,6 +301,21 @@ function createWindow() {
     return { action: "deny" };
   });
   mainWindow.webContents.on("did-finish-load", requestSync);
+  // O monitor nativo não pode ficar enviando avisos para uma página encerrada.
+  let reloadTimer;
+  const recoverPage = () => {
+    if (app.isQuitting || mainWindow.isDestroyed() || reloadTimer) return;
+    syncEngine.state.syncing = false;
+    reloadTimer = setTimeout(() => {
+      reloadTimer = null;
+      if (!app.isQuitting && !mainWindow.isDestroyed()) mainWindow.webContents.reload();
+    }, 5000);
+  };
+  mainWindow.webContents.on("render-process-gone", recoverPage);
+  mainWindow.webContents.on("did-fail-load", (event, code, description, url, isMainFrame) => {
+    if (isMainFrame && code !== -3) recoverPage();
+  });
+  mainWindow.on("closed", () => clearTimeout(reloadTimer));
   mainWindow.on("close", event => { if (!app.isQuitting) { event.preventDefault(); mainWindow.hide(); } });
 }
 // Estado do tunel no topo do menu da bandeja, regenerado a cada mudanca.

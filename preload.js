@@ -1,7 +1,7 @@
 const { contextBridge, ipcRenderer } = require("electron");
 const channels = {
   selectFolder: "selectFolder", chooseFolderParent: "chooseFolderParent", useFolder: "useFolder",
-  getStatus: "getStatus", syncNow: "syncNow",
+  getStatus: "getStatus", syncNow: "syncNow", rendererReady: "rendererReady",
   snapshot: "snapshot", readFile: "readFile", writeFile: "writeFile",
   uploadFileStream: "uploadFileStream", downloadFileStream: "downloadFileStream",
   moveFile: "moveFile", trashFile: "trashFile", mkdir: "mkdir", rmdir: "rmdir",
@@ -42,6 +42,8 @@ api.onOpenFolderSetup = (listener) => {
 api.onSyncRequested = (listener) => {
   const callback = () => listener();
   ipcRenderer.on("sync:requested", callback);
+  // Confirma a escuta depois do login: avisos anteriores ao React não se perdem.
+  ipcRenderer.invoke("sync:rendererReady").catch(() => {});
   return () => ipcRenderer.removeListener("sync:requested", callback);
 };
 if (window.location.origin === "https://fortesdrive.base44.app" || (process.env.NODE_ENV === "development" && window.location.origin === "http://localhost:5173")) {
