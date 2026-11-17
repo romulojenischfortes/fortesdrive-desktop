@@ -85,7 +85,16 @@ test('a primeira instalação não apaga o segredo recém-criado ao gravar a pas
   const folder = fs.mkdtempSync(path.join(os.tmpdir(), 'fd-first-install-'));
   try {
     fs.writeFileSync(path.join(folder, 'docker-compose.yml'), compose);
-    const helpers = setup.match(/function Gravar\([\s\S]*?\r?\n\}/)[0] + '\n' + setup.slice(setup.indexOf('function Ler-TextoUtf8'), setup.indexOf('# Janela do Windows'));
+    // O trecho testado inclui a conferência do túnel Cloudflare feita antes de os
+    // serviços subirem, que chama estas duas funções do topo do assistente: sem
+    // elas definidas o teste falhava com "not recognized".
+    const tunel = setup.slice(
+      setup.indexOf('function Provisionar-Servidor'),
+      setup.indexOf("Write-Host ''", setup.indexOf('function Ler-CodigoInstalacao'))
+    );
+    const helpers = setup.match(/function Gravar\([\s\S]*?\r?\n\}/)[0] + '\n'
+      + setup.slice(setup.indexOf('function Ler-TextoUtf8'), setup.indexOf('# Janela do Windows')) + '\n'
+      + tunel;
     const block = setup.slice(setup.indexOf('# Preserva a pasta ja escolhida'), setup.indexOf('#  4/6 Sobe os servicos'));
     runPowerShell(`$ErrorActionPreference='Stop'; ${helpers}; $pasta=$env:FD_TEST_FOLDER; $pastaDados=Join-Path $pasta 'data'; $composeAtual=Join-Path $pasta 'docker-compose.yml'; $envFile=Join-Path $pasta '.env'; $linhas=@(); $segredo='${secret}'; $legado=$false; ${block}`, folder);
     assert.match(fs.readFileSync(path.join(folder, '.env'), 'utf8'), new RegExp(`STORAGE_SIGNING_SECRET=${secret}`));
