@@ -437,12 +437,12 @@ class ServerTunnel {
     } else {
       advice.push("O gateway responde neste computador, então a falha está no túnel do Cloudflare.");
       if (pub.status >= 500 || /Cloudflare/.test(pub.message)) {
-        advice.push("O conector do túnel está ativo, mas não alcança a porta 8790: ele precisa rodar no mesmo computador do gateway, porque 127.0.0.1 é local a ele.");
+        advice.push("O conector do túnel está ativo, mas não entrega o gateway: no Docker ele precisa apontar para http://gateway:8790. Com localhost ali, o conector procura o gateway dentro do próprio contêiner e o endereço responde 502.");
       }
-      advice.push("Feche outros programas que usam cloudflared e clique em Reiniciar túnel aqui neste computador.");
-      advice.push("No painel da Cloudflare (Zero Trust > Networks > Tunnels), confira se o Public Hostname do túnel aponta para http://localhost:8790 e se o tunnel aparece como Healthy.");
+      advice.push("Clique em Reiniciar túnel para subir de novo o serviço do túnel no Docker.");
+      advice.push("No painel da Cloudflare (Zero Trust > Networks > Tunnels), confira se o Public Hostname do túnel aponta para http://gateway:8790 e se o tunnel aparece como Healthy.");
     }
-    if (!hasCloudflared) {
+    if (!hasCloudflared && this.state.mode === "quick") {
       advice.push('O cloudflared não foi encontrado: rode o atalho "FortesDrive - configurar servidor" do menu Iniciar.');
     }
     if (this.state.mode === "quick") {
@@ -465,6 +465,9 @@ class ServerTunnel {
     this.state.attempts = attempts;
     this.update({ status: "starting", error: "", url: "" });
 
+    // O token é lido antes de subir os serviços: é ele que diz se o túnel do
+    // Docker (perfil "tunnel" do Compose) entra junto.
+    await this.readTunnelFiles();
     const server = await this.ensureServer();
     if (!server.ok) return server;
     if (!this.state.enabled && !this.manual) {
@@ -472,14 +475,43 @@ class ServerTunnel {
     }
     await this.readTunnelFiles();
 
-    // O assistente do servidor já pode ter deixado o túnel no ar (tarefa do
-    // Windows): nesse caso ele é usado como está, sem abrir um segundo agente.
+    // O assistente do servidor já pode ter deixado o túnel no ar: nesse caso ele
+    // é usado como está, sem abrir um segundo conector.
     const plan = tunnelPlan({ token: this.token, hostname: this.state.hostname, port: PORT });
     if (plan.url && (await answers(plan.url + "/health"))) {
       this.update({ status: "online", url: plan.url, error: "", attempts: 0 });
       return { ok: true, message: "Túnel conectado e validado em " + plan.url + "." };
     }
+    // Túnel nomeado roda no Docker: o serviço cloudflared do Compose entrega o
+    // endereço ao gateway por http://gateway:8790, dentro da rede dos contêineres.
+    if (plan.mode === "named") return this.startContainer(plan);
     return this.launch(plan);
+  }
+
+  /** Comando do Docker Compose na pasta do servidor (o túnel é um serviço dele). */
+  compose(args) {
+    return run("docker", ["compose", ...args], this.state.serverRoot);
+  }
+
+  /** Sobe o serviço do túnel no Docker e espera o endereço público responder. */
+  async startContainer(plan) {
+    this.update({ status: "starting", error: "", url: "" });
+    const started = await this.compose(["--profile", "tunnel", "up", "-d", "--no-deps", "cloudflared"]);
+    if (!started) {
+      return this.fail('Não foi possível subir o túnel no Docker. Abra o Docker Desktop e confira "docker compose logs cloudflared" na pasta do servidor.');
+    }
+    for (let i = 0; i < LAUNCH_TIMEOUT_MS / 1000; i++) {
+      await sleep(1000);
+      if (!this.state.enabled && !this.manual) return { ok: false, message: "A subida automática foi desativada." };
+      if (await answers(plan.url + "/health")) {
+        this.update({ status: "online", url: plan.url, mode: "named", error: "", attempts: 0 });
+        return { ok: true, message: "Túnel conectado e validado em " + plan.url + "." };
+      }
+    }
+    return this.fail(
+      "O túnel subiu no Docker, mas " + plan.url + " não respondeu em " + LAUNCH_TIMEOUT_MS / 1000 +
+        ' segundos. Confira "docker compose logs cloudflared" e se o Public Hostname aponta para http://gateway:8790.'
+    );
   }
 
   async ensureServer() {
@@ -488,7 +520,8 @@ class ServerTunnel {
       return this.fail("A pasta raiz do servidor não foi encontrada neste computador. Escolha a pasta onde o servidor foi instalado.");
     }
     this.update({ status: "starting", error: "Iniciando o servidor local..." });
-    await run("docker", ["compose", "up", "-d"], this.state.serverRoot);
+    // Sem token o perfil "tunnel" fica de fora: o resto do servidor sobe normal.
+    await this.compose([...(this.token ? ["--profile", "tunnel"] : []), "up", "-d"]);
     for (let i = 0; i < 24; i++) {
       await sleep(5000);
       if (!this.state.enabled && !this.manual) return { ok: false, message: "A subida automática foi desativada." };
@@ -590,6 +623,11 @@ class ServerTunnel {
     const child = this.child;
     this.child = null;
     if (child) await this.kill(child);
+    // Túnel nomeado: quem para é o serviço do Docker (o Compose não o reinicia
+    // sozinho depois de um stop).
+    if (this.state.mode === "named" && (await exists(path.join(this.state.serverRoot, "docker-compose.yml")))) {
+      await this.compose(["--profile", "tunnel", "stop", "cloudflared"]);
+    }
     this.update({ status: "stopped", error: "", url: "", attempts: 0 });
     return this.getStatus();
   }
