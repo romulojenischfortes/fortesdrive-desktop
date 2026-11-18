@@ -24,6 +24,59 @@ async function checksum(file, size) {
 let cacheRoot = null;
 const checksums = new Map();
 
+/*
+  Índice em disco do resumo de cada arquivo: tamanho, data de modificação,
+  identidade e SHA-256. Sem ele, cada reinício do cliente relia e resumia a
+  pasta inteira — com dezenas de milhares de arquivos isso levava horas e o
+  envio não andava. O índice é apenas um acelerador: qualquer divergência de
+  tamanho, data ou identidade manda resumir o arquivo de novo, então um arquivo
+  alterado nunca é confundido com um arquivo igual.
+*/
+let indexFile = null;
+let indexLoaded = false;
+let indexDirty = false;
+let indexTimer = null;
+const index = new Map();
+
+function configureIndex(file) {
+  if (indexFile === file) return;
+  indexFile = file || null;
+  indexLoaded = false;
+  index.clear();
+  clearTimeout(indexTimer);
+  indexTimer = null;
+  indexDirty = false;
+}
+
+async function loadIndex() {
+  if (indexLoaded) return;
+  indexLoaded = true;
+  if (!indexFile) return;
+  try {
+    const data = JSON.parse(await fs.readFile(indexFile, "utf8"));
+    for (const [relative, entry] of Object.entries(data || {})) if (entry?.checksum) index.set(relative, entry);
+  } catch (e) {
+    // Primeira execução ou índice ilegível: a varredura resume os arquivos.
+  }
+}
+
+function saveIndexSoon() {
+  if (!indexFile || indexTimer) return;
+  indexTimer = setTimeout(async () => {
+    indexTimer = null;
+    if (!indexDirty) return;
+    indexDirty = false;
+    try {
+      const temp = indexFile + ".tmp";
+      await fs.writeFile(temp, JSON.stringify(Object.fromEntries(index)), "utf8");
+      await fs.rename(temp, indexFile);
+    } catch (e) {
+      // O índice é só um acelerador: falhar ao gravá-lo não afeta a sincronização.
+    }
+  }, 15000);
+  indexTimer.unref?.();
+}
+
 // Nomes que o Windows não aceita: um só arquivo assim não pode derrubar a pasta.
 const BAD_CHARS = /[<>:"|?*\x00-\x1f]/;
 const RESERVED = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i;
@@ -42,8 +95,10 @@ function nativePath(absolute) {
 
 function remember(root, relative, entry) {
   if (root !== cacheRoot) return;
-  if (entry) checksums.set(relative, entry);
-  else checksums.delete(relative);
+  if (entry) { checksums.set(relative, entry); index.set(relative, entry); }
+  else { checksums.delete(relative); index.delete(relative); }
+  indexDirty = true;
+  saveIndexSoon();
 }
 
 async function safePath(root, relative, createParents = false) {
@@ -68,7 +123,7 @@ async function safePath(root, relative, createParents = false) {
 // sincronização de mercado.
 const READDIR_LANES = 8;    // pastas listadas ao mesmo tempo
 const STAT_LANES = 32;      // informações de itens pedidas ao mesmo tempo
-const HASH_LANES = 16;      // arquivos resumidos ao mesmo tempo
+const HASH_LANES = 24;      // arquivos resumidos ao mesmo tempo
 // Arquivo pequeno é resumido numa leitura só; os grandes vão em fluxo, com
 // blocos maiores para reduzir as chamadas ao disco.
 const SMALL_FILE_BYTES = 1024 * 1024;
@@ -89,7 +144,10 @@ const ROOT_TIMEOUT_MS = 60 * 1000;
 // controle. A árvore da pasta é conhecida em segundos e o que já foi resumido
 // começa a subir na hora; o restante continua na passagem seguinte, sem reler
 // o que já foi lido.
-const HASH_BUDGET_MS = 20 * 1000;
+// Passagens mais longas: cada faixa de leitura é seguida de uma rodada de
+// planejamento e transferência, e uma passagem curta demais gastava mais tempo
+// em contabilidade do que lendo os arquivos.
+const HASH_BUDGET_MS = 45 * 1000;
 
 function withTimeout(promise, ms, message) {
   let timer;
@@ -178,9 +236,13 @@ async function walkTree(root, walk, report) {
 
 async function scan(root, baseline = {}, { hashBudget = Infinity, hashBudgetMs = HASH_BUDGET_MS, onProgress, restart = false } = {}) {
   if (cacheRoot !== root) { cacheRoot = root; checksums.clear(); walks.clear(); }
+  // O índice gravado na execução anterior volta já carregado: reabrir o cliente
+  // não obriga a resumir de novo o que não mudou.
+  await loadIndex();
   for (const entry of Object.values(baseline)) {
     if (entry.path && entry.ctimeMs != null && !checksums.has(entry.path)) checksums.set(entry.path, entry);
   }
+  for (const [relative, entry] of index) if (!checksums.has(relative)) checksums.set(relative, entry);
   let walk = walks.get(root);
   // Uma varredura concluída recomeça na passagem seguinte — é assim que arquivos
   // novos ou alterados aparecem. O resumo já conhecido volta do cache, sem reler.
@@ -211,8 +273,12 @@ async function scan(root, baseline = {}, { hashBudget = Infinity, hashBudgetMs =
     // Quem já tem resumo válido (mesmo dono, tamanho e datas) volta sem reler o
     // conteúdo; só o que mudou ou nunca foi lido entra na fila do resumo.
     walk.pending = walk.pending.filter(item => {
+      // Mesmo tamanho, mesma data e mesmo dono no disco: o conteúdo é o mesmo
+      // de quando foi resumido. A data de criação (ctime) fica de fora porque o
+      // Windows a altera em renomeações, o que resumiria arquivos intactos.
       const known = checksums.get(item.relative);
-      if (!known || known.size !== item.stat.size || known.mtimeMs !== item.stat.mtimeMs || known.ctimeMs !== item.stat.ctimeMs || known.identity !== item.identity) return true;
+      const sameIdentity = !known?.identity || !item.identity || known.identity === item.identity;
+      if (!known || known.size !== item.stat.size || known.mtimeMs !== item.stat.mtimeMs || !sameIdentity) return true;
       walk.files.push(describe(item.relative, item.stat, item.identity, known.checksum));
       return false;
     });
@@ -251,7 +317,12 @@ async function scan(root, baseline = {}, { hashBudget = Infinity, hashBudgetMs =
   report(true);
   walk.complete = walk.walked && !walk.pending.length;
   // Arquivos que sumiram saem do cache: ele não cresce sem limite.
-  if (walk.complete) for (const key of [...checksums.keys()]) if (!walk.seen.has(key)) checksums.delete(key);
+  if (walk.complete) {
+    for (const key of [...checksums.keys()]) if (!walk.seen.has(key)) checksums.delete(key);
+    // O índice acompanha a pasta: o que sumiu do disco sai dele também.
+    for (const key of [...index.keys()]) if (!walk.seen.has(key)) { index.delete(key); indexDirty = true; }
+    saveIndexSoon();
+  }
   return {
     files: walk.files, directories: walk.directories, skipped: walk.skipped,
     totalBytes: walk.totalBytes, totalFiles: walk.totalFiles,
@@ -262,7 +333,10 @@ async function scan(root, baseline = {}, { hashBudget = Infinity, hashBudgetMs =
     // `unread` são os caminhos que já existem no computador mas ainda não foram
     // resumidos: eles não podem ser tratados como "arquivo ausente".
     walked: walk.walked, complete: walk.complete, walkMs: walk.walkMs,
-    unread: walk.pending.length ? walk.pending.map(item => item.relative) : [],
+    // Lista limitada: numa pasta com dezenas de milhares de itens ainda por
+    // resumir, devolver todos a cada passagem só atravancava a comunicação com
+    // a interface sem acrescentar decisão nenhuma.
+    unread: walk.pending.length ? walk.pending.slice(0, 20000).map(item => item.relative) : [],
   };
 }
 async function assertExpected(absolute, expected) {
@@ -316,4 +390,4 @@ async function move(root, from, to, expected) {
   remember(root, to, { size: saved.size, mtimeMs: saved.mtimeMs, identity: `${saved.dev}:${saved.ino}`, checksum: expected });
   return { size: saved.size, mtimeMs: saved.mtimeMs, identity: `${saved.dev}:${saved.ino}` };
 }
-module.exports = { safePath, scan, read, write, move, checksum, assertExpected, MAX_BYTES, MAX_SCAN_BYTES };
+module.exports = { safePath, scan, read, write, move, checksum, assertExpected, configureIndex, MAX_BYTES, MAX_SCAN_BYTES };
