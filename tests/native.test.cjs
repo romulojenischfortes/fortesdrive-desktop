@@ -45,4 +45,26 @@ test('arquivo acima do limite não interrompe os demais arquivos', async () => {
     const scan = await native.scan(root);
     assert.equal(scan.files[0].path, 'ok.txt'); assert.equal(scan.skipped[0].path, 'grande.bin');
   } finally { await fs.rm(root, {recursive:true, force:true}); }
+});test('a leitura da pasta avança em lotes e retoma do ponto onde parou', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'fortesdrive-'));
+  try {
+    for (let i = 0; i < 25; i++) await fs.writeFile(path.join(root, `arquivo-${i}.txt`), `conteudo ${i}`);
+    const first = await native.scan(root, {}, { hashBudget: 10 });
+    assert.equal(first.files.length, 10);
+    assert.equal(first.complete, false);
+    // A passagem seguinte continua a mesma leitura: os resumos já feitos ficam.
+    const second = await native.scan(root, {}, { hashBudget: 10 });
+    assert.equal(second.files.length, 20);
+    assert.equal(second.complete, false);
+    const third = await native.scan(root, {}, { hashBudget: 10 });
+    assert.equal(third.files.length, 25);
+    assert.equal(third.complete, true);
+    // Concluída, a varredura recomeça para enxergar o que mudou, mas reaproveita
+    // os resumos conhecidos em vez de reler a pasta inteira.
+    await fs.writeFile(path.join(root, 'novo.txt'), 'novo');
+    const refresh = await native.scan(root, {}, { hashBudget: 10 });
+    assert.equal(refresh.complete, true);
+    assert.equal(refresh.files.length, 26);
+    assert.ok(refresh.files.some(file => file.path === 'novo.txt'));
+  } finally { await fs.rm(root, {recursive:true, force:true}); }
 });
