@@ -62,7 +62,7 @@ const MAX_CONCURRENT_UPLOADS = Number(process.env.MAX_CONCURRENT_UPLOADS || 30);
 const RATE_LIMIT_PER_MINUTE = Number(process.env.RATE_LIMIT_PER_MINUTE || 1800);
 // Tempo máximo que um arquivo espera por uma vaga antes de o cliente tentar de novo.
 const UPLOAD_SLOT_WAIT_MS = Number(process.env.UPLOAD_SLOT_WAIT_MS || 120000);
-const VERSION = '2.2.0';
+const VERSION = '2.2.1';
 const STARTED_AT = Date.now();
 const MAX_SIGNATURE_LIFETIME_MS = 25 * 3600 * 1000;
 // Pasta onde estão os arquivos gravados antes da migração (o volume da pasta
@@ -261,6 +261,34 @@ function storageSnapshotNow() {
 function cachedStorage(maxAgeMs) {
   if (Date.now() - storageCache.checkedAt < maxAgeMs) return Promise.resolve(storageCache);
   return storageSnapshotNow();
+}
+
+// O /v1/status é o que libera a sincronização do app: ele precisa responder
+// rápido e sempre. O teste de gravação no Nextcloud (MKCOL, PUT, GET e DELETE)
+// levava de 1 a 9 segundos aqui; quando passava do prazo do app, o app concluía
+// "armazenamento offline" e recusava todos os arquivos da pasta. Agora o
+// resultado recente é reaproveitado e a resposta nunca espera mais que alguns
+// segundos pelo teste.
+const STATUS_CACHE_MS = 20000;
+const STATUS_PROBE_MAX_MS = 4000;
+
+async function statusProbe() {
+  if (storageCache.checkedAt && Date.now() - storageCache.checkedAt < STATUS_CACHE_MS) return storageCache;
+  const running = storageSnapshotNow();
+  const deadline = new Promise((resolve) => setTimeout(() => resolve(null), STATUS_PROBE_MAX_MS));
+  const fresh = await Promise.race([running, deadline]);
+  if (fresh) return fresh;
+  // O teste segue em segundo plano para valer na próxima consulta. Até ele
+  // terminar, vale o último resultado conhecido — nunca um sucesso inventado.
+  running.catch(() => {});
+  if (storageCache.checkedAt) return storageCache;
+  return {
+    backend: useNextcloud ? 'nextcloud' : 'disk',
+    writable: false,
+    reason: 'storage-probe-timeout',
+    code: null,
+    detail: 'O teste de gravação não terminou em ' + STATUS_PROBE_MAX_MS + ' ms.',
+  };
 }
 
 /** Confere a assinatura da requisição. Devolve a mensagem de erro ou null. */
@@ -485,7 +513,13 @@ async function handleStatus(res) {
 
   if (useNextcloud) {
     // Quem manda no espaço agora é o Nextcloud: a cota informada é a dele.
-    const [quota, probe] = await Promise.all([nextcloud.quota(), storageSnapshotNow()]);
+    // A leitura da cota é só informativa e não pode atrasar a resposta que
+    // libera os envios do app.
+    const quota = await Promise.race([
+      nextcloud.quota(),
+      new Promise((resolve) => setTimeout(() => resolve({ freeBytes: null, totalBytes: null, usedBytes: null }), 3000)),
+    ]);
+    const probe = await statusProbe();
     disk = { freeBytes: quota.freeBytes, totalBytes: quota.totalBytes, usedBytes: quota.usedBytes };
     return sendJson(res, 200, {
       ok: true,
