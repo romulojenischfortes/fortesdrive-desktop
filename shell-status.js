@@ -42,7 +42,10 @@ class ShellStatus {
     }
     this.entries = next;
     clearTimeout(this.timer); clearTimeout(this.confirmTimer); this.confirmTimer = null;
-    await this.flush();
+    // A gravação e a atualização do Explorador correm em segundo plano: esperar
+    // por elas a cada passagem atrasava a própria sincronização numa pasta com
+    // dezenas de milhares de itens. A fila interna mantém a ordem.
+    this.flush().catch(error => console.error('FortesDrive status:', error.message));
   }
   async confirm(relative, signature) {
     if (!this.root || process.platform !== 'win32') return;
@@ -76,6 +79,12 @@ class ShellStatus {
       await fs.writeFile(temp, content, 'utf8');
       await fs.rename(temp, path.join(internal, 'shell-status.tsv'));
       this.lastWritten = content;
+      // Uma atualização por vez, com um respiro entre elas: o Windows reconstrói
+      // as marcas de todos os itens a cada refresh e chamadas em sequência
+      // deixavam o Explorador lento.
+      const since = Date.now() - (this.lastRefresh || 0);
+      if (since < 900) await new Promise(resolve => setTimeout(resolve, 900 - since));
+      this.lastRefresh = Date.now();
       const dll = path.join(process.resourcesPath || __dirname, 'shell', 'FortesDriveOverlays.dll');
       await run('rundll32.exe', [dll + ',Refresh'], {windowsHide: true});
     });
