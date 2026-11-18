@@ -1,6 +1,7 @@
 const { app, BrowserWindow, ipcMain, dialog, Menu, shell, Tray, Notification, nativeImage, net } = require("electron");
 const path = require("path");
 const fs = require("fs/promises");
+const fsSync = require("fs");
 const { SyncEngine } = require("./sync-engine");
 const { applySetupConfiguration } = require("./setup-handoff");
 const { TransferHistory } = require("./transfer-history");
@@ -68,10 +69,12 @@ function makeTrayIcon(state) {
       const cx = x - size / 2, cy = y - size / 2;
       const dist = Math.sqrt(cx * cx + cy * cy);
       const off = (y * size + x) * 4;
+      // createFromBitmap espera BGRA: gravar R primeiro trocava as cores do
+      // ícone (o verde da sincronização aparecia oliva na bandeja).
       if (dist < size / 2 - 1) {
-        buf[off] = r; buf[off + 1] = g; buf[off + 2] = b; buf[off + 3] = 255;
+        buf[off] = b; buf[off + 1] = g; buf[off + 2] = r; buf[off + 3] = 255;
       } else if (dist < size / 2) {
-        buf[off] = r; buf[off + 1] = g; buf[off + 2] = b; buf[off + 3] = 128;
+        buf[off] = b; buf[off + 1] = g; buf[off + 2] = r; buf[off + 3] = 128;
       } else {
         buf[off + 3] = 0;
       }
@@ -81,9 +84,10 @@ function makeTrayIcon(state) {
 }
 
 function updateTrayState(state) {
-  if (!tray) return;
+  if (!tray || tray.isDestroyed()) return;
   const icon = makeTrayIcon(state);
-  tray.setImage(icon);
+  // Um ícone vazio apagaria a bandeja: nesse caso o desenho anterior continua.
+  if (!icon.isEmpty()) tray.setImage(icon);
   const labels = { synced: "FortesDrive — Sincronizado", syncing: "FortesDrive — Sincronizando...", offline: "FortesDrive — Offline (fila pendente)", conflict: "FortesDrive — Conflito detectado" };
   const detail = syncEngine?.state?.progressLabel;
   tray.setToolTip((labels[state] || "FortesDrive") + (detail ? " — " + detail : ""));
@@ -341,6 +345,32 @@ function createWindow() {
 // Estado do tunel no topo do menu da bandeja, regenerado a cada mudanca.
 const TUNNEL_LABELS = { stopped: "Túnel: parado", starting: "Túnel: iniciando...", online: "Túnel: conectado", reconnecting: "Túnel: reconectando...", error: "Túnel: erro" };
 
+// Abrir a janela a partir da bandeja nunca pode falhar por ela ter sido fechada.
+function showWindow() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  mainWindow.show();
+  mainWindow.focus();
+}
+
+// Início com o Windows: o instalador deixa o atalho na pasta Iniciar (nos dois
+// modos) e o túnel também registra o início automático. O menu mostra as duas
+// formas juntas e desliga as duas de uma vez, sempre abrindo escondido.
+function startupShortcutPath() {
+  const base = process.env.APPDATA;
+  return base ? path.join(base, "Microsoft", "Windows", "Start Menu", "Programs", "Startup", "FortesDrive.lnk") : "";
+}
+function startsWithWindows() {
+  if (app.getLoginItemSettings().openAtLogin) return true;
+  const shortcut = startupShortcutPath();
+  return !!shortcut && fsSync.existsSync(shortcut);
+}
+function setStartWithWindows(enabled) {
+  app.setLoginItemSettings({ openAtLogin: enabled, args: enabled ? ["--background"] : [] });
+  const shortcut = startupShortcutPath();
+  if (!enabled && shortcut) { try { fsSync.unlinkSync(shortcut); } catch (error) { /* já removido */ } }
+}
+
 function trayTemplate() {
   const tunnel = serverTunnel?.getStatus();
   const items = [{ label: TUNNEL_LABELS[tunnel?.status] || TUNNEL_LABELS.stopped, enabled: false }];
@@ -348,13 +378,13 @@ function trayTemplate() {
   return [
     ...items,
     { type: "separator" },
-    { label: "Abrir FortesDrive", click: () => mainWindow.show() },
+    { label: "Abrir FortesDrive", click: showWindow },
     { label: "Histórico de arquivos", click: () => { mainWindow.show(); mainWindow.focus(); mainWindow.loadURL(WEB_APP_URL + "/desktop#desktop-transfer-history"); } },
     { label: "Pasta dos documentos da nuvem", click: openFolderSetup },
     { label: "Sincronizar agora", click: requestSync },
     { label: "Reiniciar túnel do servidor", click: () => serverTunnel.restart().catch(error => dialog.showErrorBox("FortesDrive", error.message)) },
     { label: "Verificar atualizações", click: () => { mainWindow.show(); updater.check().catch(error => dialog.showErrorBox("FortesDrive", error.message)); } },
-    { label: "Iniciar com o Windows", type: "checkbox", checked: app.getLoginItemSettings().openAtLogin, click: item => app.setLoginItemSettings({ openAtLogin: item.checked }) },
+    { label: "Iniciar com o Windows", type: "checkbox", checked: startsWithWindows(), click: item => setStartWithWindows(item.checked) },
     { type: "separator" },
     { label: "Sair", click: () => { app.isQuitting = true; app.quit(); } },
   ];
@@ -364,12 +394,26 @@ function refreshTrayMenu() {
   if (tray && !tray.isDestroyed()) tray.setContextMenu(Menu.buildFromTemplate(trayTemplate()));
 }
 
+// Ícone da bandeja: vem do próprio pacote, sem depender do cache de ícones do
+// Windows — quando o getFileIcon voltava vazio, a bandeja ficava sem ícone.
+function appTrayIcon() {
+  const bundled = nativeImage.createFromPath(path.join(__dirname, "build", "icon.png"));
+  return bundled.isEmpty() ? null : bundled.resize({ width: 16, height: 16 });
+}
+
 async function createTray() {
-  const icon = await app.getFileIcon(process.execPath, { size: "small" });
+  if (tray && !tray.isDestroyed()) return tray;
+  let icon = appTrayIcon();
+  if (!icon) icon = await app.getFileIcon(process.execPath, { size: "small" }).catch(() => null);
+  if (!icon || icon.isEmpty()) {
+    console.warn("Bandeja: ícone do aplicativo indisponível neste computador.");
+    return null;
+  }
   tray = new Tray(icon);
   tray.setToolTip("FortesDrive");
   refreshTrayMenu();
-  tray.on("click", () => mainWindow.show());
+  tray.on("click", showWindow);
+  tray.on("double-click", showWindow);
 
   // Monitora conexão de internet no processo principal
   const checkOnline = () => {

@@ -298,17 +298,15 @@ FunctionEnd
   ${EndIf}
 !macroend
 
-; O servidor precisa subir com o Windows: sem isso, o computador reinicia e o
-; armazenamento (gateway e tunel) fica fora do ar ate alguem abrir o programa.
+; O aplicativo precisa subir com o Windows nos dois modos. No servidor, para o
+; armazenamento (gateway e tunel) nao ficar fora do ar depois de reiniciar. No
+; cliente (ramal), para a sincronizacao continuar e o icone permanecer na
+; bandeja em segundo plano: antes o atalho era apagado nesse modo e o cliente
+; so existia enquanto alguem abrisse o atalho na mao.
 ; Vale tambem para atualizacoes, que nao passam pelas paginas do instalador.
 !macro FortesRoleAutostart
   SetShellVarContext current
-  ReadRegStr $R4 HKLM "Software\FortesDrive" "MachineRole"
-  ${If} "$R4" == "server"
-    CreateShortCut "$SMSTARTUP\FortesDrive.lnk" "$INSTDIR\FortesDrive.exe" "--background"
-  ${Else}
-    Delete "$SMSTARTUP\FortesDrive.lnk"
-  ${EndIf}
+  CreateShortCut "$SMSTARTUP\FortesDrive.lnk" "$INSTDIR\FortesDrive.exe" "--background"
 !macroend
 
 !macro customInstall
