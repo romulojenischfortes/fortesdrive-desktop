@@ -16,7 +16,6 @@ async function checksum(file, size) {
   for await (const chunk of createReadStream(file, { highWaterMark: STREAM_CHUNK })) hash.update(chunk);
   return hash.digest("hex");
 }
-
 // Resumo (SHA-256) reaproveitado entre varreduras. Sem isso, cada ciclo de
 // sincronização relia e resumia a árvore inteira — o maior gasto de tempo do
 // envio, porque a árvore é varrida de novo a cada lote. A entrada só vale para
@@ -81,6 +80,16 @@ const READ_TIMEOUT_MS = 120 * 1000;
 // Um arquivo que não respondeu volta para a fila das próximas passagens; só
 // depois de algumas tentativas ele é dado como fora da sincronização.
 const READ_TRIES = 3;
+// Uma pasta que não responde é tentada de novo antes de ser dada como ilegível.
+const READDIR_TRIES = 2;
+// A raiz é a única pasta sem a qual nada pode ser concluído: ela tem prazo mais
+// longo que as demais.
+const ROOT_TIMEOUT_MS = 60 * 1000;
+// Quanto tempo de resumo (SHA-256) uma passagem faz antes de devolver o
+// controle. A árvore da pasta é conhecida em segundos e o que já foi resumido
+// começa a subir na hora; o restante continua na passagem seguinte, sem reler
+// o que já foi lido.
+const HASH_BUDGET_MS = 20 * 1000;
 
 function withTimeout(promise, ms, message) {
   let timer;
@@ -121,14 +130,32 @@ async function walkTree(root, walk, report) {
   const info = createLimiter(STAT_LANES);
   const visit = async (folder, prefix) => {
     let entries;
-    try { entries = await list(() => withTimeout(fs.readdir(nativePath(folder), { withFileTypes: true }), OP_TIMEOUT_MS, "A pasta demorou demais para responder")); }
-    catch (e) { walk.skipped.push({ path: prefix.replace(/\/$/, ""), reason: "Pasta não pôde ser lida: " + e.message }); return; }
+    for (let attempt = 0; ; attempt++) {
+      try {
+        entries = await list(() => withTimeout(
+          fs.readdir(nativePath(folder), { withFileTypes: true }),
+          prefix ? OP_TIMEOUT_MS : ROOT_TIMEOUT_MS,
+          "A pasta demorou demais para responder"
+        ));
+        break;
+      } catch (e) {
+        // Uma pasta que não responde é tentada de novo antes de ser dada como
+        // ilegível: uma falha passageira não pode excluir o conteúdo dela.
+        if (attempt < READDIR_TRIES) { await new Promise(resolve => setTimeout(resolve, 200 * (attempt + 1))); continue; }
+        // Sem a raiz não existe varredura nenhuma. Antes, o motivo virava um item
+        // "fora da sincronização" com caminho vazio — e caminho vazio protege a
+        // pasta inteira, então o envio e o download paravam sem dizer por quê.
+        if (!prefix) throw new Error("A pasta de sincronização não pôde ser lida: " + e.message);
+        walk.skipped.push({ path: prefix.replace(/\/$/, ""), reason: "Pasta não pôde ser lida: " + e.message });
+        return;
+      }
+    }
     const subfolders = [];
     await Promise.all(entries.map(async entry => {
       if (entry.name === ".fortesdrive" || entry.name.startsWith(".fortesdrive-transfer-")) return;
       if (entry.isSymbolicLink()) { walk.skipped.push({ path: prefix + entry.name, reason: "Link simbólico não sincronizado" }); return; }
       // O nome é conferido aqui, sem reabrir pasta por pasta.
-      if (!validName(entry.name)) { walk.skipped.push({ path: prefix + entry.name, reason: "Nome incompatível com o computador: " + entry.name }); return; }
+      if (!validName(entry.name)) { walk.skipped.push({ path: prefix + entry.name, reason: `Nome incompatível com o computador: ${entry.name}` }); return; }
       const relative = prefix + entry.name;
       const absolute = path.join(folder, entry.name);
       let stat;
@@ -136,7 +163,7 @@ async function walkTree(root, walk, report) {
       catch (e) { walk.skipped.push({ path: relative, reason: e.message }); return; }
       // Pula reparse points do OneDrive (Files On-Demand) e outros não regulares.
       if (!stat.isFile() && !stat.isDirectory()) { walk.skipped.push({ path: relative, reason: "Tipo não suportado" }); return; }
-      const identity = stat.dev + ":" + stat.ino;
+      const identity = `${stat.dev}:${stat.ino}`;
       if (stat.isDirectory()) { walk.directories.push({ path: relative, identity }); subfolders.push(entry.name); return; }
       walk.totalBytes += stat.size; walk.totalFiles++;
       if (stat.size > MAX_SCAN_BYTES) { walk.skipped.push({ path: relative, size: stat.size, reason: "Acima do limite de 10 GiB por arquivo do servidor" }); return; }
@@ -149,7 +176,7 @@ async function walkTree(root, walk, report) {
   await visit(root, "");
 }
 
-async function scan(root, baseline = {}, { hashBudget = Infinity, onProgress, restart = false } = {}) {
+async function scan(root, baseline = {}, { hashBudget = Infinity, hashBudgetMs = HASH_BUDGET_MS, onProgress, restart = false } = {}) {
   if (cacheRoot !== root) { cacheRoot = root; checksums.clear(); walks.clear(); }
   for (const entry of Object.values(baseline)) {
     if (entry.path && entry.ctimeMs != null && !checksums.has(entry.path)) checksums.set(entry.path, entry);
@@ -171,7 +198,14 @@ async function scan(root, baseline = {}, { hashBudget = Infinity, onProgress, re
   //    que permite conhecer uma pasta grande em segundos.
   if (!walk.walked) {
     const startedAt = Date.now();
-    await walkTree(root, walk, () => report());
+    try {
+      await walkTree(root, walk, () => report());
+    } catch (error) {
+      // Uma árvore percorrida pela metade não serve de base para nada: o estado
+      // parcial é descartado e a próxima passagem recomeça do zero.
+      walks.delete(root);
+      throw error;
+    }
     walk.walked = true;
     walk.walkMs = Date.now() - startedAt;
     // Quem já tem resumo válido (mesmo dono, tamanho e datas) volta sem reler o
@@ -185,17 +219,23 @@ async function scan(root, baseline = {}, { hashBudget = Infinity, onProgress, re
     report(true);
   }
 
-  // 2) Resumo do conteúdo em faixas paralelas, com limite por arquivo.
-  const hashing = hashBudget === Infinity ? walk.pending.splice(0) : walk.pending.splice(0, Math.max(0, hashBudget));
+  // 2) Resumo do conteúdo em faixas paralelas, com limite por arquivo e por
+  //    passagem. Uma pasta enorme não pode segurar o envio inteiro até o último
+  //    byte ser lido: o que já foi resumido sobe nesta passagem e o restante
+  //    continua na seguinte, reaproveitando a árvore já percorrida.
+  const slice = hashBudget === Infinity ? walk.pending.length : Math.max(0, hashBudget);
+  const hashing = walk.pending.splice(0, slice);
+  const deadline = hashBudgetMs === Infinity ? Infinity : Date.now() + hashBudgetMs;
   let next = 0;
   await Promise.all(Array.from({ length: Math.min(HASH_LANES, hashing.length) }, async () => {
     while (next < hashing.length) {
+      if (Date.now() > deadline) break;
       const item = hashing[next++];
       try {
         const digest = await withTimeout(checksum(nativePath(item.absolute), item.stat.size), READ_TIMEOUT_MS, "A leitura do arquivo demorou demais");
         const after = await withTimeout(fs.stat(nativePath(item.absolute)), OP_TIMEOUT_MS, "O arquivo demorou demais para responder");
         if (item.stat.size !== after.size || item.stat.mtimeMs !== after.mtimeMs) { remember(root, item.relative, null); walk.skipped.push({ path: item.relative, reason: "Arquivo em edição ou download" }); continue; }
-        const identity = after.dev + ":" + after.ino;
+        const identity = `${after.dev}:${after.ino}`;
         remember(root, item.relative, { size: after.size, mtimeMs: after.mtimeMs, ctimeMs: after.ctimeMs, identity, checksum: digest });
         walk.files.push(describe(item.relative, after, identity, digest));
         if (walk.files.length % 25 === 0) report();
@@ -206,6 +246,8 @@ async function scan(root, baseline = {}, { hashBudget = Infinity, onProgress, re
       }
     }
   }));
+  // O que não coube no tempo desta passagem volta para a fila, na frente.
+  if (next < hashing.length) walk.pending = [...hashing.slice(next), ...walk.pending];
   report(true);
   walk.complete = walk.walked && !walk.pending.length;
   // Arquivos que sumiram saem do cache: ele não cresce sem limite.
@@ -214,10 +256,15 @@ async function scan(root, baseline = {}, { hashBudget = Infinity, onProgress, re
     files: walk.files, directories: walk.directories, skipped: walk.skipped,
     totalBytes: walk.totalBytes, totalFiles: walk.totalFiles,
     pendingHash: walk.pending.length, pendingBytes: walk.pending.reduce((sum, item) => sum + item.stat.size, 0),
-    complete: walk.complete, walkMs: walk.walkMs,
+    // `walked` diz que a árvore inteira já é conhecida (nomes, tamanhos e datas
+    // de todos os arquivos). É a partir daí que o plano pode ser montado; o
+    // resumo do conteúdo continua em lotes nas passagens seguintes.
+    // `unread` são os caminhos que já existem no computador mas ainda não foram
+    // resumidos: eles não podem ser tratados como "arquivo ausente".
+    walked: walk.walked, complete: walk.complete, walkMs: walk.walkMs,
+    unread: walk.pending.length ? walk.pending.map(item => item.relative) : [],
   };
 }
-
 async function assertExpected(absolute, expected) {
   let stat;
   try { stat = await fs.lstat(absolute); } catch (e) { if (e.code !== "ENOENT") throw e; }

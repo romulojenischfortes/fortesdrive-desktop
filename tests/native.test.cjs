@@ -68,3 +68,28 @@ test('arquivo acima do limite não interrompe os demais arquivos', async () => {
     assert.ok(refresh.files.some(file => file.path === 'novo.txt'));
   } finally { await fs.rm(root, {recursive:true, force:true}); }
 });
+test('a árvore fica pronta antes do resumo, para o envio começar na mesma passagem', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'fortesdrive-'));
+  try {
+    for (let i = 0; i < 12; i++) await fs.writeFile(path.join(root, `f-${i}.txt`), `conteudo ${i}`);
+    const first = await native.scan(root, {}, { hashBudget: 4 });
+    // A árvore inteira já é conhecida: o plano pode ser montado e os arquivos
+    // resumidos nesta passagem começam a subir sem esperar o restante.
+    assert.equal(first.walked, true);
+    assert.equal(first.complete, false);
+    assert.equal(first.files.length, 4);
+    assert.equal(first.unread.length, 8);
+    const second = await native.scan(root, {}, { hashBudget: 100 });
+    assert.equal(second.walked, true);
+    assert.equal(second.files.length, 12);
+    assert.equal(second.complete, true);
+    assert.equal(second.unread.length, 0);
+  } finally { await fs.rm(root, {recursive:true, force:true}); }
+});
+test('pasta raiz ilegível falha com o motivo em vez de marcar tudo como fora', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'fortesdrive-'));
+  await fs.rm(root, { recursive: true, force: true });
+  // Antes, o erro da raiz virava um item "fora da sincronização" com caminho
+  // vazio — e caminho vazio protege a pasta inteira, parando envio e download.
+  await assert.rejects(native.scan(root), /não pôde ser lida/);
+});

@@ -133,7 +133,7 @@ class SyncEngine {
     return this.store.get(key, { files: {}, folders: {}, pending: {} });
   }
   saveManifest(userId, manifest) { this.store.set(this.manifestKey(userId), manifest); }
-  async snapshot(userId) {
+  async snapshot(userId, { hashBudgetMs } = {}) {
     if (!this.watchFolder) throw new Error("Escolha a pasta raiz primeiro");
     // Uma varredura em andamento é reaproveitada: com a pasta grande, uma nova
     // passagem pedida enquanto a anterior ainda lê abriria duas leituras do mesmo
@@ -148,12 +148,13 @@ class SyncEngine {
     this.scanning = (async () => {
       try {
         const result = await native.scan(this.watchFolder, userId ? this.getManifest(userId).files : {}, {
-          // A leitura vai até o fim numa passagem só: a árvore inteira fica
-          // conhecida em segundos e o envio começa logo depois, em vez de
-          // esperar vários ciclos para terminar de percorrer a pasta.
+          // A árvore da pasta é percorrida de uma vez (segundos) e o resumo do
+          // conteúdo avança em lotes por passagem: o que já está pronto começa a
+          // subir imediatamente, em vez de a pasta inteira esperar o último byte.
+          hashBudgetMs,
           onProgress: ({ total, hashed, pending, walking }) => { live.total = total; live.hashed = hashed; live.pending = pending; live.walking = walking; live.at = Date.now(); },
         });
-        this.state.scan = { phase: result.complete ? "idle" : "scanning", total: result.totalFiles, hashed: result.files.length, pending: result.pendingHash, walking: false, walkMs: result.walkMs, ms: Date.now() - startedAt, at: Date.now() };
+        this.state.scan = { phase: result.complete ? "idle" : "scanning", total: result.totalFiles, hashed: result.files.length, pending: result.pendingHash, walking: !result.walked, walkMs: result.walkMs, ms: Date.now() - startedAt, at: Date.now() };
         return result;
       } catch (error) {
         this.state.scan = { phase: "idle", error: error.message || "A pasta não pôde ser lida", ms: Date.now() - startedAt };

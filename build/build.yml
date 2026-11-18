@@ -16,7 +16,7 @@ jobs:
       - run: npm install
       - run: node generate-icon.js
       - name: Test native transfers and updater
-        run: node --test tests/native.test.cjs tests/native-streams.test.cjs tests/updater.test.cjs tests/badge-setup.test.cjs tests/packaging.test.cjs tests/server-package.test.cjs tests/setup-handoff.test.cjs tests/installer-folder.test.cjs tests/transfer-history.test.cjs tests/gateway-uploads.test.cjs tests/storage-folder.test.cjs tests/install-health.test.cjs tests/storage-diagnostics.test.cjs tests/cloudflare-tunnel.test.cjs tests/docker-tunnel.test.cjs
+        run: node --test tests/native.test.cjs tests/native-streams.test.cjs tests/updater.test.cjs tests/badge-setup.test.cjs tests/packaging.test.cjs tests/server-package.test.cjs tests/setup-handoff.test.cjs tests/installer-folder.test.cjs tests/transfer-history.test.cjs tests/gateway-uploads.test.cjs tests/storage-folder.test.cjs tests/install-health.test.cjs tests/storage-diagnostics.test.cjs tests/cloudflare-tunnel.test.cjs tests/docker-tunnel.test.cjs tests/continuous-monitor.test.cjs
       - name: Build and test Explorer badges
         shell: cmd
         run: |
@@ -90,6 +90,11 @@ jobs:
           tag_name: v${{ steps.version.outputs.version }}
           name: FortesDrive Desktop ${{ steps.version.outputs.version }}
           body: |
+            Sincronizacao de pasta grande: a leitura deixou de travar o envio. A pasta e resumida em lotes e os arquivos ja lidos comecam a subir na mesma passagem; o painel mostra quantos faltam resumir e quanto ainda falta enviar.
+            Enquanto a leitura nao termina, arquivo ainda nao lido nao e tratado como excluido: nada vai para a lixeira e nada sai da nuvem por engano.
+            Repercusao das alteracoes entre a nuvem e todas as instancias: edicao, insercao e exclusao feitas em qualquer computador, no app ou no servidor chegam aos demais.
+            Exclusao definitiva (lixeira esvaziada) fica registrada como lapide: o arquivo sai de todos os computadores, em vez de voltar a subir.
+            Registro que sumiu da nuvem sem lapide nao e exclusao: o conteudo do computador volta para a nuvem, sem apagar nada do PC.
             Instalador dos dois modos, Cliente (instancia) e Servidor: a pagina do papel da maquina agora aceita o codigo de instalacao gerado em Armazenamento, e o assistente do servidor ja cria o tunel Cloudflare e o endereco publico sem pedir nada. Codigo digitado no instalador e usado uma unica vez.
             Modo Servidor sobe com o Windows: o atalho de inicializacao e criado na instalacao e refeito em cada atualizacao, para o gateway e o tunel voltarem sozinhos depois de reiniciar. No desinstalar, o atalho e removido.
             Modo Servidor liga a subida automatica do tunel na primeira abertura, respeitando depois a escolha feita no painel.
