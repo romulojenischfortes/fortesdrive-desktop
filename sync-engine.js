@@ -133,7 +133,7 @@ class SyncEngine {
     return this.store.get(key, { files: {}, folders: {}, pending: {} });
   }
   saveManifest(userId, manifest) { this.store.set(this.manifestKey(userId), manifest); }
-  async snapshot(userId, { incremental = true } = {}) {
+  async snapshot(userId) {
     if (!this.watchFolder) throw new Error("Escolha a pasta raiz primeiro");
     // Uma varredura em andamento é reaproveitada: com a pasta grande, uma nova
     // passagem pedida enquanto a anterior ainda lê abriria duas leituras do mesmo
@@ -143,17 +143,17 @@ class SyncEngine {
     // quantos arquivos já foram lidos e quantos faltam resumir, em vez de deixar
     // "Sincronizando" sem nenhum número enquanto a pasta é percorrida.
     const startedAt = Date.now();
-    const live = { phase: "scanning", total: 0, hashed: 0, pending: 0, startedAt };
+    const live = { phase: "scanning", total: 0, hashed: 0, pending: 0, walking: true, startedAt };
     this.state.scan = live;
     this.scanning = (async () => {
       try {
         const result = await native.scan(this.watchFolder, userId ? this.getManifest(userId).files : {}, {
-          // Somente o ciclo de sincronização pede a leitura em lotes; uma
-          // varredura completa continua disponível para quem não pediu.
-          hashBudget: incremental ? undefined : Infinity,
-          onProgress: ({ total, hashed, pending }) => { live.total = total; live.hashed = hashed; live.pending = pending; live.at = Date.now(); },
+          // A leitura vai até o fim numa passagem só: a árvore inteira fica
+          // conhecida em segundos e o envio começa logo depois, em vez de
+          // esperar vários ciclos para terminar de percorrer a pasta.
+          onProgress: ({ total, hashed, pending, walking }) => { live.total = total; live.hashed = hashed; live.pending = pending; live.walking = walking; live.at = Date.now(); },
         });
-        this.state.scan = { phase: result.complete ? "idle" : "scanning", total: result.totalFiles, hashed: result.files.length, pending: result.pendingHash, ms: Date.now() - startedAt, at: Date.now() };
+        this.state.scan = { phase: result.complete ? "idle" : "scanning", total: result.totalFiles, hashed: result.files.length, pending: result.pendingHash, walking: false, walkMs: result.walkMs, ms: Date.now() - startedAt, at: Date.now() };
         return result;
       } catch (error) {
         this.state.scan = { phase: "idle", error: error.message || "A pasta não pôde ser lida", ms: Date.now() - startedAt };
