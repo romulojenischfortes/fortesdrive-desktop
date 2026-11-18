@@ -7,9 +7,11 @@ const native = require("./native-files");
 const {ShellStatus} = require("./shell-status");
 
 class SyncEngine {
-  constructor(notify) {
+  constructor(notify, userDataDir) {
     this.store = new Store({ name: "fortesdrive-native-v2" });
+    this.userDataDir = userDataDir || null;
     this.watchFolder = this.store.get("watchFolder", null);
+    native.configureIndex(this.indexPath());
     // A pasta padrão da primeira execução já existe, mas ninguém escolheu onde
     // ela fica nem como se chama: enquanto isso não é confirmado, o aplicativo
     // abre o assistente de pasta. Uma instalação antiga já sincronizando conta
@@ -30,6 +32,9 @@ class SyncEngine {
     await this.stop();
     this.watchFolder = canonical;
     this.store.set("watchFolder", canonical);
+    // Cada pasta tem o seu índice de resumos: trocar de pasta não reaproveita
+    // resumo de outro conteúdo.
+    native.configureIndex(this.indexPath());
     // Pasta escolhida explicitamente (local + nome) não precisa mais do assistente.
     this.folderConfigured = true;
     this.store.set("folderConfigured", true);
@@ -40,7 +45,10 @@ class SyncEngine {
     // O pulso continua mesmo se o disco ou o monitor falhar. Não depende da janela.
     if (!this.timer) this.timer = setInterval(() => {
       this.start().catch(error => { this.state.error = error.message; });
-      this.notify();
+      // Uma passagem em andamento já enxerga o que mudou: avisar de novo a cada
+      // 30 segundos fazia a passagem ser interrompida antes de os arquivos já
+      // lidos começarem a subir, e a pasta nunca saía da leitura.
+      if (!this.state.syncing) this.notify();
     }, 30000);
     if (this.state.running || this.starting) return this.starting;
     this.starting = (async () => {
@@ -119,6 +127,16 @@ class SyncEngine {
     if (!at) return false;
     if (Date.now() - at > 120000) { this.selfWrites.delete(this.selfKey(relative)); return false; }
     return true;
+  }
+  /**
+   * Arquivo do índice de resumos da pasta atual, ao lado dos dados do
+   * aplicativo. É o que permite reabrir o cliente e saber em segundos o que
+   * mudou, sem resumir de novo dezenas de milhares de arquivos.
+   */
+  indexPath() {
+    if (!this.userDataDir || !this.watchFolder) return null;
+    const digest = crypto.createHash("sha256").update(this.watchFolder.toLowerCase()).digest("hex").slice(0, 16);
+    return path.join(this.userDataDir, "scan-index-" + digest + ".json");
   }
   manifestKey(userId) {
     if (typeof userId !== "string" || !userId || userId.length > 100 || !this.watchFolder) throw new Error("Conta e pasta são obrigatórias");
