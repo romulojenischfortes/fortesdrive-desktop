@@ -1,6 +1,7 @@
 const Store = require("electron-store");
 const chokidar = require("chokidar");
 const crypto = require("crypto");
+const path = require("path");
 const fs = require("fs/promises");
 const native = require("./native-files");
 const {ShellStatus} = require("./shell-status");
@@ -20,6 +21,7 @@ class SyncEngine {
     this.notify = notify;
     this.state = { running: false, syncing: false, queue: 0, error: "", lastSync: null };
     this.badges = new ShellStatus();
+    this.selfWrites = new Map();
   }
   async setWatchFolder(folder) {
     if (this.state.syncing) throw new Error("Aguarde a sincronização terminar antes de trocar a pasta");
@@ -56,6 +58,11 @@ class SyncEngine {
       watcher.on("all", (event, absolute) => {
         if (this.watcher !== watcher) return;
         this.badges.dirty(absolute);
+        // Arquivo que o próprio aplicativo acabou de gravar (download, edição ou
+        // exclusão feita pela sincronização) não é alteração do usuário: avisar a
+        // fila por causa dele reiniciava a passagem a cada arquivo baixado, e uma
+        // pasta com milhares de arquivos nunca terminava de sincronizar.
+        if (this.isSelfWrite(absolute)) return;
         // Janela limitada: uma cópia contínua não adia o aviso indefinidamente.
         if (!this.debounce) this.debounce = setTimeout(() => {
           this.debounce = null;
@@ -93,6 +100,26 @@ class SyncEngine {
     await this.closing;
   }
   getStatus() { return { ...this.state, machineRole: this.store.get("machineRole", "client"), nativeStreaming: true, watchFolder: this.watchFolder, folderConfigured: this.folderConfigured, deviceId: this.deviceId }; }
+  /** Marca um arquivo gravado pela própria sincronização (caminho relativo). */
+  markSelfWrite(relative) {
+    if (typeof relative !== "string" || !relative) return;
+    const key = this.selfKey(relative);
+    this.selfWrites.set(key, Date.now());
+    if (this.selfWrites.size > 20000) {
+      const limit = Date.now() - 120000;
+      for (const [item, at] of this.selfWrites) if (at < limit) this.selfWrites.delete(item);
+    }
+  }
+  selfKey(relative) { return process.platform === "win32" ? relative.toLowerCase() : relative; }
+  /** O evento do monitor veio de uma gravação nossa? Vale por 2 minutos. */
+  isSelfWrite(absolute) {
+    if (!this.watchFolder) return false;
+    const relative = path.relative(this.watchFolder, absolute).split(path.sep).join("/");
+    const at = this.selfWrites.get(this.selfKey(relative));
+    if (!at) return false;
+    if (Date.now() - at > 120000) { this.selfWrites.delete(this.selfKey(relative)); return false; }
+    return true;
+  }
   manifestKey(userId) {
     if (typeof userId !== "string" || !userId || userId.length > 100 || !this.watchFolder) throw new Error("Conta e pasta são obrigatórias");
     return "manifest_" + crypto.createHash("sha256").update(userId + "\0" + this.watchFolder).digest("hex");
@@ -106,9 +133,34 @@ class SyncEngine {
     return this.store.get(key, { files: {}, folders: {}, pending: {} });
   }
   saveManifest(userId, manifest) { this.store.set(this.manifestKey(userId), manifest); }
-  async snapshot(userId) {
+  async snapshot(userId, { incremental = true } = {}) {
     if (!this.watchFolder) throw new Error("Escolha a pasta raiz primeiro");
-    return native.scan(this.watchFolder, userId ? this.getManifest(userId).files : {});
+    // Uma varredura em andamento é reaproveitada: com a pasta grande, uma nova
+    // passagem pedida enquanto a anterior ainda lê abriria duas leituras do mesmo
+    // disco e nenhuma terminaria antes do próximo pedido.
+    if (this.scanning) return this.scanning;
+    // O andamento da leitura vai para o estado do programa: o painel mostra
+    // quantos arquivos já foram lidos e quantos faltam resumir, em vez de deixar
+    // "Sincronizando" sem nenhum número enquanto a pasta é percorrida.
+    const startedAt = Date.now();
+    const live = { phase: "scanning", total: 0, hashed: 0, pending: 0, startedAt };
+    this.state.scan = live;
+    this.scanning = (async () => {
+      try {
+        const result = await native.scan(this.watchFolder, userId ? this.getManifest(userId).files : {}, {
+          // Somente o ciclo de sincronização pede a leitura em lotes; uma
+          // varredura completa continua disponível para quem não pediu.
+          hashBudget: incremental ? undefined : Infinity,
+          onProgress: ({ total, hashed, pending }) => { live.total = total; live.hashed = hashed; live.pending = pending; live.at = Date.now(); },
+        });
+        this.state.scan = { phase: result.complete ? "idle" : "scanning", total: result.totalFiles, hashed: result.files.length, pending: result.pendingHash, ms: Date.now() - startedAt, at: Date.now() };
+        return result;
+      } catch (error) {
+        this.state.scan = { phase: "idle", error: error.message || "A pasta não pôde ser lida", ms: Date.now() - startedAt };
+        throw error;
+      }
+    })().finally(() => { this.scanning = null; });
+    return this.scanning;
   }
 }
 module.exports = { SyncEngine };

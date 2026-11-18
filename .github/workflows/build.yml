@@ -90,6 +90,8 @@ jobs:
           tag_name: v${{ steps.version.outputs.version }}
           name: FortesDrive Desktop ${{ steps.version.outputs.version }}
           body: |
+            Sincronizacao de pasta grande: a leitura deixou de travar o envio. A pasta e resumida em lotes e os arquivos ja lidos comecam a subir na mesma passagem; o painel mostra quantos faltam resumir e quanto ainda falta enviar.
+            Enquanto a leitura nao termina, arquivo ainda nao lido nao e tratado como excluido: nada vai para a lixeira e nada sai da nuvem por engano.
             Instalador dos dois modos, Cliente (instancia) e Servidor: a pagina do papel da maquina agora aceita o codigo de instalacao gerado em Armazenamento, e o assistente do servidor ja cria o tunel Cloudflare e o endereco publico sem pedir nada. Codigo digitado no instalador e usado uma unica vez.
             Modo Servidor sobe com o Windows: o atalho de inicializacao e criado na instalacao e refeito em cada atualizacao, para o gateway e o tunel voltarem sozinhos depois de reiniciar. No desinstalar, o atalho e removido.
             Modo Servidor liga a subida automatica do tunel na primeira abertura, respeitando depois a escolha feita no painel.

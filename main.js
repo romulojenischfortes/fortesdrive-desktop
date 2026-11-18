@@ -224,9 +224,14 @@ function registerHandlers() {
     verifyUpdateSignature: () => updater.verifyUpdateSignature(),
     syncNow: () => { requestSync(); return true; },
     rendererReady: () => { requestSync(); return true; },
-    snapshot: userId => syncEngine.snapshot(userId),
+    snapshot: (userId, options) => syncEngine.snapshot(userId, options),
     uploadFileStream: (relative, authorization, expected) => transfers.upload(syncEngine.watchFolder, relative, authorization, expected, (loaded, total) => mainWindow?.webContents.send("sync:transferProgress", { path: relative, direction: "upload", loaded, total })),
-    downloadFileStream: (relative, url, file, expected) => transfers.download(syncEngine.watchFolder, relative, url, file, expected, (loaded, total) => mainWindow?.webContents.send("sync:transferProgress", { path: relative, direction: "download", loaded, total })),
+    downloadFileStream: async (relative, url, file, expected) => {
+      const saved = await transfers.download(syncEngine.watchFolder, relative, url, file, expected, (loaded, total) => mainWindow?.webContents.send("sync:transferProgress", { path: relative, direction: "download", loaded, total }));
+      // O arquivo que acabou de descer não é uma alteração do usuário.
+      syncEngine.markSelfWrite(relative);
+      return saved;
+    },
     publishSyncStatus: async payload => {
       try { await syncEngine.badges.publish(payload); syncEngine.state.badgeError = ""; }
       catch (error) { syncEngine.state.badgeError = error.message; }
@@ -276,15 +281,30 @@ function registerHandlers() {
       return true;
     },
     readFile: (relative, hash) => native.read(syncEngine.watchFolder, relative, hash),
-    writeFile: (relative, bytes, hash, expected) => native.write(syncEngine.watchFolder, relative, bytes, hash, expected),
-    moveFile: (from, to, expected) => native.move(syncEngine.watchFolder, from, to, expected),
+    writeFile: async (relative, bytes, hash, expected) => {
+      const saved = await native.write(syncEngine.watchFolder, relative, bytes, hash, expected);
+      syncEngine.markSelfWrite(relative);
+      return saved;
+    },
+    moveFile: async (from, to, expected) => {
+      const saved = await native.move(syncEngine.watchFolder, from, to, expected);
+      syncEngine.markSelfWrite(from); syncEngine.markSelfWrite(to);
+      return saved;
+    },
     trashFile: async (relative, expected) => {
       const file = await native.safePath(syncEngine.watchFolder, relative);
       await native.assertExpected(file, expected);
       await shell.trashItem(file);
+      syncEngine.markSelfWrite(relative);
     },
-    mkdir: async relative => { await fs.mkdir(await native.safePath(syncEngine.watchFolder, relative, true), { recursive: true }); },
-    rmdir: async relative => { await fs.rmdir(await native.safePath(syncEngine.watchFolder, relative)); },
+    mkdir: async relative => {
+      await fs.mkdir(await native.safePath(syncEngine.watchFolder, relative, true), { recursive: true });
+      syncEngine.markSelfWrite(relative);
+    },
+    rmdir: async relative => {
+      await fs.rmdir(await native.safePath(syncEngine.watchFolder, relative));
+      syncEngine.markSelfWrite(relative);
+    },
   };
   for (const [channel, handler] of Object.entries(handlers)) ipcMain.handle("sync:" + channel, (event, ...args) => { trusted(event); return handler(...args); });
 }
