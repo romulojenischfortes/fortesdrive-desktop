@@ -1,0 +1,136 @@
+name: Build Installer
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm install
+      - run: node generate-icon.js
+      - name: Test native transfers and updater
+        run: node --test tests/native.test.cjs tests/native-streams.test.cjs tests/updater.test.cjs tests/badge-setup.test.cjs tests/packaging.test.cjs tests/server-package.test.cjs tests/setup-handoff.test.cjs tests/installer-folder.test.cjs tests/transfer-history.test.cjs tests/gateway-uploads.test.cjs tests/storage-folder.test.cjs tests/install-health.test.cjs tests/storage-diagnostics.test.cjs tests/cloudflare-tunnel.test.cjs tests/docker-tunnel.test.cjs tests/continuous-monitor.test.cjs tests/fast-first-scan.test.cjs
+      - name: Build and test Explorer badges
+        shell: cmd
+        run: |
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do call "%%i\VC\Auxiliary\Build\vcvars64.bat"
+          node shell\generate-icons.cjs
+          if errorlevel 1 exit /b 1
+          cd shell
+          rc /nologo /fo overlays.res overlays.rc
+          if errorlevel 1 exit /b 1
+          cl /nologo /std:c++17 /utf-8 /EHsc /MT /LD overlays.cpp /link /DEF:overlays.def /OUT:FortesDriveOverlays.dll overlays.res ole32.lib shell32.lib advapi32.lib uuid.lib user32.lib
+          if errorlevel 1 exit /b 1
+          cl /nologo /std:c++17 /utf-8 /EHsc /MT smoke.cpp /link /OUT:smoke.exe overlays.res ole32.lib shell32.lib advapi32.lib uuid.lib user32.lib
+          if errorlevel 1 exit /b 1
+          smoke.exe
+          if errorlevel 1 exit /b 1
+      - name: Set unique update version
+        id: version
+        shell: pwsh
+        run: |
+          $base = (Get-Content package.json | ConvertFrom-Json).version.Split('.')
+          $patch = [Math]::Max([int]$base[2], [int]"${{ github.run_number }}")
+          $version = "$($base[0]).$($base[1]).$patch"
+          npm version $version --no-git-tag-version --allow-same-version
+          "version=$version" >> $env:GITHUB_OUTPUT
+      # Assinatura Authenticode opcional: só acontece quando as credenciais
+      # existem nos segredos do repositório. Sem elas, o instalador é publicado
+      # como NÃO assinado — e o release diz isso claramente.
+      - name: Configure code signing (optional)
+        id: signing
+        shell: pwsh
+        run: |
+          if ("${{ secrets.WINDOWS_CERTIFICATE }}" -ne "") {
+            [IO.File]::WriteAllBytes("$PWD\build\certificate.pfx", [Convert]::FromBase64String("${{ secrets.WINDOWS_CERTIFICATE }}"))
+            "CSC_LINK=$PWD\build\certificate.pfx" >> $env:GITHUB_ENV
+            "CSC_KEY_PASSWORD=${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}" >> $env:GITHUB_ENV
+            "signed=true" >> $env:GITHUB_OUTPUT
+            Write-Host "Credenciais encontradas: o instalador será assinado e com carimbo de tempo."
+          } else {
+            "signed=false" >> $env:GITHUB_OUTPUT
+            Write-Host "Sem credenciais de assinatura: o instalador será publicado sem assinatura digital."
+          }
+      - name: Build installer
+        run: npx electron-builder --win nsis --publish never
+      - name: Compute SHA-256
+        id: hash
+        shell: pwsh
+        run: |
+          $version = "${{ steps.version.outputs.version }}"
+          $exe = Get-Item "release/FortesDrive-Setup-$version.exe"
+          $feed = Get-Content release/latest.yml -Raw
+          if ($feed -notmatch "(?m)^version: $([regex]::Escape($version))\s*$" -or -not $feed.Contains($exe.Name)) { throw 'Update feed does not match installer version' }
+          $hash = (Get-FileHash $exe.FullName -Algorithm SHA256).Hash.ToLower()
+          $sha512 = [Convert]::ToBase64String([Security.Cryptography.SHA512]::Create().ComputeHash([IO.File]::ReadAllBytes($exe.FullName)))
+          if (-not $feed.Contains($sha512)) { throw 'Installer hash does not match update feed' }
+          @{ version = $version; commit = "${{ github.sha }}"; installer = $exe.Name; sha256 = $hash } | ConvertTo-Json | Set-Content release/desktop-release.json -Encoding utf8
+          "sha256=$hash" >> $env:GITHUB_OUTPUT
+          "asset=$($exe.Name)" >> $env:GITHUB_OUTPUT
+      - name: Remove certificate from runner
+        if: always()
+        shell: pwsh
+        run: Remove-Item -Force build/certificate.pfx -ErrorAction SilentlyContinue
+      - name: Publish installer and update feed
+        uses: softprops/action-gh-release@v2
+        with:
+          fail_on_unmatched_files: true
+          files: |
+            release/*.exe
+            release/*.exe.blockmap
+            release/latest.yml
+            release/desktop-release.json
+          tag_name: v${{ steps.version.outputs.version }}
+          name: FortesDrive Desktop ${{ steps.version.outputs.version }}
+          body: |
+            Sincronizacao de pasta grande: a leitura deixou de travar o envio. A pasta e resumida em lotes e os arquivos ja lidos comecam a subir na mesma passagem; o painel mostra quantos faltam resumir e quanto ainda falta enviar.
+            Enquanto a leitura nao termina, arquivo ainda nao lido nao e tratado como excluido: nada vai para a lixeira e nada sai da nuvem por engano.
+            Repercusao das alteracoes entre a nuvem e todas as instancias: edicao, insercao e exclusao feitas em qualquer computador, no app ou no servidor chegam aos demais.
+            Exclusao definitiva (lixeira esvaziada) fica registrada como lapide: o arquivo sai de todos os computadores, em vez de voltar a subir.
+            Registro que sumiu da nuvem sem lapide nao e exclusao: o conteudo do computador volta para a nuvem, sem apagar nada do PC.
+            Instalador dos dois modos, Cliente (instancia) e Servidor: a pagina do papel da maquina agora aceita o codigo de instalacao gerado em Armazenamento, e o assistente do servidor ja cria o tunel Cloudflare e o endereco publico sem pedir nada. Codigo digitado no instalador e usado uma unica vez.
+            Modo Servidor sobe com o Windows: o atalho de inicializacao e criado na instalacao e refeito em cada atualizacao, para o gateway e o tunel voltarem sozinhos depois de reiniciar. No desinstalar, o atalho e removido.
+            Modo Servidor liga a subida automatica do tunel na primeira abertura, respeitando depois a escolha feita no painel.
+            Instalacao nova sobre um servidor existente mantem o papel de servidor: a leitura do papel gravado passou a usar a visao de registro correta.
+            Novo painel do cliente desktop: estado e acoes a esquerda, abas (Sincronizacao, Servidor, Atualizacoes, Historico) a direita e faixa de transferencias fixa no rodape, sem barra de rolagem na janela.
+            Barra de envio e download sem piscar: quando a etapa nao mede bytes, um brilho percorre a barra em vez de mudar a opacidade, e o progresso medido nao zera ao trocar de etapa.
+            Tunel do servidor sob controle no proprio cliente: botoes Iniciar, Parar, Reiniciar e Diagnosticar conexao, com confirmacao na tela do que cada acao fez.
+            Diagnostico separa gateway local, tunel e acesso publico, com latencia, horario da verificacao e orientacao para o erro 502.
+            Instalador unificado: escolha Cliente ou Servidor; o cliente nao instala dependencias do servidor.
+            Verificacao da atualizacao no instalador: confere os componentes desta versao e mostra um alerta quando algum nao foi aplicado, com registro em verificacao-instalacao.log.
+            Verificacao no cliente ao abrir: confere versao em execucao, componentes do instalador, servidor de armazenamento e sincronizacao, avisa na tela e no sistema as etapas que falharam e oferece verificar de novo ou baixar o instalador.
+            Cliente: escolha obrigatoria da pasta de download e sincronizacao dentro do instalador, antes de instalar. Corrigida a ordem de carregamento dos plugins NSIS que impedia gerar o novo instalador. Configuracao nativa Unicode sem PowerShell, sem pasta padrao imposta. Atualizacoes automaticas preservam a pasta existente.
+            Avisos individuais do Windows para cada arquivo concluido, historico persistente por conta e pasta, filtros, ordenacao, paginacao e exportacao CSV real. As marcas do Explorador sao atualizadas apos a confirmacao de cada arquivo.
+            No Meu Drive do cliente, selecione arquivos ou pastas e use Sincronizar Agora para reconciliar somente a selecao.
+            Gateway 2.0.2: envios aceitam corpo em chunks e arquivos vazios, sem exigir o Content-Length que o tunel nao repassa (corrige o erro 411).
+            Inicializacao: removido o parametro invalido New-Item -LiteralPath que interrompia o assistente e o reparo antes de iniciar o gateway.
+            Configuracao: o segredo de assinatura e mantido na primeira instalacao, e as aspas envolvem o volume inteiro, corrigindo o Compose de pastas personalizadas.
+            Recuperacao: inicia tambem as dependencias de servidores antigos e confirma o gateway local antes de iniciar o tunel.
+            Regressao: os testes executam as rotinas reais no Windows PowerShell 5.1, com caminhos acentuados e configuracao antiga, sem apagar dados.
+            Tunel: o assistente garante que o endereco do FortesDrive aponte para a porta 8790.
+            Envio e download nativos em fluxo, ate 10 GiB por arquivo, sem copiar o conteudo inteiro para a memoria.
+            Reconciliacao indexada e checkpoints agrupados para pastas com milhares de arquivos.
+            Sincronização recursiva de arquivos e subpastas, edição, renomeação, movimentos e exclusões bidirecionais.
+            Marcas no Explorador do Windows: verde = na nuvem, relógio = pendente/alterado, cadeado = pasta protegida por senha aguardando desbloqueio, vermelho = erro.
+            O instalador solicita permissão de administrador para registrar a extensão do Explorador.
+            Após instalar, encerre a sessão do Windows e entre novamente para carregar as marcas.
+            O Windows possui um limite de marcas compartilhado por todos os aplicativos.
+            Publique também as alterações do aplicativo web para carregar o coordenador de sincronização atualizado.
+
+            Atualizador corrigido: usa somente o instalador desta atualização e preserva downloads prontos ao verificar novamente.
+
+            ### Verificação do instalador
+            Código-fonte: ${{ github.sha }}
+            Arquivo: ${{ steps.hash.outputs.asset }}
+            SHA-256: ${{ steps.hash.outputs.sha256 }}
+
+            Assinatura digital: ${{ steps.signing.outputs.signed == 'true' && 'assinado (Authenticode com carimbo de tempo).' || 'NÃO assinado — o Windows pode exibir um aviso ao abrir o arquivo. Baixe apenas nesta página oficial.' }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
