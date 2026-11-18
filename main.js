@@ -477,7 +477,7 @@ function watchTray() {
 }
 app.whenReady().then(async () => {
   // Primeiro aplica a escolha feita no instalador, sem criar uma pasta padrao.
-  syncEngine = new SyncEngine(requestSync);
+  syncEngine = new SyncEngine(requestSync, app.getPath("userData"));
   transferHistory = new TransferHistory(app.getPath("userData"), syncEngine);
   serverTunnel = new ServerTunnel({ userDataDir: app.getPath("userData"), app, onState: refreshTrayMenu });
   // A bandeja é o único caminho de volta para o aplicativo: ela nasce antes de
