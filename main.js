@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, dialog, Menu, shell, Tray, Notification, nativeImage, net } = require("electron");
+const { app, BrowserWindow, ipcMain, dialog, Menu, shell, Tray, Notification, nativeImage, net, powerMonitor } = require("electron");
 const path = require("path");
 const fs = require("fs/promises");
 const fsSync = require("fs");
@@ -26,6 +26,7 @@ const WEB_APP_URL = process.env.NODE_ENV === "development" ? "http://localhost:5
 // tela, para o servidor e o tunel subirem em segundo plano.
 const START_HIDDEN = process.argv.includes("--background");
 let mainWindow, tray, syncEngine, updater, transferHistory, serverTunnel, installHealth;
+let onlineTimer, trayTimer;
 let lastOnlineState = null;
 if (process.platform === "win32") app.setAppUserModelId("com.fortesdrive.desktop");
 const notificationQueue = [];
@@ -340,7 +341,13 @@ function createWindow() {
     if (isMainFrame && code !== -3) recoverPage();
   });
   mainWindow.on("closed", () => clearTimeout(reloadTimer));
-  mainWindow.on("close", event => { if (!app.isQuitting) { event.preventDefault(); mainWindow.hide(); } });
+  mainWindow.on("close", event => {
+    if (app.isQuitting) return;
+    // Sem bandeja, esconder a janela deixaria o aplicativo invisível e sem como
+    // ser reaberto: nesse caso ele fecha de verdade.
+    if (!tray || tray.isDestroyed()) { app.isQuitting = true; app.quit(); return; }
+    event.preventDefault(); mainWindow.hide();
+  });
 }
 // Estado do tunel no topo do menu da bandeja, regenerado a cada mudanca.
 const TUNNEL_LABELS = { stopped: "Túnel: parado", starting: "Túnel: iniciando...", online: "Túnel: conectado", reconnecting: "Túnel: reconectando...", error: "Túnel: erro" };
@@ -401,21 +408,11 @@ function appTrayIcon() {
   return bundled.isEmpty() ? null : bundled.resize({ width: 16, height: 16 });
 }
 
-async function createTray() {
-  if (tray && !tray.isDestroyed()) return tray;
-  let icon = appTrayIcon();
-  if (!icon) icon = await app.getFileIcon(process.execPath, { size: "small" }).catch(() => null);
-  if (!icon || icon.isEmpty()) {
-    console.warn("Bandeja: ícone do aplicativo indisponível neste computador.");
-    return null;
-  }
-  tray = new Tray(icon);
-  tray.setToolTip("FortesDrive");
-  refreshTrayMenu();
-  tray.on("click", showWindow);
-  tray.on("double-click", showWindow);
-
-  // Monitora conexão de internet no processo principal
+// Monitora conexão de internet no processo principal. Fica fora da criação da
+// bandeja porque a bandeja pode ser recriada; um monitor por criação acumularia
+// avisos repetidos de conexão.
+function startOnlineMonitor() {
+  if (onlineTimer) return;
   const checkOnline = () => {
     const online = net.isOnline();
     if (lastOnlineState === false && online) {
@@ -428,14 +425,65 @@ async function createTray() {
     }
     lastOnlineState = online;
   };
-  setInterval(checkOnline, 5000);
+  onlineTimer = setInterval(checkOnline, 5000);
   lastOnlineState = net.isOnline();
+}
+
+// Ícone garantido para a bandeja: o do pacote, depois o do executável e, por
+// último, o desenho de estado. Antes, quando o ícone do pacote não era lido, a
+// criação desistia e a bandeja ficava sem nada — nenhum ícone aparecia.
+async function trayIcon() {
+  const bundled = appTrayIcon();
+  if (bundled) return bundled;
+  const fromExe = await app.getFileIcon(process.execPath, { size: "small" }).catch(() => null);
+  if (fromExe && !fromExe.isEmpty()) return fromExe;
+  return makeTrayIcon("synced");
+}
+
+async function createTray() {
+  if (tray && !tray.isDestroyed()) return tray;
+  tray = null;
+  const icon = await trayIcon();
+  try {
+    tray = new Tray(icon);
+  } catch (error) {
+    console.error("Bandeja: não foi possível criar o ícone: " + error.message);
+    return null;
+  }
+  tray.setToolTip("FortesDrive");
+  refreshTrayMenu();
+  tray.on("click", showWindow);
+  tray.on("double-click", showWindow);
+  startOnlineMonitor();
+  return tray;
+}
+
+// O ícone da bandeja some sem aviso quando o Windows recria a barra de tarefas
+// (troca de sessão, bloqueio/desbloqueio, reinício do Explorador). Sem bandeja,
+// o aplicativo não tem como ser reaberto: este pulso devolve o ícone sozinho.
+function watchTray() {
+  if (trayTimer) return;
+  trayTimer = setInterval(() => {
+    if (tray && !tray.isDestroyed()) return;
+    tray = null;
+    createTray().catch(error => console.error("Bandeja: " + error.message));
+  }, 20000);
+  const reinstall = () => {
+    if (tray && !tray.isDestroyed()) { tray.destroy(); tray = null; }
+    createTray().catch(error => console.error("Bandeja: " + error.message));
+  };
+  powerMonitor.on("unlock-screen", reinstall);
+  powerMonitor.on("resume", reinstall);
 }
 app.whenReady().then(async () => {
   // Primeiro aplica a escolha feita no instalador, sem criar uma pasta padrao.
   syncEngine = new SyncEngine(requestSync);
   transferHistory = new TransferHistory(app.getPath("userData"), syncEngine);
   serverTunnel = new ServerTunnel({ userDataDir: app.getPath("userData"), app, onState: refreshTrayMenu });
+  // A bandeja é o único caminho de volta para o aplicativo: ela nasce antes de
+  // qualquer passo que possa esperar o usuário (escolha de pasta) ou falhar.
+  await createTray();
+  watchTray();
   await serverTunnel.init();
   installHealth = createInstallHealth({ app });
   await installHealth.load();
