@@ -77,8 +77,8 @@ services:
       # integridade e origem da migração (a subpasta u/ da versão anterior).
       DATA_DIR: /data
       LEGACY_DIR: /data
-      MAX_CONCURRENT_UPLOADS: "30"
-      RATE_LIMIT_PER_MINUTE: "1800"
+      MAX_CONCURRENT_UPLOADS: "64"
+      RATE_LIMIT_PER_MINUTE: "60000"
       NEXTCLOUD_URL: http://nextcloud
       NEXTCLOUD_ROOT: FortesDrive
     volumes:

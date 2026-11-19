@@ -16,7 +16,7 @@ jobs:
       - run: npm install
       - run: node generate-icon.js
       - name: Test native transfers and updater
-        run: node --test tests/native.test.cjs tests/native-streams.test.cjs tests/updater.test.cjs tests/badge-setup.test.cjs tests/packaging.test.cjs tests/server-package.test.cjs tests/setup-handoff.test.cjs tests/installer-folder.test.cjs tests/transfer-history.test.cjs tests/gateway-uploads.test.cjs tests/storage-folder.test.cjs tests/install-health.test.cjs tests/storage-diagnostics.test.cjs tests/cloudflare-tunnel.test.cjs tests/docker-tunnel.test.cjs tests/continuous-monitor.test.cjs
+        run: node --test tests/native.test.cjs tests/native-streams.test.cjs tests/updater.test.cjs tests/badge-setup.test.cjs tests/packaging.test.cjs tests/server-package.test.cjs tests/setup-handoff.test.cjs tests/installer-folder.test.cjs tests/transfer-history.test.cjs tests/gateway-uploads.test.cjs tests/storage-folder.test.cjs tests/install-health.test.cjs tests/storage-diagnostics.test.cjs tests/cloudflare-tunnel.test.cjs tests/docker-tunnel.test.cjs tests/continuous-monitor.test.cjs tests/fast-first-scan.test.cjs
       - name: Build and test Explorer badges
         shell: cmd
         run: |
@@ -90,6 +90,8 @@ jobs:
           tag_name: v${{ steps.version.outputs.version }}
           name: FortesDrive Desktop ${{ steps.version.outputs.version }}
           body: |
+            Aceleracao massiva de varredura e envio: resumo SHA-256 em lotes paralelos nas threads nativas, indice incremental em segundo plano, conexoes HTTP persistentes de baixa latencia (TCP_NODELAY e buffers de 1 MB) e confirmacao de historico em lote.
+            Gateway 2.2.2: ate 64 envios simultaneos, limite de 60.000 requisicoes por minuto, passagem livre para objetos assinados e pool persistente no Nextcloud.
             Sincronizacao de pasta grande: a leitura deixou de travar o envio. A pasta e resumida em lotes e os arquivos ja lidos comecam a subir na mesma passagem; o painel mostra quantos faltam resumir e quanto ainda falta enviar.
             Enquanto a leitura nao termina, arquivo ainda nao lido nao e tratado como excluido: nada vai para a lixeira e nada sai da nuvem por engano.
             Repercusao das alteracoes entre a nuvem e todas as instancias: edicao, insercao e exclusao feitas em qualquer computador, no app ou no servidor chegam aos demais.

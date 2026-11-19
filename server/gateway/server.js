@@ -56,13 +56,13 @@ const MAX_UPLOAD_BYTES = Number(process.env.MAX_UPLOAD_BYTES || 10737418240);
 // Envio em lote: o cliente manda até 30 arquivos ao mesmo tempo. O gateway
 // aceita esses 30 e, se chegar mais, o arquivo espera a vez (acquireUploadSlot)
 // em vez de ser recusado — a fila nunca para no meio.
-const MAX_CONCURRENT_UPLOADS = Number(process.env.MAX_CONCURRENT_UPLOADS || 30);
-// Sincronização em lote faz muitas chamadas por minuto: o limite existe para
-// barrar abuso, não para atrapalhar o uso normal.
-const RATE_LIMIT_PER_MINUTE = Number(process.env.RATE_LIMIT_PER_MINUTE || 1800);
+const MAX_CONCURRENT_UPLOADS = Number(process.env.MAX_CONCURRENT_UPLOADS || 64);
+// Sincronização em lote faz dezenas de milhares de chamadas por minuto através do
+// mesmo túnel Cloudflare: o limite barra abuso sem frear transferências assinadas.
+const RATE_LIMIT_PER_MINUTE = Number(process.env.RATE_LIMIT_PER_MINUTE || 60000);
 // Tempo máximo que um arquivo espera por uma vaga antes de o cliente tentar de novo.
 const UPLOAD_SLOT_WAIT_MS = Number(process.env.UPLOAD_SLOT_WAIT_MS || 120000);
-const VERSION = '2.2.1';
+const VERSION = '2.2.2';
 const STARTED_AT = Date.now();
 const MAX_SIGNATURE_LIFETIME_MS = 25 * 3600 * 1000;
 // Pasta onde estão os arquivos gravados antes da migração (o volume da pasta
@@ -718,7 +718,9 @@ const server = http.createServer(async (req, res) => {
       });
     }
 
-    if (rateLimited(clientIp(req))) {
+    // Transferências com assinatura HMAC válida não sofrem bloqueio por IP do túnel;
+    // apenas requisições inválidas ou fora de /v1/objects passam pelo freio de taxa.
+    if (!url.pathname.startsWith('/v1/objects/') && rateLimited(clientIp(req))) {
       return sendJson(res, 429, { error: 'Muitas requisições. Aguarde um instante.' });
     }
 
@@ -747,7 +749,10 @@ const server = http.createServer(async (req, res) => {
       }
 
       const failure = signatureError(url, op, key);
-      if (failure) return sendJson(res, 401, { error: failure });
+      if (failure) {
+        if (rateLimited(clientIp(req))) return sendJson(res, 429, { error: 'Muitas requisições. Aguarde um instante.' });
+        return sendJson(res, 401, { error: failure });
+      }
 
       if (op === 'put') {
         if (req.method !== 'PUT') return sendJson(res, 405, { error: 'Use PUT para enviar conteúdo.' });

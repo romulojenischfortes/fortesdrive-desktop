@@ -4,16 +4,18 @@ const { createReadStream } = require("node:fs");
 const os = require("node:os");
 const crypto = require("node:crypto");
 
-const SMALL_FILE_BYTES = 2 * 1024 * 1024;
-const STREAM_CHUNK = 4 * 1024 * 1024;
+const SMALL_FILE_BYTES = 8 * 1024 * 1024;
+const STREAM_CHUNK = 8 * 1024 * 1024;
+const EMPTY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+const fastSha256 = typeof crypto.hash === "function"
+  ? (buf) => crypto.hash("sha256", buf, "hex")
+  : (buf) => crypto.createHash("sha256").update(buf).digest("hex");
 
 async function computeFileHash(file, size) {
-  if (size === 0) {
-    return crypto.createHash("sha256").digest("hex");
-  }
+  if (size === 0) return EMPTY_SHA256;
   if (size != null && size <= SMALL_FILE_BYTES) {
     const buffer = await fs.readFile(file);
-    return crypto.createHash("sha256").update(buffer).digest("hex");
+    return fastSha256(buffer);
   }
   const hash = crypto.createHash("sha256");
   for await (const chunk of createReadStream(file, { highWaterMark: STREAM_CHUNK })) {
@@ -22,23 +24,39 @@ async function computeFileHash(file, size) {
   return hash.digest("hex");
 }
 
+async function hashOneFile(file, size) {
+  const digest = await computeFileHash(file, size);
+  const after = await fs.stat(file);
+  return {
+    digest,
+    after: {
+      size: after.size,
+      mtimeMs: after.mtimeMs,
+      ctimeMs: after.ctimeMs,
+      dev: after.dev,
+      ino: after.ino,
+    },
+  };
+}
+
 if (!isMainThread && parentPort) {
-  parentPort.on("message", async ({ id, file, size }) => {
+  parentPort.on("message", async (msg) => {
+    const { id, batch, file, size } = msg;
+    if (Array.isArray(batch)) {
+      const results = await Promise.all(batch.map(async (entry) => {
+        try {
+          const res = await hashOneFile(entry.file, entry.size);
+          return { ok: true, digest: res.digest, after: res.after };
+        } catch (error) {
+          return { ok: false, error: error.message || "Falha ao ler arquivo" };
+        }
+      }));
+      parentPort.postMessage({ id, ok: true, results });
+      return;
+    }
     try {
-      const digest = await computeFileHash(file, size);
-      const after = await fs.stat(file);
-      parentPort.postMessage({
-        id,
-        ok: true,
-        digest,
-        after: {
-          size: after.size,
-          mtimeMs: after.mtimeMs,
-          ctimeMs: after.ctimeMs,
-          dev: after.dev,
-          ino: after.ino,
-        },
-      });
+      const res = await hashOneFile(file, size);
+      parentPort.postMessage({ id, ok: true, digest: res.digest, after: res.after });
     } catch (error) {
       parentPort.postMessage({ id, ok: false, error: error.message || "Falha ao ler arquivo" });
     }
@@ -46,8 +64,8 @@ if (!isMainThread && parentPort) {
 } else {
   const { Worker } = require("node:worker_threads");
   const cpuCount = typeof os.availableParallelism === "function" ? os.availableParallelism() : (os.cpus()?.length || 4);
-  const POOL_SIZE = Math.max(2, Math.min(8, cpuCount - 1));
-  const MAX_INFLIGHT_PER_WORKER = 4;
+  const POOL_SIZE = Math.max(4, Math.min(16, cpuCount));
+  const MAX_INFLIGHT_PER_WORKER = 12;
 
   let workers = null;
   let idleTimer = null;
@@ -81,7 +99,7 @@ if (!isMainThread && parentPort) {
         if (task) {
           clearTimeout(task.timer);
           pendingTasks.delete(msg.id);
-          if (msg.ok) task.resolve({ digest: msg.digest, after: msg.after });
+          if (msg.ok) task.resolve(msg.results ? msg.results : { digest: msg.digest, after: msg.after });
           else task.reject(new Error(msg.error));
         }
         pump();
@@ -139,11 +157,12 @@ if (!isMainThread && parentPort) {
       }, item.timeoutMs);
       timer.unref?.();
       pendingTasks.set(id, { resolve: item.resolve, reject: item.reject, timer, slot: best });
-      best.worker.postMessage({ id, file: item.file, size: item.size });
+      if (item.batch) best.worker.postMessage({ id, batch: item.batch });
+      else best.worker.postMessage({ id, file: item.file, size: item.size });
     }
   }
 
-  async function runFallback({ file, size, timeoutMs, resolve, reject }) {
+  async function runFallback({ file, size, batch, timeoutMs, resolve, reject }) {
     let timer;
     const timeout = new Promise((_, rej) => {
       timer = setTimeout(() => {
@@ -154,14 +173,16 @@ if (!isMainThread && parentPort) {
     });
     try {
       const result = await Promise.race([
-        (async () => {
-          const digest = await computeFileHash(file, size);
-          const after = await fs.stat(file);
-          return {
-            digest,
-            after: { size: after.size, mtimeMs: after.mtimeMs, ctimeMs: after.ctimeMs, dev: after.dev, ino: after.ino },
-          };
-        })(),
+        batch
+          ? Promise.all(batch.map(async (entry) => {
+              try {
+                const res = await hashOneFile(entry.file, entry.size);
+                return { ok: true, digest: res.digest, after: res.after };
+              } catch (error) {
+                return { ok: false, error: error.message || "Falha ao ler arquivo" };
+              }
+            }))
+          : hashOneFile(file, size),
         timeout,
       ]);
       resolve(result);
@@ -180,6 +201,14 @@ if (!isMainThread && parentPort) {
     });
   }
 
+  function hashBatch(batch, timeoutMs = 120000) {
+    clearTimeout(idleTimer);
+    return new Promise((resolve, reject) => {
+      taskQueue.push({ batch, timeoutMs, resolve, reject });
+      pump();
+    });
+  }
+
   function shutdownPool() {
     clearTimeout(idleTimer);
     idleTimer = null;
@@ -191,5 +220,5 @@ if (!isMainThread && parentPort) {
     }
   }
 
-  module.exports = { computeFileHash, hashAndStat, shutdownPool, POOL_SIZE };
+  module.exports = { computeFileHash, hashAndStat, hashBatch, shutdownPool, POOL_SIZE, SMALL_FILE_BYTES };
 }

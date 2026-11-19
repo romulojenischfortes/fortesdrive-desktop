@@ -247,10 +247,57 @@ function registerHandlers() {
       const result = await transferHistory.add(userId, event);
       if (result.added) {
         const item = result.item;
-        const absolute = await native.safePath(syncEngine.watchFolder, item.path);
-        const stat = await fs.stat(absolute);
-        await syncEngine.badges.confirm(item.path, { size: event.size, mtimeMs: event.mtimeMs ?? stat.mtimeMs }).catch(error => { syncEngine.state.badgeError = error.message; });
-        notify(item.direction === "download" ? "FortesDrive — Download concluído" : "FortesDrive — Arquivo sincronizado", item.path, "normal", () => shell.showItemInFolder(absolute));
+        let mtimeMs = event.mtimeMs;
+        if (mtimeMs == null) {
+          const absolute = await native.safePath(syncEngine.watchFolder, item.path);
+          mtimeMs = (await fs.stat(absolute)).mtimeMs;
+        }
+        await syncEngine.badges.confirm(item.path, { size: event.size, mtimeMs }).catch(error => { syncEngine.state.badgeError = error.message; });
+        const now = Date.now();
+        if (!syncEngine.lastCompletionToastAt || now - syncEngine.lastCompletionToastAt >= 4000) {
+          syncEngine.lastCompletionToastAt = now;
+          notify(item.direction === "download" ? "FortesDrive — Download concluído" : "FortesDrive — Arquivo sincronizado", item.path, "normal", () => {
+            native.safePath(syncEngine.watchFolder, item.path).then(abs => shell.showItemInFolder(abs)).catch(() => {});
+          });
+        }
+        mainWindow?.webContents.send("sync:transferCompleted");
+      }
+      return true;
+    },
+    recordTransferCompletions: async (userId, events) => {
+      if (!Array.isArray(events) || !events.length) return true;
+      const results = await transferHistory.addBatch(userId, events);
+      let addedCount = 0;
+      let lastItem = null;
+      for (let i = 0; i < results.length; i++) {
+        const res = results[i];
+        if (!res?.added) continue;
+        addedCount++;
+        lastItem = res.item;
+        const ev = events[i];
+        let mtimeMs = ev.mtimeMs;
+        if (mtimeMs == null) {
+          try {
+            const abs = await native.safePath(syncEngine.watchFolder, res.item.path);
+            mtimeMs = (await fs.stat(abs)).mtimeMs;
+          } catch {}
+        }
+        if (mtimeMs != null) {
+          await syncEngine.badges.confirm(res.item.path, { size: ev.size, mtimeMs }).catch(error => { syncEngine.state.badgeError = error.message; });
+        }
+      }
+      if (addedCount > 0) {
+        const now = Date.now();
+        if (!syncEngine.lastCompletionToastAt || now - syncEngine.lastCompletionToastAt >= 4000) {
+          syncEngine.lastCompletionToastAt = now;
+          if (addedCount === 1 && lastItem) {
+            notify(lastItem.direction === "download" ? "FortesDrive — Download concluído" : "FortesDrive — Arquivo sincronizado", lastItem.path, "normal", () => {
+              native.safePath(syncEngine.watchFolder, lastItem.path).then(abs => shell.showItemInFolder(abs)).catch(() => {});
+            });
+          } else {
+            notify("FortesDrive — Arquivos sincronizados", `${addedCount} arquivos concluídos neste lote.`, "normal");
+          }
+        }
         mainWindow?.webContents.send("sync:transferCompleted");
       }
       return true;

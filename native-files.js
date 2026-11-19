@@ -1,20 +1,12 @@
 const fs = require("fs/promises");
 const path = require("path");
 const crypto = require("crypto");
-const { createReadStream } = require("fs");
+const hashPool = require("./hash-pool");
 const MAX_BYTES = 100 * 1024 * 1024; // IPC legado: nunca carrega arquivos grandes na RAM.
 const MAX_SCAN_BYTES = 10 * 1024 * 1024 * 1024;
 
 async function checksum(file, size) {
-  // Arquivo pequeno: uma leitura só custa menos que abrir um fluxo, e é nesta
-  // faixa que está a maior parte dos documentos.
-  if (size != null && size <= SMALL_FILE_BYTES) {
-    const buffer = await fs.readFile(file);
-    return crypto.createHash("sha256").update(buffer).digest("hex");
-  }
-  const hash = crypto.createHash("sha256");
-  for await (const chunk of createReadStream(file, { highWaterMark: STREAM_CHUNK })) hash.update(chunk);
-  return hash.digest("hex");
+  return hashPool.computeFileHash(file, size);
 }
 // Resumo (SHA-256) reaproveitado entre varreduras. Sem isso, cada ciclo de
 // sincronização relia e resumia a árvore inteira — o maior gasto de tempo do
@@ -101,37 +93,42 @@ function remember(root, relative, entry) {
   saveIndexSoon();
 }
 
+const verifiedDirs = new Map();
+const VERIFIED_DIR_TTL_MS = 5000;
+
 async function safePath(root, relative, createParents = false) {
   if (typeof relative !== "string" || !relative || relative.includes("\\") || relative.includes("\0")) throw new Error("Caminho inválido");
   const parts = relative.split("/");
   if (parts.some(p => !validName(p))) throw new Error(`Nome incompatível com o computador: ${relative}`);
+  const now = Date.now();
+  if (verifiedDirs.size > 20000) verifiedDirs.clear();
   let current = root;
   for (let i = 0; i < parts.length; i++) {
     current = path.join(current, parts[i]);
+    const isParent = i < parts.length - 1;
+    if (isParent) {
+      const cachedAt = verifiedDirs.get(current);
+      if (cachedAt && now - cachedAt < VERIFIED_DIR_TTL_MS) continue;
+    }
     let stat;
     try { stat = await fs.lstat(current); } catch (e) { if (e.code !== "ENOENT") throw e; }
-    if (stat?.isSymbolicLink()) throw new Error("Links simbólicos não são sincronizados");
-    if (i < parts.length - 1 && !stat && createParents) await fs.mkdir(current);
-    if (i < parts.length - 1 && stat && !stat.isDirectory()) throw new Error("Uma pasta foi substituída por um arquivo");
+    if (stat?.isSymbolicLink()) { verifiedDirs.delete(current); throw new Error("Links simbólicos não são sincronizados"); }
+    if (isParent && !stat && createParents) { await fs.mkdir(current); verifiedDirs.set(current, now); continue; }
+    if (isParent && stat && !stat.isDirectory()) { verifiedDirs.delete(current); throw new Error("Uma pasta foi substituída por um arquivo"); }
+    if (isParent && stat?.isDirectory()) verifiedDirs.set(current, now);
   }
   return current;
 }
 // A varredura precisa terminar depressa mesmo com dezenas de milhares de
-// arquivos. O que pesa não é o tamanho da pasta, e sim a quantidade de idas ao
-// disco: uma consulta por vez levava minutos só para listar a árvore. Agora as
-// pastas e os itens são consultados em paralelo, como fazem os clientes de
-// sincronização de mercado.
-const READDIR_LANES = 8;    // pastas listadas ao mesmo tempo
-const STAT_LANES = 32;      // informações de itens pedidas ao mesmo tempo
-const HASH_LANES = 24;      // arquivos resumidos ao mesmo tempo
-// Arquivo pequeno é resumido numa leitura só; os grandes vão em fluxo, com
-// blocos maiores para reduzir as chamadas ao disco.
-const SMALL_FILE_BYTES = 1024 * 1024;
-const STREAM_CHUNK = 1024 * 1024;
+// arquivos. Pastas, metadados e resumos SHA-256 saturam SSDs NVMe modernos.
+const READDIR_LANES = 64;   // pastas listadas ao mesmo tempo em paralelo
+const STAT_LANES = 256;     // informações de itens pedidas ao mesmo tempo
+const HASH_LANES = 96;      // arquivos/lotes despachados simultaneamente ao pool multi-thread
+const SMALL_HASH_BATCH = 32;
 // Uma única pasta ou arquivo que não responde (disco removido, OneDrive que
 // nunca baixa) não pode segurar a pasta inteira: cada operação tem o seu limite.
 const OP_TIMEOUT_MS = 20 * 1000;
-const READ_TIMEOUT_MS = 120 * 1000;
+const READ_TIMEOUT_MS = 180 * 1000;
 // Um arquivo que não respondeu volta para a fila das próximas passagens; só
 // depois de algumas tentativas ele é dado como fora da sincronização.
 const READ_TRIES = 3;
@@ -140,14 +137,9 @@ const READDIR_TRIES = 2;
 // A raiz é a única pasta sem a qual nada pode ser concluído: ela tem prazo mais
 // longo que as demais.
 const ROOT_TIMEOUT_MS = 60 * 1000;
-// Quanto tempo de resumo (SHA-256) uma passagem faz antes de devolver o
-// controle. A árvore da pasta é conhecida em segundos e o que já foi resumido
-// começa a subir na hora; o restante continua na passagem seguinte, sem reler
-// o que já foi lido.
-// Passagens mais longas: cada faixa de leitura é seguida de uma rodada de
-// planejamento e transferência, e uma passagem curta demais gastava mais tempo
-// em contabilidade do que lendo os arquivos.
-const HASH_BUDGET_MS = 45 * 1000;
+// A primeira passagem percorre toda a árvore e já libera os primeiros milhares de
+// arquivos em poucos segundos para o upload iniciar na hora.
+const HASH_BUDGET_MS = 2500;
 
 function withTimeout(promise, ms, message) {
   let timer;
@@ -175,7 +167,7 @@ function createLimiter(limit) {
 // conhecida numa passagem só; este estado guarda o resultado dela.
 const walks = new Map();
 function newWalk() {
-  return { files: [], pending: [], directories: [], skipped: [], seen: new Set(), totalFiles: 0, totalBytes: 0, walked: false, walkMs: 0, complete: false };
+  return { files: [], pending: [], directories: [], skipped: [], seen: new Set(), totalFiles: 0, totalBytes: 0, hashedBytes: 0, startedAt: Date.now(), walked: false, walkMs: 0, complete: false };
 }
 
 /**
@@ -251,7 +243,18 @@ async function scan(root, baseline = {}, { hashBudget = Infinity, hashBudgetMs =
   const report = (force = false) => {
     if (!force && Date.now() - lastReport < 150) return;
     lastReport = Date.now();
-    try { onProgress?.({ total: walk.totalFiles, hashed: walk.files.length, pending: walk.pending.length, walking: !walk.walked }); } catch (e) {}
+    const elapsedSec = Math.max(0.001, (Date.now() - walk.startedAt) / 1000);
+    try {
+      onProgress?.({
+        total: walk.totalFiles,
+        hashed: walk.files.length,
+        pending: walk.pending.length,
+        totalBytes: walk.totalBytes,
+        hashedBytes: walk.hashedBytes,
+        bytesPerSec: Math.round(walk.hashedBytes / elapsedSec),
+        walking: !walk.walked,
+      });
+    } catch (e) {}
   };
   const describe = (relative, stat, identity, digest) => ({ path: relative, name: relative.slice(relative.lastIndexOf("/") + 1), size: stat.size, mtimeMs: stat.mtimeMs, ctimeMs: stat.ctimeMs, checksum: digest, identity });
   report(true);
@@ -270,18 +273,26 @@ async function scan(root, baseline = {}, { hashBudget = Infinity, hashBudgetMs =
     }
     walk.walked = true;
     walk.walkMs = Date.now() - startedAt;
+    
     // Quem já tem resumo válido (mesmo dono, tamanho e datas) volta sem reler o
     // conteúdo; só o que mudou ou nunca foi lido entra na fila do resumo.
-    walk.pending = walk.pending.filter(item => {
-      // Mesmo tamanho, mesma data e mesmo dono no disco: o conteúdo é o mesmo
-      // de quando foi resumido. A data de criação (ctime) fica de fora porque o
-      // Windows a altera em renomeações, o que resumiria arquivos intactos.
+    const newPending = [];
+    for (const item of walk.pending) {
       const known = checksums.get(item.relative);
       const sameIdentity = !known?.identity || !item.identity || known.identity === item.identity;
-      if (!known || known.size !== item.stat.size || known.mtimeMs !== item.stat.mtimeMs || !sameIdentity) return true;
-      walk.files.push(describe(item.relative, item.stat, item.identity, known.checksum));
-      return false;
-    });
+      if (!known || known.size !== item.stat.size || known.mtimeMs !== item.stat.mtimeMs || !sameIdentity) {
+        newPending.push(item);
+      } else {
+        walk.hashedBytes += item.stat.size;
+        walk.files.push(describe(item.relative, item.stat, item.identity, known.checksum));
+      }
+    }
+    
+    // Ordena os que precisam de resumo: os pequenos primeiro. Assim a primeira
+    // faixa já entrega milhares de arquivos resumidos, que sobem enquanto os 
+    // vídeos pesados e imagens ISO, que travam as faixas nas posições de leitura
+    // onde calharam de cair, ficam para as faixas finais da verificação.
+    walk.pending = newPending.sort((a, b) => a.stat.size - b.stat.size);
     report(true);
   }
 
@@ -293,22 +304,62 @@ async function scan(root, baseline = {}, { hashBudget = Infinity, hashBudgetMs =
   const hashing = walk.pending.splice(0, slice);
   const deadline = hashBudgetMs === Infinity ? Infinity : Date.now() + hashBudgetMs;
   let next = 0;
+  const acceptHashed = (item, digest, after) => {
+    if (item.stat.size !== after.size || item.stat.mtimeMs !== after.mtimeMs) {
+      remember(root, item.relative, null);
+      walk.skipped.push({ path: item.relative, reason: "Arquivo em edição ou download" });
+      return;
+    }
+    const identity = `${after.dev}:${after.ino}`;
+    remember(root, item.relative, { size: after.size, mtimeMs: after.mtimeMs, ctimeMs: after.ctimeMs, identity, checksum: digest });
+    walk.hashedBytes += after.size;
+    walk.files.push(describe(item.relative, after, identity, digest));
+    if (walk.files.length % 50 === 0) report();
+  };
+  const failHashed = (item, e) => {
+    item.tries++;
+    if (e.timeout && item.tries < READ_TRIES) walk.pending.push(item);
+    else walk.skipped.push({ path: item.relative, reason: "Não foi possível ler: " + e.message });
+  };
   await Promise.all(Array.from({ length: Math.min(HASH_LANES, hashing.length) }, async () => {
     while (next < hashing.length) {
       if (Date.now() > deadline) break;
-      const item = hashing[next++];
+      const first = hashing[next++];
+      // Agrupa arquivos pequenos num único despacho para a worker_thread:
+      // elimina dezenas de milhares de mensagens IPC individuais.
+      if (first.stat.size > 0 && first.stat.size <= 512 * 1024 && typeof hashPool.hashBatch === "function") {
+        const group = [first];
+        let groupBytes = first.stat.size;
+        while (group.length < SMALL_HASH_BATCH && next < hashing.length && hashing[next].stat.size > 0 && hashing[next].stat.size <= 512 * 1024 && groupBytes + hashing[next].stat.size <= 4 * 1024 * 1024) {
+          const candidate = hashing[next++];
+          group.push(candidate);
+          groupBytes += candidate.stat.size;
+        }
+        try {
+          const results = await hashPool.hashBatch(group.map(it => ({ file: nativePath(it.absolute), size: it.stat.size })), READ_TIMEOUT_MS);
+          for (let i = 0; i < group.length; i++) {
+            const res = results[i];
+            if (res?.ok) acceptHashed(group[i], res.digest, res.after);
+            else failHashed(group[i], new Error(res?.error || "Falha ao ler arquivo"));
+          }
+        } catch (e) {
+          for (const it of group) failHashed(it, e);
+        }
+        continue;
+      }
       try {
-        const digest = await withTimeout(checksum(nativePath(item.absolute), item.stat.size), READ_TIMEOUT_MS, "A leitura do arquivo demorou demais");
-        const after = await withTimeout(fs.stat(nativePath(item.absolute)), OP_TIMEOUT_MS, "O arquivo demorou demais para responder");
-        if (item.stat.size !== after.size || item.stat.mtimeMs !== after.mtimeMs) { remember(root, item.relative, null); walk.skipped.push({ path: item.relative, reason: "Arquivo em edição ou download" }); continue; }
-        const identity = `${after.dev}:${after.ino}`;
-        remember(root, item.relative, { size: after.size, mtimeMs: after.mtimeMs, ctimeMs: after.ctimeMs, identity, checksum: digest });
-        walk.files.push(describe(item.relative, after, identity, digest));
-        if (walk.files.length % 25 === 0) report();
+        let digest, after;
+        if (first.stat.size === 0) {
+          digest = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+          after = await withTimeout(fs.stat(nativePath(first.absolute)), OP_TIMEOUT_MS, "O arquivo demorou demais para responder");
+        } else {
+          const verified = await hashPool.hashAndStat(nativePath(first.absolute), first.stat.size, READ_TIMEOUT_MS);
+          digest = verified.digest;
+          after = verified.after;
+        }
+        acceptHashed(first, digest, after);
       } catch (e) {
-        item.tries++;
-        if (e.timeout && item.tries < READ_TRIES) walk.pending.push(item);
-        else walk.skipped.push({ path: item.relative, reason: "Não foi possível ler: " + e.message });
+        failHashed(first, e);
       }
     }
   }));
@@ -323,9 +374,12 @@ async function scan(root, baseline = {}, { hashBudget = Infinity, hashBudgetMs =
     for (const key of [...index.keys()]) if (!walk.seen.has(key)) { index.delete(key); indexDirty = true; }
     saveIndexSoon();
   }
+  const elapsedSec = Math.max(0.001, (Date.now() - walk.startedAt) / 1000);
   return {
     files: walk.files, directories: walk.directories, skipped: walk.skipped,
     totalBytes: walk.totalBytes, totalFiles: walk.totalFiles,
+    hashedBytes: walk.hashedBytes,
+    bytesPerSec: Math.round(walk.hashedBytes / elapsedSec),
     pendingHash: walk.pending.length, pendingBytes: walk.pending.reduce((sum, item) => sum + item.stat.size, 0),
     // `walked` diz que a árvore inteira já é conhecida (nomes, tamanhos e datas
     // de todos os arquivos). É a partir daí que o plano pode ser montado; o
@@ -381,6 +435,7 @@ async function write(root, relative, bytes, hash, expected) {
   return { size: saved.size, mtimeMs: saved.mtimeMs, identity: `${saved.dev}:${saved.ino}` };
 }
 async function move(root, from, to, expected) {
+  verifiedDirs.clear();
   const source = await safePath(root, from), destination = await safePath(root, to, true);
   await assertExpected(source, expected);
   await assertExpected(destination, null);
@@ -390,4 +445,31 @@ async function move(root, from, to, expected) {
   remember(root, to, { size: saved.size, mtimeMs: saved.mtimeMs, identity: `${saved.dev}:${saved.ino}`, checksum: expected });
   return { size: saved.size, mtimeMs: saved.mtimeMs, identity: `${saved.dev}:${saved.ino}` };
 }
-module.exports = { safePath, scan, read, write, move, checksum, assertExpected, configureIndex, MAX_BYTES, MAX_SCAN_BYTES };
+/**
+ * Retorna um retrato instantâneo da varredura em andamento (sem esperar o fim
+ * do lote atual de SHA-256), permitindo que a sincronização envie arquivos já
+ * verificados enquanto os workers continuam lendo o restante em paralelo.
+ */
+function peekScan(root) {
+  if (cacheRoot !== root) return null;
+  const walk = walks.get(root);
+  if (!walk || !walk.walked || walk.complete) return null;
+  const elapsedSec = Math.max(0.001, (Date.now() - walk.startedAt) / 1000);
+  return {
+    files: walk.files.slice(),
+    directories: walk.directories.slice(),
+    skipped: walk.skipped.slice(),
+    totalBytes: walk.totalBytes,
+    totalFiles: walk.totalFiles,
+    hashedBytes: walk.hashedBytes,
+    bytesPerSec: Math.round(walk.hashedBytes / elapsedSec),
+    pendingHash: walk.pending.length,
+    pendingBytes: walk.pending.reduce((sum, item) => sum + item.stat.size, 0),
+    walked: true,
+    complete: false,
+    walkMs: walk.walkMs,
+    unread: walk.pending.length ? walk.pending.slice(0, 20000).map(item => item.relative) : [],
+  };
+}
+
+module.exports = { safePath, scan, peekScan, read, write, move, checksum, assertExpected, configureIndex, shutdownPool: hashPool.shutdownPool, MAX_BYTES, MAX_SCAN_BYTES };

@@ -7,7 +7,7 @@ const channels = {
   moveFile: "moveFile", trashFile: "trashFile", mkdir: "mkdir", rmdir: "rmdir",
   getManifest: "getManifest", saveManifest: "saveManifest", setState: "setState",
   notify: "notify", publishSyncStatus: "publishSyncStatus",
-  recordTransferCompletion: "recordTransferCompletion", getTransferHistory: "getTransferHistory",
+  recordTransferCompletion: "recordTransferCompletion", recordTransferCompletions: "recordTransferCompletions", getTransferHistory: "getTransferHistory",
   exportTransferHistory: "exportTransferHistory", revealTransferHistoryItem: "revealTransferHistoryItem",
   getBadgeSetup: "getBadgeSetup", repairBadges: "repairBadges",
   getUpdateStatus: "getUpdateStatus", checkForUpdates: "checkForUpdates",

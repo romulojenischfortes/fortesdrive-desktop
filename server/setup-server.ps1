@@ -520,8 +520,8 @@ $senhaBancoRaiz = Manter-Ou-Gerar 'NEXTCLOUD_DB_ROOT_PASSWORD' 18
 
 $linhasEnv = @(
   ('STORAGE_SIGNING_SECRET=' + $segredo),
-  'MAX_CONCURRENT_UPLOADS=30',
-  'RATE_LIMIT_PER_MINUTE=1800',
+  'MAX_CONCURRENT_UPLOADS=64',
+  'RATE_LIMIT_PER_MINUTE=60000',
   ('NEXTCLOUD_ADMIN_USER=' + $usuarioNextcloud),
   ('NEXTCLOUD_ADMIN_PASSWORD=' + $senhaNextcloud),
   # NEXTCLOUD_USER é o nome que o gateway lê. Sem esta linha ele não se

@@ -22,6 +22,13 @@ const fsp = require('node:fs/promises');
 const fs = require('node:fs');
 const path = require('node:path');
 
+const davAgents = {
+  'http:': new http.Agent({ keepAlive: true, keepAliveMsecs: 30000, maxSockets: 96, maxFreeSockets: 32, scheduling: 'lifo' }),
+  'https:': new https.Agent({ keepAlive: true, keepAliveMsecs: 30000, maxSockets: 96, maxFreeSockets: 32, scheduling: 'lifo' }),
+};
+const ensuredParents = new Set();
+const ensuringParents = new Map();
+
 const CONTENT_TYPES = {
   jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', gif: 'image/gif',
   webp: 'image/webp', avif: 'image/avif', bmp: 'image/bmp', heic: 'image/heic',
@@ -82,6 +89,7 @@ function open(method, target, headers = {}) {
       hostname: base.hostname,
       port: base.port || (base.protocol === 'https:' ? 443 : 80),
       path: requestPath,
+      agent: davAgents[base.protocol],
       headers: {
         Authorization: auth,
         'User-Agent': 'FortesDrive-Gateway',
@@ -119,24 +127,39 @@ function send(method, target, { headers = {}, body = null, timeoutMs = 60000 } =
   });
 }
 
-/** Cria as pastas pai do objeto, uma a uma (405 = já existe). */
-async function ensureParents(key) {
+/** Cria as pastas pai do objeto uma única vez por diretório (405 = já existe). */
+async function ensureParents(key, force = false) {
   const cfg = config();
   const segments = [cfg.root, ...String(key).split('/').slice(0, -1).filter(Boolean)];
-  let target = '';
-  for (const segment of segments) {
-    target += '/' + encodeURIComponent(segment);
-    const result = await send('MKCOL', target, { timeoutMs: 30000 });
-    if (result.status >= 400 && result.status !== 405) {
-      // 409 = ainda faltava uma pasta acima; 423 = bloqueado por outra operação.
-      if (result.status !== 409) {
-        const error = new Error('Não foi possível preparar a pasta no Nextcloud (' + result.status + ').');
-        // O status viaja junto para o diagnóstico dizer o motivo real.
-        error.status = result.status;
-        throw error;
+  const fullTarget = '/' + segments.map(s => encodeURIComponent(s)).join('/');
+  const cacheKey = cfg.url + '|' + cfg.user + '|' + fullTarget;
+  if (!force && ensuredParents.has(cacheKey)) return;
+  if (!force && ensuringParents.has(cacheKey)) return ensuringParents.get(cacheKey);
+
+  const job = (async () => {
+    let target = '';
+    for (const segment of segments) {
+      target += '/' + encodeURIComponent(segment);
+      const stepKey = cfg.url + '|' + cfg.user + '|' + target;
+      if (!force && ensuredParents.has(stepKey)) continue;
+      const result = await send('MKCOL', target, { timeoutMs: 30000 });
+      if (result.status >= 400 && result.status !== 405) {
+        if (result.status !== 409 && result.status !== 423) {
+          const error = new Error('Não foi possível preparar a pasta no Nextcloud (' + result.status + ').');
+          error.status = result.status;
+          throw error;
+        }
+      } else {
+        ensuredParents.add(stepKey);
       }
     }
-  }
+    ensuredParents.add(cacheKey);
+  })().finally(() => {
+    ensuringParents.delete(cacheKey);
+  });
+
+  ensuringParents.set(cacheKey, job);
+  return job;
 }
 
 /**
@@ -268,10 +291,7 @@ async function objectSize(key) {
  * Envia um arquivo já conferido (SHA-256) para o Nextcloud.
  * O cabeçalho OC-Checksum faz o próprio Nextcloud recusar conteúdo corrompido.
  */
-async function putFile(key, filePath, sha256Hex) {
-  const cfg = config();
-  const size = (await fsp.stat(filePath)).size;
-  await ensureParents(key);
+async function putFileOnce(cfg, key, filePath, size, sha256Hex) {
   return new Promise((resolve, reject) => {
     const headers = {
       'Content-Type': contentTypeFor(key),
@@ -307,6 +327,22 @@ async function putFile(key, filePath, sha256Hex) {
     source.on('error', reject);
     source.pipe(req);
   });
+}
+
+async function putFile(key, filePath, sha256Hex) {
+  const cfg = config();
+  const size = (await fsp.stat(filePath)).size;
+  await ensureParents(key);
+  try {
+    return await putFileOnce(cfg, key, filePath, size, sha256Hex);
+  } catch (error) {
+    if (error.upstreamStatus === 404 || error.upstreamStatus === 409) {
+      ensuredParents.clear();
+      await ensureParents(key, true);
+      return await putFileOnce(cfg, key, filePath, size, sha256Hex);
+    }
+    throw error;
+  }
 }
 
 /** Entrega o objeto ao cliente, respeitando Range (vídeo, retomada de download). */

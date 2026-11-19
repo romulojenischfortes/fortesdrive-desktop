@@ -43,3 +43,49 @@ test('acesso nativo: leitura, edição atômica, movimento, diretórios e prote�
     await assert.rejects(native.safePath(root, 'link/file.txt'), /simbólicos/);
   } finally { await fs.rm(root, { recursive: true, force: true }); }
 });
+test('nuvem que perdeu os registros nao apaga o computador: o conteudo volta a subir', async () => {
+  const { planDesktopSync } = await import('../../src/lib/desktopSyncPlan.js');
+  const baseline = {}, locals = [];
+  for (let i = 1; i <= 30; i += 1) {
+    baseline['f' + i] = { path: `pasta/${i}.txt`, checksum: 'A', version: 1, identity: `${i}:${i}` };
+    locals.push({ path: `pasta/${i}.txt`, checksum: 'A', identity: `${i}:${i}`, size: 1 });
+  }
+  assert.deepEqual(planDesktopSync(locals, [], baseline).map(a => a.type), Array(30).fill('upload'));
+});
+test('registro perdido sem lapide volta a subir em vez de apagar o computador', async () => {
+  const { planDesktopSync } = await import('../../src/lib/desktopSyncPlan.js');
+  const baseline = {}, locals = [];
+  for (let i = 1; i <= 30; i += 1) {
+    baseline['f' + i] = { path: `pasta/${i}.txt`, checksum: 'A', version: 1, identity: `${i}:${i}` };
+    locals.push({ path: `pasta/${i}.txt`, checksum: 'A', identity: `${i}:${i}`, size: 1 });
+  }
+  const cloud = Object.entries(baseline).slice(1)
+    .map(([id, b]) => ({ id, path: b.path, checksum: 'A', currentVersion: 1, status: 'SYNCED' }));
+  const actions = planDesktopSync(locals, cloud, baseline);
+  // O registro que sumiu sem lápide é uma perda da nuvem, não uma exclusão: o
+  // arquivo do computador é reenviado (sem apagar nada do PC).
+  const lost = actions.find(a => a.recreateId === 'f1');
+  assert.ok(lost, 'o arquivo cujo registro sumiu precisa voltar para a nuvem');
+  assert.equal(lost.type, 'upload');
+  assert.equal(actions.filter(a => a.type === 'trashLocal').length, 0);
+  assert.equal(actions.filter(a => a.type === 'adopt').length, 29);
+});
+
+test('lapide da exclusao definitiva apaga o arquivo em todos os computadores', async () => {
+  const { planDesktopSync } = await import('../../src/lib/desktopSyncPlan.js');
+  const baseline = { f1: { path: 'pasta/1.txt', checksum: 'A', version: 1, identity: '1:1' } };
+  const locals = [{ path: 'pasta/1.txt', checksum: 'A', identity: '1:1', size: 1 }];
+  // A lixeira foi esvaziada: o registro saiu, restou a lápide dele.
+  const grave = { id: 'f1', path: '', status: 'DELETED', currentVersion: 0 };
+  assert.deepEqual(planDesktopSync(locals, [grave], baseline).map(a => a.type), ['trashLocal']);
+});
+
+test('arquivo que já existe no PC e ainda não foi lido não é baixado por cima', async () => {
+  const { planDesktopSync } = await import('../../src/lib/desktopSyncPlan.js');
+  const actions = planDesktopSync([], [remote], {}, [], { complete: false, unread: new Set([remote.path]) });
+  assert.deepEqual(actions, []);
+  // Sem o resumo pronto ele continua pendente; assim que o conteúdo é lido, a
+  // decisão volta a ser feita normalmente.
+  const decided = planDesktopSync([], [remote], {}, [], { complete: true });
+  assert.deepEqual(decided.map(action => action.type), ['download']);
+});

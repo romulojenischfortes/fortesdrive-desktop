@@ -32,6 +32,7 @@
       "transfer-history.js",
       "server-tunnel.js",
       "build/icon.png",
+      "hash-pool.js",
       "native-files.js",
       "native-transfers.js",
       "shell-status.js",

@@ -8,7 +8,12 @@ const { Transform } = require('node:stream');
 const { pipeline } = require('node:stream/promises');
 const native = require('./native-files');
 const MAX_TRANSFER_BYTES = 10 * 1024 * 1024 * 1024;
-const agents = { 'https:': new https.Agent({ keepAlive: true, maxSockets: 30 }), 'http:': new http.Agent({ keepAlive: true, maxSockets: 30 }) };
+const STREAM_HIGH_WATER_MARK = 1024 * 1024;
+const agents = {
+  'https:': new https.Agent({ keepAlive: true, keepAliveMsecs: 30000, maxSockets: 96, maxFreeSockets: 32, scheduling: 'lifo' }),
+  'http:': new http.Agent({ keepAlive: true, keepAliveMsecs: 30000, maxSockets: 96, maxFreeSockets: 32, scheduling: 'lifo' }),
+};
+const verifiedInternalDirs = new Map();
 
 function target(address, op, allowLocal = false) {
   const url = new URL(address);
@@ -34,6 +39,7 @@ function meter(hash, size, progress) {
 function request(url, method, headers) {
   const transport = url.protocol === 'https:' ? https : http;
   const req = transport.request(url, { method, headers, agent: agents[url.protocol] });
+  req.setNoDelay(true);
   req.setTimeout(120000, () => req.destroy(new Error('A transferência ficou sem resposta; o arquivo permanece pendente.')));
   return req;
 }
@@ -64,7 +70,7 @@ async function upload(root, relative, authorization, expected, progress, allowLo
     req.once('error', reject);
     req.once('response', response => responseJson(response).then(resolve, reject));
   });
-  const sent = pipeline(createReadStream(absolute, { highWaterMark: 256 * 1024 }), counter, req);
+  const sent = pipeline(createReadStream(absolute, { highWaterMark: STREAM_HIGH_WATER_MARK }), counter, req);
   const [body] = await Promise.all([received, sent]).catch(error => { req.destroy(error); throw error; });
   const after = await fs.lstat(absolute), digest = hash.digest('hex');
   if (counter.bytes() !== expected.size || after.size !== before.size || after.mtimeMs !== before.mtimeMs || digest !== expected.checksum || body.ok !== true || body.size !== expected.size || body.checksum !== digest) throw new Error('Integridade ou confirmação divergente; o arquivo não foi concluído.');
@@ -77,9 +83,12 @@ async function download(root, relative, address, file, expected, progress, allow
   const absolute = await native.safePath(root, relative, true);
   await native.assertExpected(absolute, expected);
   const internalDir = path.join(root, '.fortesdrive');
-  const internalStat = await fs.lstat(internalDir).catch(error => { if (error.code !== 'ENOENT') throw error; });
-  if (internalStat?.isSymbolicLink() || (internalStat && !internalStat.isDirectory())) throw new Error('Diretorio interno inseguro.');
-  await fs.mkdir(internalDir, { recursive: true });
+  if (Date.now() - (verifiedInternalDirs.get(internalDir) || 0) > 10000) {
+    const internalStat = await fs.lstat(internalDir).catch(error => { if (error.code !== 'ENOENT') throw error; });
+    if (internalStat?.isSymbolicLink() || (internalStat && !internalStat.isDirectory())) throw new Error('Diretorio interno inseguro.');
+    await fs.mkdir(internalDir, { recursive: true });
+    verifiedInternalDirs.set(internalDir, Date.now());
+  }
   const internal = path.join(internalDir, crypto.randomUUID() + '.tmp');
   const req = request(url, 'GET', {});
   try {
@@ -87,7 +96,7 @@ async function download(root, relative, address, file, expected, progress, allow
     if (response.statusCode !== 200) { response.resume(); throw Object.assign(new Error('Servidor recusou o download.'), { status: response.statusCode }); }
     if (Number(response.headers['content-length']) !== file.size) { response.destroy(); throw new Error('Tamanho divergente no download.'); }
     const hash = crypto.createHash('sha256'), counter = meter(hash, file.size, progress);
-    await pipeline(response, counter, createWriteStream(internal, { flags: 'wx', highWaterMark: 256 * 1024 }));
+    await pipeline(response, counter, createWriteStream(internal, { flags: 'wx', highWaterMark: STREAM_HIGH_WATER_MARK }));
     if (counter.bytes() !== file.size || hash.digest('hex') !== file.checksum) throw new Error('Download incompleto ou corrompido; o arquivo local foi preservado.');
     await native.assertExpected(absolute, expected);
     await fs.rename(internal, absolute);

@@ -31,6 +31,7 @@ class SyncEngine {
     if (!(await fs.stat(canonical)).isDirectory()) throw new Error("Selecione um diretório");
     await this.stop();
     this.watchFolder = canonical;
+    this.completedScan = null;
     this.store.set("watchFolder", canonical);
     // Cada pasta tem o seu índice de resumos: trocar de pasta não reaproveita
     // resumo de outro conteúdo.
@@ -66,12 +67,9 @@ class SyncEngine {
       watcher.on("all", (event, absolute) => {
         if (this.watcher !== watcher) return;
         this.badges.dirty(absolute);
-        // Arquivo que o próprio aplicativo acabou de gravar (download, edição ou
-        // exclusão feita pela sincronização) não é alteração do usuário: avisar a
-        // fila por causa dele reiniciava a passagem a cada arquivo baixado, e uma
-        // pasta com milhares de arquivos nunca terminava de sincronizar.
         if (this.isSelfWrite(absolute)) return;
-        // Janela limitada: uma cópia contínua não adia o aviso indefinidamente.
+        this.completedScan = null;
+        // Janela curta: detecta alterações locais quase na hora sem adiar indefinidamente.
         if (!this.debounce) this.debounce = setTimeout(() => {
           this.debounce = null;
           this.notify();
@@ -102,6 +100,7 @@ class SyncEngine {
     this.timer = this.debounce = this.restartTimer = null;
     await this.starting?.catch(() => {});
     this.state.running = false;
+    await this.bgScanning?.catch(() => {});
     const watcher = this.watcher;
     this.watcher = null;
     await watcher?.close();
@@ -151,28 +150,95 @@ class SyncEngine {
     return this.store.get(key, { files: {}, folders: {}, pending: {} });
   }
   saveManifest(userId, manifest) { this.store.set(this.manifestKey(userId), manifest); }
-  async snapshot(userId, { hashBudgetMs } = {}) {
+  /**
+   * Continua o resumo SHA-256 em segundo plano nas worker_threads enquanto a
+   * fila de transferências envia os arquivos já prontos, eliminando o pingue-
+   * pongue onde o disco ficava ocioso esperando a rede (e vice-versa).
+   */
+  pumpBackgroundScan(userId) {
+    if (this.bgScanning || this.scanning || !this.watchFolder || !this.state.running) return;
+    const folder = this.watchFolder;
+    this.bgScanning = (async () => {
+      try {
+        while (this.state.running && this.watchFolder === folder) {
+          const startedAt = this.state.scan?.startedAt || Date.now();
+          const result = await native.scan(folder, userId ? this.getManifest(userId).files : {}, {
+            hashBudgetMs: 60000,
+            onProgress: ({ total, hashed, pending, totalBytes, hashedBytes, bytesPerSec, walking }) => {
+              this.state.scan = { phase: "scanning", total, hashed, pending, totalBytes, hashedBytes, bytesPerSec, walking, startedAt, at: Date.now() };
+            },
+          });
+          this.state.scan = {
+            phase: result.complete ? "idle" : "scanning",
+            total: result.totalFiles,
+            hashed: result.files.length,
+            pending: result.pendingHash,
+            totalBytes: result.totalBytes,
+            hashedBytes: result.hashedBytes,
+            bytesPerSec: result.bytesPerSec,
+            walking: !result.walked,
+            walkMs: result.walkMs,
+            ms: Date.now() - startedAt,
+            startedAt,
+            at: Date.now(),
+          };
+          if (result.complete) {
+            this.completedScan = { folder, result, at: Date.now() };
+            this.notify();
+            break;
+          }
+        }
+      } catch (error) {
+        this.state.scan = { phase: "idle", error: error.message || "A pasta não pôde ser lida" };
+      }
+    })().finally(() => { this.bgScanning = null; });
+  }
+  async snapshot(userId, { hashBudgetMs, incremental } = {}) {
     if (!this.watchFolder) throw new Error("Escolha a pasta raiz primeiro");
-    // Uma varredura em andamento é reaproveitada: com a pasta grande, uma nova
-    // passagem pedida enquanto a anterior ainda lê abriria duas leituras do mesmo
-    // disco e nenhuma terminaria antes do próximo pedido.
+    if (this.bgScanning) {
+      const instant = native.peekScan?.(this.watchFolder);
+      if (instant) return instant;
+      await this.bgScanning;
+    }
+    if (incremental && this.completedScan && this.completedScan.folder === this.watchFolder && Date.now() - this.completedScan.at < 15000) {
+      const cached = this.completedScan.result;
+      this.completedScan = null;
+      return cached;
+    }
     if (this.scanning) return this.scanning;
-    // O andamento da leitura vai para o estado do programa: o painel mostra
-    // quantos arquivos já foram lidos e quantos faltam resumir, em vez de deixar
-    // "Sincronizando" sem nenhum número enquanto a pasta é percorrida.
     const startedAt = Date.now();
-    const live = { phase: "scanning", total: 0, hashed: 0, pending: 0, walking: true, startedAt };
+    const live = { phase: "scanning", total: 0, hashed: 0, pending: 0, totalBytes: 0, hashedBytes: 0, bytesPerSec: 0, walking: true, startedAt };
     this.state.scan = live;
     this.scanning = (async () => {
       try {
         const result = await native.scan(this.watchFolder, userId ? this.getManifest(userId).files : {}, {
-          // A árvore da pasta é percorrida de uma vez (segundos) e o resumo do
-          // conteúdo avança em lotes por passagem: o que já está pronto começa a
-          // subir imediatamente, em vez de a pasta inteira esperar o último byte.
           hashBudgetMs,
-          onProgress: ({ total, hashed, pending, walking }) => { live.total = total; live.hashed = hashed; live.pending = pending; live.walking = walking; live.at = Date.now(); },
+          onProgress: ({ total, hashed, pending, totalBytes, hashedBytes, bytesPerSec, walking }) => {
+            live.total = total; live.hashed = hashed; live.pending = pending;
+            live.totalBytes = totalBytes; live.hashedBytes = hashedBytes; live.bytesPerSec = bytesPerSec;
+            live.walking = walking; live.at = Date.now();
+          },
         });
-        this.state.scan = { phase: result.complete ? "idle" : "scanning", total: result.totalFiles, hashed: result.files.length, pending: result.pendingHash, walking: !result.walked, walkMs: result.walkMs, ms: Date.now() - startedAt, at: Date.now() };
+        this.state.scan = {
+          phase: result.complete ? "idle" : "scanning",
+          total: result.totalFiles,
+          hashed: result.files.length,
+          pending: result.pendingHash,
+          totalBytes: result.totalBytes,
+          hashedBytes: result.hashedBytes,
+          bytesPerSec: result.bytesPerSec,
+          walking: !result.walked,
+          walkMs: result.walkMs,
+          ms: Date.now() - startedAt,
+          startedAt,
+          at: Date.now(),
+        };
+        // Dispara a continuação paralela em segundo plano se ainda restarem
+        // arquivos por resumir: o disco continua a 100% nas worker_threads
+        // enquanto esta passagem já envia os milhares de arquivos prontos.
+        if (!result.complete && this.state.running) {
+          setImmediate(() => this.pumpBackgroundScan(userId));
+        }
         return result;
       } catch (error) {
         this.state.scan = { phase: "idle", error: error.message || "A pasta não pôde ser lida", ms: Date.now() - startedAt };
