@@ -30,10 +30,19 @@ static std::wstring widen(const std::string& value) {
   int n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value.data(), (int)value.size(), nullptr, 0);
   std::wstring result(n, 0); if(n) MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value.data(), (int)value.size(), result.data(), n); return result;
 }
-static std::wstring rootPath() {
+static std::mutex rootMutex;
+static std::wstring cachedSyncRoot;
+static ULONGLONG rootCheckedAt = 0;
+static std::wstring rootPath(bool force = false) {
+  const ULONGLONG now = GetTickCount64();
+  std::lock_guard<std::mutex> guard(rootMutex);
+  if(!force && rootCheckedAt && now - rootCheckedAt < 1500) return cachedSyncRoot;
+  rootCheckedAt = now;
   wchar_t buffer[32768]; DWORD bytes = sizeof(buffer);
-  if(RegGetValueW(HKEY_CURRENT_USER,L"Software\\FortesDrive",L"SyncRoot",RRF_RT_REG_SZ,nullptr,buffer,&bytes) != ERROR_SUCCESS) return L"";
-  std::wstring root(buffer); while(root.size() > 3 && root.back() == L'\\') root.pop_back(); return root;
+  if(RegGetValueW(HKEY_CURRENT_USER,L"Software\\FortesDrive",L"SyncRoot",RRF_RT_REG_SZ,nullptr,buffer,&bytes) != ERROR_SUCCESS) { cachedSyncRoot.clear(); return L""; }
+  std::wstring root(buffer); while(root.size() > 3 && root.back() == L'\\') root.pop_back();
+  cachedSyncRoot = root;
+  return cachedSyncRoot;
 }
 static ULONGLONG stamp(const FILETIME& time) { ULARGE_INTEGER value; value.LowPart=time.dwLowDateTime; value.HighPart=time.dwHighDateTime; return value.QuadPart; }
 static void load(const std::wstring& root) {
@@ -102,10 +111,14 @@ extern "C" HRESULT __stdcall DllGetClassObject(REFCLSID clsid,REFIID iid,void** 
 }
 extern "C" HRESULT __stdcall DllCanUnloadNow(){return objects.load()==0?S_OK:S_FALSE;}
 extern "C" void CALLBACK Refresh(HWND,HINSTANCE,LPSTR,int) {
-  const auto root=rootPath();if(root.empty())return;
-  SHChangeNotify(SHCNE_UPDATEITEM,SHCNF_PATHW,root.c_str(),nullptr);
-  SHChangeNotify(SHCNE_UPDATEDIR,SHCNF_PATHW,root.c_str(),nullptr);
+  const auto root=rootPath(true);if(root.empty())return;
+  SHChangeNotify(SHCNE_UPDATEITEM,SHCNF_PATHW|SHCNF_FLUSHNOWAIT,root.c_str(),nullptr);
+  SHChangeNotify(SHCNE_UPDATEDIR,SHCNF_PATHW|SHCNF_FLUSHNOWAIT,root.c_str(),nullptr);
   std::lock_guard<std::mutex> lock(cacheMutex);load(root);
-  for(const auto& pair:cache)if(!pair.first.empty()) {const auto item=root+L"\\"+pair.first;SHChangeNotify(SHCNE_UPDATEITEM,SHCNF_PATHW,item.c_str(),nullptr);}
+  if(cache.size()<=32) {
+    for(const auto& pair:cache)if(!pair.first.empty()) {const auto item=root+L"\\"+pair.first;SHChangeNotify(SHCNE_UPDATEITEM,SHCNF_PATHW|SHCNF_FLUSHNOWAIT,item.c_str(),nullptr);}
+  } else {
+    SHChangeNotify(SHCNE_ASSOCCHANGED,SHCNF_IDLIST|SHCNF_FLUSHNOWAIT,nullptr,nullptr);
+  }
 }
 BOOL APIENTRY DllMain(HMODULE handle,DWORD reason,LPVOID){if(reason==DLL_PROCESS_ATTACH){moduleHandle=handle;DisableThreadLibraryCalls(handle);}return TRUE;}

@@ -53,8 +53,11 @@ function notify(title, body, urgency, onClick) {
   showNext();
 }
 
-// --- Ícones de estado do tray (gerados em memória, sem arquivos externos) ---
+// --- Ícones de estado do tray (cacheados em memória para zero alocação em setState) ---
+const trayIconCache = new Map();
+let lastTraySignature = "";
 function makeTrayIcon(state) {
+  if (trayIconCache.has(state)) return trayIconCache.get(state);
   // state: "synced" | "syncing" | "offline" | "conflict"
   const colors = {
     synced: [16, 185, 129],   // emerald
@@ -81,30 +84,58 @@ function makeTrayIcon(state) {
       }
     }
   }
-  return nativeImage.createFromBitmap(buf, { width: size, height: size });
+  const image = nativeImage.createFromBitmap(buf, { width: size, height: size });
+  trayIconCache.set(state, image);
+  return image;
 }
 
 function updateTrayState(state) {
   if (!tray || tray.isDestroyed()) return;
-  const icon = makeTrayIcon(state);
-  // Um ícone vazio apagaria a bandeja: nesse caso o desenho anterior continua.
-  if (!icon.isEmpty()) tray.setImage(icon);
   const labels = { synced: "FortesDrive — Sincronizado", syncing: "FortesDrive — Sincronizando...", offline: "FortesDrive — Offline (fila pendente)", conflict: "FortesDrive — Conflito detectado" };
-  const detail = syncEngine?.state?.progressLabel;
-  tray.setToolTip((labels[state] || "FortesDrive") + (detail ? " — " + detail : ""));
+  const detail = syncEngine?.state?.progressLabel || "";
+  const tooltip = (labels[state] || "FortesDrive") + (detail ? " — " + detail : "");
+  const signature = state + "|" + tooltip;
+  if (signature === lastTraySignature) return;
+  const prevState = lastTraySignature.split("|")[0];
+  lastTraySignature = signature;
+  if (prevState !== state) {
+    const icon = makeTrayIcon(state);
+    if (!icon.isEmpty()) tray.setImage(icon);
+  }
+  tray.setToolTip(tooltip);
 }
 
 // Barra de progresso na barra de tarefas do Windows: acompanha a transferência
 // mesmo com a janela minimizada ou atrás de outras. 2 = indeterminado,
 // -1 = limpa a barra.
+let lastWinProgressSig = "";
+let lastWinProgressAt = 0;
+let winProgressTimer = null;
 function applyWindowsProgress() {
   if (!mainWindow || mainWindow.isDestroyed()) return;
   const { progress, progressMode } = syncEngine.state;
-  if (typeof progress !== "number" || progress < 0) {
-    mainWindow.setProgressBar(-1, { mode: "none" });
+  const clear = typeof progress !== "number" || progress < 0;
+  const mode = clear ? "none" : (progressMode || "normal");
+  const rounded = clear ? -1 : (mode === "indeterminate" ? 2 : Math.round(progress * 100) / 100);
+  const sig = `${mode}:${rounded}`;
+  if (sig === lastWinProgressSig) return;
+  const now = Date.now();
+  if (!clear && now - lastWinProgressAt < 900) {
+    if (!winProgressTimer) {
+      winProgressTimer = setTimeout(() => {
+        winProgressTimer = null;
+        applyWindowsProgress();
+      }, 900 - (now - lastWinProgressAt));
+      winProgressTimer.unref?.();
+    }
     return;
   }
-  mainWindow.setProgressBar(progress, { mode: progressMode || "normal" });
+  clearTimeout(winProgressTimer);
+  winProgressTimer = null;
+  lastWinProgressSig = sig;
+  lastWinProgressAt = now;
+  if (clear) mainWindow.setProgressBar(-1, { mode: "none" });
+  else mainWindow.setProgressBar(rounded, { mode });
 }
 app.commandLine.appendSwitch("disable-renderer-backgrounding");
 if (!app.requestSingleInstanceLock()) app.quit();
@@ -112,11 +143,15 @@ app.on("second-instance", async () => {
   if (mainWindow?.isMinimized()) mainWindow.restore();
   mainWindow?.show(); mainWindow?.focus();
   if (!syncEngine) return;
-  await refreshSetupConfiguration();
+  await refreshSetupConfiguration(true);
   requestSync();
 });
 
-async function refreshSetupConfiguration() {
+let lastSetupCheckAt = 0;
+async function refreshSetupConfiguration(force = false) {
+  const now = Date.now();
+  if (!force && now - lastSetupCheckAt < 15000) return;
+  lastSetupCheckAt = now;
   try {
     const directory = app.getPath("userData");
     await applySetupConfiguration(syncEngine, path.join(directory, "fortesdrive-setup.json"));
@@ -139,6 +174,36 @@ function installFolderArgument() {
 function trusted(event) {
   if (event.sender !== mainWindow?.webContents || event.senderFrame?.parent || new URL(event.senderFrame.url).origin !== new URL(WEB_APP_URL).origin) throw new Error("Solicitação não autorizada");
 }
+const pendingProgressIpc = new Map();
+let progressIpcTimer = null;
+let completedIpcTimer = null;
+
+function queueProgressIpc(direction, relative, loaded, total) {
+  if (!mainWindow || mainWindow.isDestroyed() || !mainWindow.isVisible()) return;
+  pendingProgressIpc.set(`${direction}:${relative}`, { path: relative, direction, loaded, total });
+  if (progressIpcTimer) return;
+  progressIpcTimer = setTimeout(() => {
+    progressIpcTimer = null;
+    if (!pendingProgressIpc.size || !mainWindow || mainWindow.isDestroyed()) {
+      pendingProgressIpc.clear();
+      return;
+    }
+    const batch = [...pendingProgressIpc.values()];
+    pendingProgressIpc.clear();
+    mainWindow.webContents.send("sync:transferProgressBatch", batch);
+  }, 150);
+  progressIpcTimer.unref?.();
+}
+
+function scheduleCompletedIpc() {
+  if (!mainWindow || mainWindow.isDestroyed() || !mainWindow.isVisible() || completedIpcTimer) return;
+  completedIpcTimer = setTimeout(() => {
+    completedIpcTimer = null;
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send("sync:transferCompleted");
+  }, 600);
+  completedIpcTimer.unref?.();
+}
+
 function requestSync() {
   if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send("sync:requested");
 }
@@ -202,7 +267,7 @@ function registerHandlers() {
     // instalador sabe desenhar, para recursos novos (cadeado) não quebrarem
     // clientes antigos que ainda não foram atualizados.
     getStatus: async () => {
-      await refreshSetupConfiguration();
+      if (!syncEngine.state.syncing) await refreshSetupConfiguration(false);
       return { ...syncEngine.getStatus(), updating: updater?.state.status === "installing", appVersion: app.getVersion(), badgeStates: ["synced", "pending", "error", "locked"] };
     },
     getServerTunnel: () => serverTunnel.getStatus(),
@@ -230,10 +295,9 @@ function registerHandlers() {
     syncNow: () => { requestSync(); return true; },
     rendererReady: () => { requestSync(); return true; },
     snapshot: (userId, options) => syncEngine.snapshot(userId, options),
-    uploadFileStream: (relative, authorization, expected) => transfers.upload(syncEngine.watchFolder, relative, authorization, expected, (loaded, total) => mainWindow?.webContents.send("sync:transferProgress", { path: relative, direction: "upload", loaded, total })),
+    uploadFileStream: (relative, authorization, expected) => transfers.upload(syncEngine.watchFolder, relative, authorization, expected, (loaded, total) => queueProgressIpc("upload", relative, loaded, total)),
     downloadFileStream: async (relative, url, file, expected) => {
-      const saved = await transfers.download(syncEngine.watchFolder, relative, url, file, expected, (loaded, total) => mainWindow?.webContents.send("sync:transferProgress", { path: relative, direction: "download", loaded, total }));
-      // O arquivo que acabou de descer não é uma alteração do usuário.
+      const saved = await transfers.download(syncEngine.watchFolder, relative, url, file, expected, (loaded, total) => queueProgressIpc("download", relative, loaded, total));
       syncEngine.markSelfWrite(relative);
       return saved;
     },
@@ -243,6 +307,7 @@ function registerHandlers() {
     },
     getManifest: userId => syncEngine.getManifest(userId),
     saveManifest: (userId, manifest) => syncEngine.saveManifest(userId, manifest),
+    saveManifestPatch: (userId, patch) => syncEngine.saveManifestPatch(userId, patch),
     recordTransferCompletion: async (userId, event) => {
       const result = await transferHistory.add(userId, event);
       if (result.added) {
@@ -254,13 +319,13 @@ function registerHandlers() {
         }
         await syncEngine.badges.confirm(item.path, { size: event.size, mtimeMs }).catch(error => { syncEngine.state.badgeError = error.message; });
         const now = Date.now();
-        if (!syncEngine.lastCompletionToastAt || now - syncEngine.lastCompletionToastAt >= 4000) {
+        if (!syncEngine.lastCompletionToastAt || now - syncEngine.lastCompletionToastAt >= 6000) {
           syncEngine.lastCompletionToastAt = now;
           notify(item.direction === "download" ? "FortesDrive — Download concluído" : "FortesDrive — Arquivo sincronizado", item.path, "normal", () => {
             native.safePath(syncEngine.watchFolder, item.path).then(abs => shell.showItemInFolder(abs)).catch(() => {});
           });
         }
-        mainWindow?.webContents.send("sync:transferCompleted");
+        scheduleCompletedIpc();
       }
       return true;
     },
@@ -275,20 +340,13 @@ function registerHandlers() {
         addedCount++;
         lastItem = res.item;
         const ev = events[i];
-        let mtimeMs = ev.mtimeMs;
-        if (mtimeMs == null) {
-          try {
-            const abs = await native.safePath(syncEngine.watchFolder, res.item.path);
-            mtimeMs = (await fs.stat(abs)).mtimeMs;
-          } catch {}
-        }
-        if (mtimeMs != null) {
-          await syncEngine.badges.confirm(res.item.path, { size: ev.size, mtimeMs }).catch(error => { syncEngine.state.badgeError = error.message; });
+        if (ev.mtimeMs != null) {
+          syncEngine.badges.confirm(res.item.path, { size: ev.size, mtimeMs: ev.mtimeMs }).catch(() => {});
         }
       }
       if (addedCount > 0) {
         const now = Date.now();
-        if (!syncEngine.lastCompletionToastAt || now - syncEngine.lastCompletionToastAt >= 4000) {
+        if (!syncEngine.lastCompletionToastAt || now - syncEngine.lastCompletionToastAt >= 6000) {
           syncEngine.lastCompletionToastAt = now;
           if (addedCount === 1 && lastItem) {
             notify(lastItem.direction === "download" ? "FortesDrive — Download concluído" : "FortesDrive — Arquivo sincronizado", lastItem.path, "normal", () => {
@@ -298,7 +356,7 @@ function registerHandlers() {
             notify("FortesDrive — Arquivos sincronizados", `${addedCount} arquivos concluídos neste lote.`, "normal");
           }
         }
-        mainWindow?.webContents.send("sync:transferCompleted");
+        scheduleCompletedIpc();
       }
       return true;
     },
@@ -320,13 +378,10 @@ function registerHandlers() {
       const allowed = ["syncing", "queue", "error", "lastSync", "userEmail", "online", "conflicts", "syncedCount", "skipped", "issues", "progress", "progressMode", "progressLabel", "localBytes", "localFiles", "cloudBytes", "cloudFiles", "pendingUploadBytes", "pendingUploadFiles", "historyError"];
       for (const key of allowed) if (Object.hasOwn(state, key)) syncEngine.state[key] = state[key];
       applyWindowsProgress();
-      // Atualiza o ícone do tray com base no estado
       const current = syncEngine.state;
-      if (current.conflicts > 0 || current.error) updateTrayState("conflict");
-      else if (current.syncing) updateTrayState("syncing");
-      else if (current.online === false || current.skipped > 0) updateTrayState("offline");
-      else updateTrayState("synced");
-      if (state.error) await syncEngine.badges.publish({entries: [...syncEngine.badges.entries.values()], state: state.online === false ? "pending" : "error"}).catch(error => { syncEngine.state.badgeError = error.message; });
+      const trayKind = current.conflicts > 0 || current.error ? "conflict" : current.syncing ? "syncing" : (current.online === false || current.skipped > 0) ? "offline" : "synced";
+      updateTrayState(trayKind);
+      if (state.error) syncEngine.badges.setRootState(state.online === false ? "pending" : "error");
     },
     notify: (params) => {
       notify(params.title, params.body, params.urgency);
@@ -514,7 +569,7 @@ function watchTray() {
     if (tray && !tray.isDestroyed()) return;
     tray = null;
     createTray().catch(error => console.error("Bandeja: " + error.message));
-  }, 20000);
+  }, 60000); // Reduzido de 20s para 60s
   const reinstall = () => {
     if (tray && !tray.isDestroyed()) { tray.destroy(); tray = null; }
     createTray().catch(error => console.error("Bandeja: " + error.message));
@@ -534,7 +589,7 @@ app.whenReady().then(async () => {
   await serverTunnel.init();
   installHealth = createInstallHealth({ app });
   await installHealth.load();
-  await refreshSetupConfiguration();
+  await refreshSetupConfiguration(true);
   // A pasta vinda do instalador é aplicada aqui, antes da janela web, e some
   // quando já é a mesma pasta configurada.
   const folderArgument = installFolderArgument();

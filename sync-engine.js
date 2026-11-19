@@ -6,16 +6,34 @@ const fs = require("fs/promises");
 const native = require("./native-files");
 const {ShellStatus} = require("./shell-status");
 
+const yieldLoop = () => new Promise(resolve => setImmediate(resolve));
+
+async function stringifyManifestAsync(manifest) {
+  const parts = ['{"files":{'];
+  const fileEntries = Object.entries(manifest.files || {});
+  for (let i = 0; i < fileEntries.length; i++) {
+    const [k, v] = fileEntries[i];
+    parts.push((i ? "," : "") + JSON.stringify(k) + ":" + JSON.stringify(v));
+    if ((i + 1) % 4000 === 0) await yieldLoop();
+  }
+  parts.push('},"folders":' + JSON.stringify(manifest.folders || {}));
+  parts.push(',"pending":' + JSON.stringify(manifest.pending || {}));
+  if (manifest.uploaded && Object.keys(manifest.uploaded).length) {
+    parts.push(',"uploaded":' + JSON.stringify(manifest.uploaded));
+  }
+  if (manifest.completions && Object.keys(manifest.completions).length) {
+    parts.push(',"completions":' + JSON.stringify(manifest.completions));
+  }
+  parts.push("}");
+  return parts.join("");
+}
+
 class SyncEngine {
   constructor(notify, userDataDir) {
     this.store = new Store({ name: "fortesdrive-native-v2" });
     this.userDataDir = userDataDir || null;
     this.watchFolder = this.store.get("watchFolder", null);
     native.configureIndex(this.indexPath());
-    // A pasta padrão da primeira execução já existe, mas ninguém escolheu onde
-    // ela fica nem como se chama: enquanto isso não é confirmado, o aplicativo
-    // abre o assistente de pasta. Uma instalação antiga já sincronizando conta
-    // como confirmada e não é interrompida.
     if (this.store.has("folderConfigured")) this.folderConfigured = !!this.store.get("folderConfigured");
     else { this.folderConfigured = !!this.watchFolder; this.store.set("folderConfigured", this.folderConfigured); }
     this.deviceId = this.store.get("deviceId", crypto.randomUUID());
@@ -24,6 +42,8 @@ class SyncEngine {
     this.state = { running: false, syncing: false, queue: 0, error: "", lastSync: null };
     this.badges = new ShellStatus();
     this.selfWrites = new Map();
+    this.manifests = new Map();
+    this.manifestSaves = new Map();
   }
   async setWatchFolder(folder) {
     if (this.state.syncing) throw new Error("Aguarde a sincronização terminar antes de trocar a pasta");
@@ -33,22 +53,15 @@ class SyncEngine {
     this.watchFolder = canonical;
     this.completedScan = null;
     this.store.set("watchFolder", canonical);
-    // Cada pasta tem o seu índice de resumos: trocar de pasta não reaproveita
-    // resumo de outro conteúdo.
     native.configureIndex(this.indexPath());
-    // Pasta escolhida explicitamente (local + nome) não precisa mais do assistente.
     this.folderConfigured = true;
     this.store.set("folderConfigured", true);
     await this.start();
   }
   async start() {
     if (!this.watchFolder || !this.folderConfigured) return;
-    // O pulso continua mesmo se o disco ou o monitor falhar. Não depende da janela.
     if (!this.timer) this.timer = setInterval(() => {
       this.start().catch(error => { this.state.error = error.message; });
-      // Uma passagem em andamento já enxerga o que mudou: avisar de novo a cada
-      // 30 segundos fazia a passagem ser interrompida antes de os arquivos já
-      // lidos começarem a subir, e a pasta nunca saía da leitura.
       if (!this.state.syncing) this.notify();
     }, 30000);
     if (this.state.running || this.starting) return this.starting;
@@ -60,7 +73,7 @@ class SyncEngine {
         ignored: /(^|[/\\])(?:\.fortesdrive([/\\]|$)|\.fortesdrive-transfer-)/,
         ignoreInitial: true, followSymlinks: false,
         usePolling: !!this.pollingFallback, interval: 1000, binaryInterval: 1000,
-        awaitWriteFinish: { stabilityThreshold: 1000, pollInterval: 200 },
+        awaitWriteFinish: { stabilityThreshold: 2000, pollInterval: 400 },
       });
       this.watcher = watcher;
       this.state.running = true;
@@ -69,7 +82,6 @@ class SyncEngine {
         this.badges.dirty(absolute);
         if (this.isSelfWrite(absolute)) return;
         this.completedScan = null;
-        // Janela curta: detecta alterações locais quase na hora sem adiar indefinidamente.
         if (!this.debounce) this.debounce = setTimeout(() => {
           this.debounce = null;
           this.notify();
@@ -77,7 +89,7 @@ class SyncEngine {
       }).on("ready", () => {
         if (this.watcher !== watcher) return;
         this.state.watcherError = "";
-        this.notify(); // Inclui arquivos criados durante a leitura inicial.
+        this.notify();
       }).on("error", error => {
         if (this.watcher !== watcher) return;
         this.state.watcherError = "Monitoramento da pasta: " + error.message;
@@ -101,13 +113,13 @@ class SyncEngine {
     await this.starting?.catch(() => {});
     this.state.running = false;
     await this.bgScanning?.catch(() => {});
+    await this.flushManifests().catch(() => {});
     const watcher = this.watcher;
     this.watcher = null;
     await watcher?.close();
     await this.closing;
   }
   getStatus() { return { ...this.state, machineRole: this.store.get("machineRole", "client"), nativeStreaming: true, watchFolder: this.watchFolder, folderConfigured: this.folderConfigured, deviceId: this.deviceId }; }
-  /** Marca um arquivo gravado pela própria sincronização (caminho relativo). */
   markSelfWrite(relative) {
     if (typeof relative !== "string" || !relative) return;
     const key = this.selfKey(relative);
@@ -118,7 +130,6 @@ class SyncEngine {
     }
   }
   selfKey(relative) { return process.platform === "win32" ? relative.toLowerCase() : relative; }
-  /** O evento do monitor veio de uma gravação nossa? Vale por 2 minutos. */
   isSelfWrite(absolute) {
     if (!this.watchFolder) return false;
     const relative = path.relative(this.watchFolder, absolute).split(path.sep).join("/");
@@ -127,34 +138,149 @@ class SyncEngine {
     if (Date.now() - at > 120000) { this.selfWrites.delete(this.selfKey(relative)); return false; }
     return true;
   }
-  /**
-   * Arquivo do índice de resumos da pasta atual, ao lado dos dados do
-   * aplicativo. É o que permite reabrir o cliente e saber em segundos o que
-   * mudou, sem resumir de novo dezenas de milhares de arquivos.
-   */
   indexPath() {
     if (!this.userDataDir || !this.watchFolder) return null;
     const digest = crypto.createHash("sha256").update(this.watchFolder.toLowerCase()).digest("hex").slice(0, 16);
     return path.join(this.userDataDir, "scan-index-" + digest + ".json");
   }
+  manifestFilePath(key) {
+    if (!this.userDataDir) return null;
+    return path.join(this.userDataDir, "manifests", key + ".json");
+  }
   manifestKey(userId) {
     if (typeof userId !== "string" || !userId || userId.length > 100 || !this.watchFolder) throw new Error("Conta e pasta são obrigatórias");
     return "manifest_" + crypto.createHash("sha256").update(userId + "\0" + this.watchFolder).digest("hex");
   }
-  getManifest(userId) {
-    const key = this.manifestKey(userId);
+  checkFolderOwner(userId) {
     const rootKey = "owner_" + crypto.createHash("sha256").update(this.watchFolder).digest("hex");
     const owner = this.store.get(rootKey);
     if (owner && owner !== userId) throw new Error("Esta pasta pertence a outra conta FortesDrive. Selecione outra pasta para evitar misturar dados.");
-    this.store.set(rootKey, userId);
-    return this.store.get(key, { files: {}, folders: {}, pending: {} });
+    if (owner !== userId) this.store.set(rootKey, userId);
   }
-  saveManifest(userId, manifest) { this.store.set(this.manifestKey(userId), manifest); }
-  /**
-   * Continua o resumo SHA-256 em segundo plano nas worker_threads enquanto a
-   * fila de transferências envia os arquivos já prontos, eliminando o pingue-
-   * pongue onde o disco ficava ocioso esperando a rede (e vice-versa).
-   */
+  async loadManifestObject(userId) {
+    const key = this.manifestKey(userId);
+    this.checkFolderOwner(userId);
+    if (this.manifests.has(key)) return this.manifests.get(key);
+    const file = this.manifestFilePath(key);
+    if (file) {
+      try {
+        const parsed = JSON.parse(await fs.readFile(file, "utf8"));
+        const normalized = { files: parsed?.files || {}, folders: parsed?.folders || {}, pending: parsed?.pending || {}, ...(parsed?.uploaded ? { uploaded: parsed.uploaded } : {}), ...(parsed?.completions ? { completions: parsed.completions } : {}) };
+        this.manifests.set(key, normalized);
+        return normalized;
+      } catch (e) {
+        if (e.code !== "ENOENT") console.warn("Manifesto inválido, recuperando backup:", e.message);
+      }
+    }
+    const legacy = this.store.get(key, { files: {}, folders: {}, pending: {} });
+    const normalized = { files: legacy?.files || {}, folders: legacy?.folders || {}, pending: legacy?.pending || {}, ...(legacy?.uploaded ? { uploaded: legacy.uploaded } : {}), ...(legacy?.completions ? { completions: legacy.completions } : {}) };
+    this.manifests.set(key, normalized);
+    if (file) {
+      this.scheduleManifestFlush(key, 50);
+      // Remove cópia pesada do electron-store síncrono após migrar para arquivo assíncrono dedicado.
+      if (this.store.has(key) && typeof this.store.delete === "function") {
+        setImmediate(() => { try { this.store.delete(key); } catch {} });
+      }
+    }
+    return normalized;
+  }
+  getManifest(userId) {
+    return this.loadManifestObject(userId);
+  }
+  cachedBaselineFiles(userId) {
+    if (!userId || !this.watchFolder) return {};
+    try {
+      const key = this.manifestKey(userId);
+      return this.manifests.get(key)?.files || {};
+    } catch {
+      return {};
+    }
+  }
+  scheduleManifestFlush(key, delayMs = 1200) {
+    const file = this.manifestFilePath(key);
+    if (!file) {
+      const current = this.manifests.get(key);
+      if (current) this.store.set(key, current);
+      return Promise.resolve();
+    }
+    let slot = this.manifestSaves.get(key);
+    if (!slot) {
+      slot = { dirty: 0, saved: 0, timer: null, writing: Promise.resolve() };
+      this.manifestSaves.set(key, slot);
+    }
+    slot.dirty++;
+    if (!slot.timer) {
+      slot.timer = setTimeout(() => {
+        slot.timer = null;
+        this.flushSingleManifest(key, slot).catch(() => {});
+      }, delayMs);
+      slot.timer.unref?.();
+    }
+    return slot.writing;
+  }
+  flushSingleManifest(key, slot) {
+    slot.writing = slot.writing.catch(() => {}).then(async () => {
+      const file = this.manifestFilePath(key);
+      if (!file) return;
+      while (slot.saved < slot.dirty) {
+        const target = slot.dirty;
+        const manifest = this.manifests.get(key);
+        if (!manifest) { slot.saved = target; break; }
+        await fs.mkdir(path.dirname(file), { recursive: true });
+        const json = await stringifyManifestAsync(manifest);
+        const temp = file + ".tmp";
+        await fs.writeFile(temp, json, "utf8");
+        await fs.rename(temp, file);
+        slot.saved = target;
+      }
+    });
+    return slot.writing;
+  }
+  async flushManifests() {
+    const tasks = [];
+    for (const [key, slot] of this.manifestSaves) {
+      clearTimeout(slot.timer);
+      slot.timer = null;
+      tasks.push(this.flushSingleManifest(key, slot));
+    }
+    await Promise.allSettled(tasks);
+  }
+  async saveManifest(userId, manifest) {
+    const key = this.manifestKey(userId);
+    this.checkFolderOwner(userId);
+    const normalized = {
+      files: manifest?.files || {},
+      folders: manifest?.folders || {},
+      pending: manifest?.pending || {},
+      ...(manifest?.uploaded ? { uploaded: manifest.uploaded } : {}),
+      ...(manifest?.completions ? { completions: manifest.completions } : {}),
+    };
+    this.manifests.set(key, normalized);
+    this.scheduleManifestFlush(key, 1200);
+    return true;
+  }
+  async saveManifestPatch(userId, patch) {
+    if (!patch || typeof patch !== "object") return true;
+    const target = await this.loadManifestObject(userId);
+    const key = this.manifestKey(userId);
+    const applyMap = (section, setObj, delArr) => {
+      if ((!setObj || !Object.keys(setObj).length) && (!Array.isArray(delArr) || !delArr.length)) return;
+      target[section] ||= {};
+      if (Array.isArray(delArr)) for (const id of delArr) delete target[section][id];
+      if (setObj) for (const [id, val] of Object.entries(setObj)) target[section][id] = val;
+    };
+    applyMap("files", patch.filesSet, patch.filesDelete);
+    applyMap("pending", patch.pendingSet, patch.pendingDelete);
+    applyMap("uploaded", patch.uploadedSet, patch.uploadedDelete);
+    applyMap("completions", patch.completionsSet, patch.completionsDelete);
+    if (patch.foldersReplace && typeof patch.foldersReplace === "object") {
+      target.folders = patch.foldersReplace;
+    } else {
+      applyMap("folders", patch.foldersSet, patch.foldersDelete);
+    }
+    this.scheduleManifestFlush(key, 1200);
+    return true;
+  }
   pumpBackgroundScan(userId) {
     if (this.bgScanning || this.scanning || !this.watchFolder || !this.state.running) return;
     const folder = this.watchFolder;
@@ -162,7 +288,8 @@ class SyncEngine {
       try {
         while (this.state.running && this.watchFolder === folder) {
           const startedAt = this.state.scan?.startedAt || Date.now();
-          const result = await native.scan(folder, userId ? this.getManifest(userId).files : {}, {
+          const baselineFiles = userId ? (await this.loadManifestObject(userId)).files : {};
+          const result = await native.scan(folder, baselineFiles, {
             hashBudgetMs: 60000,
             onProgress: ({ total, hashed, pending, totalBytes, hashedBytes, bytesPerSec, walking }) => {
               this.state.scan = { phase: "scanning", total, hashed, pending, totalBytes, hashedBytes, bytesPerSec, walking, startedAt, at: Date.now() };
@@ -211,7 +338,8 @@ class SyncEngine {
     this.state.scan = live;
     this.scanning = (async () => {
       try {
-        const result = await native.scan(this.watchFolder, userId ? this.getManifest(userId).files : {}, {
+        const baselineFiles = userId ? (await this.loadManifestObject(userId)).files : {};
+        const result = await native.scan(this.watchFolder, baselineFiles, {
           hashBudgetMs,
           onProgress: ({ total, hashed, pending, totalBytes, hashedBytes, bytesPerSec, walking }) => {
             live.total = total; live.hashed = hashed; live.pending = pending;
@@ -233,9 +361,6 @@ class SyncEngine {
           startedAt,
           at: Date.now(),
         };
-        // Dispara a continuação paralela em segundo plano se ainda restarem
-        // arquivos por resumir: o disco continua a 100% nas worker_threads
-        // enquanto esta passagem já envia os milhares de arquivos prontos.
         if (!result.complete && this.state.running) {
           setImmediate(() => this.pumpBackgroundScan(userId));
         }

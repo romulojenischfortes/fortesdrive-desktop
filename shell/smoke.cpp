@@ -16,6 +16,7 @@ int wmain() {
     std::filesystem::create_directories(metadata);
     HKEY key;require(RegCreateKeyExW(HKEY_CURRENT_USER,L"Software\\FortesDrive",0,nullptr,0,KEY_SET_VALUE,nullptr,&key,nullptr)==ERROR_SUCCESS,"registry");
     require(RegSetValueExW(key,L"SyncRoot",0,REG_SZ,(const BYTE*)root.c_str(),(DWORD)((root.size()+1)*sizeof(wchar_t)))==ERROR_SUCCESS,"root");RegCloseKey(key);
+    rootPath(true);
     {std::ofstream output(file.c_str(),std::ios::binary);output<<"hello";}
     WIN32_FILE_ATTRIBUTE_DATA attrs{};require(GetFileAttributesExW(file.c_str(),GetFileExInfoStandard,&attrs),"file attributes");
     auto ms=(long long)(stamp(attrs.ftLastWriteTime)/10000)-11644473600000LL;

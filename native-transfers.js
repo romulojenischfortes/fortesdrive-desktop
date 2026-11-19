@@ -8,10 +8,10 @@ const { Transform } = require('node:stream');
 const { pipeline } = require('node:stream/promises');
 const native = require('./native-files');
 const MAX_TRANSFER_BYTES = 10 * 1024 * 1024 * 1024;
-const STREAM_HIGH_WATER_MARK = 1024 * 1024;
+const STREAM_HIGH_WATER_MARK = 2 * 1024 * 1024;
 const agents = {
-  'https:': new https.Agent({ keepAlive: true, keepAliveMsecs: 30000, maxSockets: 96, maxFreeSockets: 32, scheduling: 'lifo' }),
-  'http:': new http.Agent({ keepAlive: true, keepAliveMsecs: 30000, maxSockets: 96, maxFreeSockets: 32, scheduling: 'lifo' }),
+  'https:': new https.Agent({ keepAlive: true, keepAliveMsecs: 30000, maxSockets: 128, maxFreeSockets: 64, scheduling: 'lifo' }),
+  'http:': new http.Agent({ keepAlive: true, keepAliveMsecs: 30000, maxSockets: 128, maxFreeSockets: 64, scheduling: 'lifo' }),
 };
 const verifiedInternalDirs = new Map();
 
@@ -30,7 +30,7 @@ function meter(hash, size, progress) {
     loaded += chunk.length;
     if (loaded > size) return callback(new Error('O tamanho do arquivo mudou durante a transferência.'));
     hash.update(chunk);
-    if (Date.now() - last >= 250 || loaded === size) { last = Date.now(); progress?.(loaded, size); }
+    if (Date.now() - last >= 300 || loaded === size) { last = Date.now(); progress?.(loaded, size); }
     callback(null, chunk);
   } });
   stream.bytes = () => loaded;

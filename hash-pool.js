@@ -64,8 +64,8 @@ if (!isMainThread && parentPort) {
 } else {
   const { Worker } = require("node:worker_threads");
   const cpuCount = typeof os.availableParallelism === "function" ? os.availableParallelism() : (os.cpus()?.length || 4);
-  const POOL_SIZE = Math.max(4, Math.min(16, cpuCount));
-  const MAX_INFLIGHT_PER_WORKER = 12;
+  const POOL_SIZE = Math.max(4, Math.min(20, cpuCount));
+  const MAX_INFLIGHT_PER_WORKER = 16;
 
   let workers = null;
   let idleTimer = null;

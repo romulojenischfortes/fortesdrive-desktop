@@ -52,20 +52,30 @@ async function loadIndex() {
   }
 }
 
-function saveIndexSoon() {
+const yieldLoop = () => new Promise(resolve => setImmediate(resolve));
+
+function saveIndexSoon(delayMs = 20000) {
   if (!indexFile || indexTimer) return;
   indexTimer = setTimeout(async () => {
     indexTimer = null;
     if (!indexDirty) return;
     indexDirty = false;
     try {
+      const snapshot = [...index.entries()];
+      const chunks = ["{"];
+      for (let i = 0; i < snapshot.length; i++) {
+        const [k, v] = snapshot[i];
+        chunks.push((i ? "," : "") + JSON.stringify(k) + ":" + JSON.stringify(v));
+        if ((i + 1) % 4000 === 0) await yieldLoop();
+      }
+      chunks.push("}");
       const temp = indexFile + ".tmp";
-      await fs.writeFile(temp, JSON.stringify(Object.fromEntries(index)), "utf8");
+      await fs.writeFile(temp, chunks.join(""), "utf8");
       await fs.rename(temp, indexFile);
     } catch (e) {
       // O índice é só um acelerador: falhar ao gravá-lo não afeta a sincronização.
     }
-  }, 15000);
+  }, delayMs);
   indexTimer.unref?.();
 }
 
@@ -121,10 +131,12 @@ async function safePath(root, relative, createParents = false) {
 }
 // A varredura precisa terminar depressa mesmo com dezenas de milhares de
 // arquivos. Pastas, metadados e resumos SHA-256 saturam SSDs NVMe modernos.
-const READDIR_LANES = 64;   // pastas listadas ao mesmo tempo em paralelo
-const STAT_LANES = 256;     // informações de itens pedidas ao mesmo tempo
-const HASH_LANES = 96;      // arquivos/lotes despachados simultaneamente ao pool multi-thread
-const SMALL_HASH_BATCH = 32;
+const READDIR_LANES = 128;  // pastas listadas ao mesmo tempo em paralelo
+const STAT_LANES = 512;     // informações de itens pedidas ao mesmo tempo
+const HASH_LANES = 128;     // arquivos/lotes despachados simultaneamente ao pool multi-thread
+const SMALL_HASH_BATCH = 64;
+const SMALL_BATCH_ITEM_BYTES = 1024 * 1024;
+const SMALL_BATCH_MAX_BYTES = 8 * 1024 * 1024;
 // Uma única pasta ou arquivo que não responde (disco removido, OneDrive que
 // nunca baixa) não pode segurar a pasta inteira: cada operação tem o seu limite.
 const OP_TIMEOUT_MS = 20 * 1000;
@@ -277,7 +289,8 @@ async function scan(root, baseline = {}, { hashBudget = Infinity, hashBudgetMs =
     // Quem já tem resumo válido (mesmo dono, tamanho e datas) volta sem reler o
     // conteúdo; só o que mudou ou nunca foi lido entra na fila do resumo.
     const newPending = [];
-    for (const item of walk.pending) {
+    for (let i = 0; i < walk.pending.length; i++) {
+      const item = walk.pending[i];
       const known = checksums.get(item.relative);
       const sameIdentity = !known?.identity || !item.identity || known.identity === item.identity;
       if (!known || known.size !== item.stat.size || known.mtimeMs !== item.stat.mtimeMs || !sameIdentity) {
@@ -286,6 +299,7 @@ async function scan(root, baseline = {}, { hashBudget = Infinity, hashBudgetMs =
         walk.hashedBytes += item.stat.size;
         walk.files.push(describe(item.relative, item.stat, item.identity, known.checksum));
       }
+      if ((i + 1) % 5000 === 0) await yieldLoop();
     }
     
     // Ordena os que precisam de resumo: os pequenos primeiro. Assim a primeira
@@ -327,10 +341,10 @@ async function scan(root, baseline = {}, { hashBudget = Infinity, hashBudgetMs =
       const first = hashing[next++];
       // Agrupa arquivos pequenos num único despacho para a worker_thread:
       // elimina dezenas de milhares de mensagens IPC individuais.
-      if (first.stat.size > 0 && first.stat.size <= 512 * 1024 && typeof hashPool.hashBatch === "function") {
+      if (first.stat.size > 0 && first.stat.size <= SMALL_BATCH_ITEM_BYTES && typeof hashPool.hashBatch === "function") {
         const group = [first];
         let groupBytes = first.stat.size;
-        while (group.length < SMALL_HASH_BATCH && next < hashing.length && hashing[next].stat.size > 0 && hashing[next].stat.size <= 512 * 1024 && groupBytes + hashing[next].stat.size <= 4 * 1024 * 1024) {
+        while (group.length < SMALL_HASH_BATCH && next < hashing.length && hashing[next].stat.size > 0 && hashing[next].stat.size <= SMALL_BATCH_ITEM_BYTES && groupBytes + hashing[next].stat.size <= SMALL_BATCH_MAX_BYTES) {
           const candidate = hashing[next++];
           group.push(candidate);
           groupBytes += candidate.stat.size;
