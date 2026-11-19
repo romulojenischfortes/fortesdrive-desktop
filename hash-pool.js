@@ -95,6 +95,7 @@ if (!isMainThread && parentPort) {
       const slot = { worker, inflight: 0 };
       worker.on("message", (msg) => {
         slot.inflight = Math.max(0, slot.inflight - 1);
+        if (slot.inflight === 0) worker.unref?.();
         const task = pendingTasks.get(msg.id);
         if (task) {
           clearTimeout(task.timer);
@@ -145,17 +146,18 @@ if (!isMainThread && parentPort) {
       if (!best) break;
       const item = taskQueue.shift();
       const id = nextTaskId++;
+      if (best.inflight === 0) best.worker.ref?.();
       best.inflight++;
       const timer = setTimeout(() => {
         if (!pendingTasks.has(id)) return;
         pendingTasks.delete(id);
         best.inflight = Math.max(0, best.inflight - 1);
+        if (best.inflight === 0) best.worker.unref?.();
         const error = new Error("A leitura do arquivo demorou demais");
         error.timeout = true;
         item.reject(error);
         pump();
       }, item.timeoutMs);
-      timer.unref?.();
       pendingTasks.set(id, { resolve: item.resolve, reject: item.reject, timer, slot: best });
       if (item.batch) best.worker.postMessage({ id, batch: item.batch });
       else best.worker.postMessage({ id, file: item.file, size: item.size });
