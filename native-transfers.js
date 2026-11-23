@@ -7,11 +7,15 @@ const path = require('node:path');
 const { Transform } = require('node:stream');
 const { pipeline } = require('node:stream/promises');
 const native = require('./native-files');
+const hashPool = require('./hash-pool');
 const MAX_TRANSFER_BYTES = 10 * 1024 * 1024 * 1024;
-const STREAM_HIGH_WATER_MARK = 2 * 1024 * 1024;
+const STREAM_HIGH_WATER_MARK = 4 * 1024 * 1024;
+const RANGE_PART_MIN_BYTES = 8 * 1024 * 1024;
+const RANGE_THRESHOLD_BYTES = 24 * 1024 * 1024;
+const MAX_RANGE_PARTS = 6;
 const agents = {
-  'https:': new https.Agent({ keepAlive: true, keepAliveMsecs: 30000, maxSockets: 128, maxFreeSockets: 64, scheduling: 'lifo' }),
-  'http:': new http.Agent({ keepAlive: true, keepAliveMsecs: 30000, maxSockets: 128, maxFreeSockets: 64, scheduling: 'lifo' }),
+  'https:': new https.Agent({ keepAlive: true, keepAliveMsecs: 45000, maxSockets: 192, maxFreeSockets: 96, scheduling: 'lifo' }),
+  'http:': new http.Agent({ keepAlive: true, keepAliveMsecs: 45000, maxSockets: 192, maxFreeSockets: 96, scheduling: 'lifo' }),
 };
 const verifiedInternalDirs = new Map();
 
@@ -74,8 +78,28 @@ async function upload(root, relative, authorization, expected, progress, allowLo
   const [body] = await Promise.all([received, sent]).catch(error => { req.destroy(error); throw error; });
   const after = await fs.lstat(absolute), digest = hash.digest('hex');
   if (counter.bytes() !== expected.size || after.size !== before.size || after.mtimeMs !== before.mtimeMs || digest !== expected.checksum || body.ok !== true || body.size !== expected.size || body.checksum !== digest) throw new Error('Integridade ou confirmação divergente; o arquivo não foi concluído.');
-  return { storageKey: authorization.storageKey, checksum: digest, size: after.size, mtimeMs: after.mtimeMs, ctimeMs: after.ctimeMs, identity: `${after.dev}:${after.ino}` };
+  const identity = `${after.dev}:${after.ino}`;
+  native.remember?.(root, relative, { size: after.size, mtimeMs: after.mtimeMs, ctimeMs: after.ctimeMs, identity, checksum: digest });
+  return { storageKey: authorization.storageKey, checksum: digest, size: after.size, mtimeMs: after.mtimeMs, ctimeMs: after.ctimeMs, identity };
 }
+
+async function writeResponseAtOffset(response, handle, startOffset, expectedLen, onChunk) {
+  let offset = startOffset;
+  let received = 0;
+  for await (const chunk of response) {
+    received += chunk.length;
+    if (received > expectedLen) throw new Error('Segmento excedeu o tamanho esperado no download.');
+    let written = 0;
+    while (written < chunk.length) {
+      const res = await handle.write(chunk, written, chunk.length - written, offset);
+      written += res.bytesWritten;
+      offset += res.bytesWritten;
+    }
+    onChunk?.(chunk.length);
+  }
+  if (received !== expectedLen) throw new Error('Segmento incompleto no download paralelo.');
+}
+
 async function download(root, relative, address, file, expected, progress, allowLocal = false) {
   checkedSize(file.size);
   if (!/^[a-f0-9]{64}$/i.test(file.checksum || '')) throw new Error('Checksum obrigatório para download nativo.');
@@ -90,18 +114,63 @@ async function download(root, relative, address, file, expected, progress, allow
     verifiedInternalDirs.set(internalDir, Date.now());
   }
   const internal = path.join(internalDir, crypto.randomUUID() + '.tmp');
-  const req = request(url, 'GET', {});
+  const total = file.size;
+  const parts = total >= RANGE_THRESHOLD_BYTES ? Math.min(MAX_RANGE_PARTS, Math.floor(total / RANGE_PART_MIN_BYTES)) : 1;
+  const partSize = parts > 1 ? Math.ceil(total / parts) : total;
+  const firstHeaders = parts > 1 ? { Range: `bytes=0-${partSize - 1}` } : {};
+  const firstReq = request(url, 'GET', firstHeaders);
+  const activeReqs = [firstReq];
+  let handle = null;
   try {
-    const response = await new Promise((resolve, reject) => { req.once('error', reject); req.once('response', resolve); req.end(); });
-    if (response.statusCode !== 200) { response.resume(); throw Object.assign(new Error('Servidor recusou o download.'), { status: response.statusCode }); }
-    if (Number(response.headers['content-length']) !== file.size) { response.destroy(); throw new Error('Tamanho divergente no download.'); }
-    const hash = crypto.createHash('sha256'), counter = meter(hash, file.size, progress);
-    await pipeline(response, counter, createWriteStream(internal, { flags: 'wx', highWaterMark: STREAM_HIGH_WATER_MARK }));
-    if (counter.bytes() !== file.size || hash.digest('hex') !== file.checksum) throw new Error('Download incompleto ou corrompido; o arquivo local foi preservado.');
+    const firstRes = await new Promise((resolve, reject) => { firstReq.once('error', reject); firstReq.once('response', resolve); firstReq.end(); });
+    if (parts > 1 && firstRes.statusCode === 206) {
+      const firstLen = Math.min(partSize, total);
+      if (Number(firstRes.headers['content-length']) !== firstLen) { firstRes.destroy(); throw new Error('Tamanho divergente no segmento inicial.'); }
+      handle = await fs.open(internal, 'wx+');
+      await handle.truncate(total);
+      let loadedTotal = 0, lastProgressAt = 0;
+      const reportChunk = delta => {
+        loadedTotal += delta;
+        const now = Date.now();
+        if (now - lastProgressAt >= 200 || loadedTotal === total) { lastProgressAt = now; progress?.(loadedTotal, total); }
+      };
+      const tasks = [writeResponseAtOffset(firstRes, handle, 0, firstLen, reportChunk)];
+      for (let i = 1; i < parts; i++) {
+        const start = i * partSize;
+        const end = Math.min(total - 1, start + partSize - 1);
+        const segLen = end - start + 1;
+        tasks.push((async () => {
+          const segReq = request(url, 'GET', { Range: `bytes=${start}-${end}` });
+          activeReqs.push(segReq);
+          const segRes = await new Promise((resolve, reject) => { segReq.once('error', reject); segReq.once('response', resolve); segReq.end(); });
+          if (segRes.statusCode !== 206 || Number(segRes.headers['content-length']) !== segLen) {
+            segRes.destroy();
+            throw Object.assign(new Error('Falha ao baixar faixa paralela do arquivo.'), { status: segRes.statusCode });
+          }
+          await writeResponseAtOffset(segRes, handle, start, segLen, reportChunk);
+        })());
+      }
+      await Promise.all(tasks);
+      await handle.close(); handle = null;
+      const verifiedDigest = await hashPool.computeFileHash(internal, total);
+      if (verifiedDigest !== file.checksum) throw new Error('Download incompleto ou corrompido; o arquivo local foi preservado.');
+    } else {
+      if (firstRes.statusCode !== 200) { firstRes.resume(); throw Object.assign(new Error('Servidor recusou o download.'), { status: firstRes.statusCode }); }
+      if (Number(firstRes.headers['content-length']) !== total) { firstRes.destroy(); throw new Error('Tamanho divergente no download.'); }
+      const hash = crypto.createHash('sha256'), counter = meter(hash, total, progress);
+      await pipeline(firstRes, counter, createWriteStream(internal, { flags: 'wx', highWaterMark: STREAM_HIGH_WATER_MARK }));
+      if (counter.bytes() !== total || hash.digest('hex') !== file.checksum) throw new Error('Download incompleto ou corrompido; o arquivo local foi preservado.');
+    }
     await native.assertExpected(absolute, expected);
     await fs.rename(internal, absolute);
     const saved = await fs.stat(absolute);
-    return { size: saved.size, mtimeMs: saved.mtimeMs, ctimeMs: saved.ctimeMs, identity: `${saved.dev}:${saved.ino}` };
-  } finally { req.destroy(); await fs.rm(internal, { force: true }); }
+    const identity = `${saved.dev}:${saved.ino}`;
+    native.remember?.(root, relative, { size: saved.size, mtimeMs: saved.mtimeMs, ctimeMs: saved.ctimeMs, identity, checksum: file.checksum });
+    return { size: saved.size, mtimeMs: saved.mtimeMs, ctimeMs: saved.ctimeMs, identity };
+  } finally {
+    if (handle) await handle.close().catch(() => {});
+    for (const r of activeReqs) r.destroy();
+    await fs.rm(internal, { force: true });
+  }
 }
 module.exports = { upload, download, MAX_TRANSFER_BYTES };

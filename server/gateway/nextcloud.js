@@ -23,8 +23,8 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const davAgents = {
-  'http:': new http.Agent({ keepAlive: true, keepAliveMsecs: 30000, maxSockets: 96, maxFreeSockets: 32, scheduling: 'lifo' }),
-  'https:': new https.Agent({ keepAlive: true, keepAliveMsecs: 30000, maxSockets: 96, maxFreeSockets: 32, scheduling: 'lifo' }),
+  'http:': new http.Agent({ keepAlive: true, keepAliveMsecs: 45000, maxSockets: 128, maxFreeSockets: 64, scheduling: 'lifo' }),
+  'https:': new https.Agent({ keepAlive: true, keepAliveMsecs: 45000, maxSockets: 128, maxFreeSockets: 64, scheduling: 'lifo' }),
 };
 const ensuredParents = new Set();
 const ensuringParents = new Map();
@@ -82,21 +82,20 @@ function open(method, target, headers = {}) {
   const auth = 'Basic ' + Buffer.from(cfg.user + ':' + cfg.password).toString('base64');
   const basePath = base.pathname.replace(/\/+$/, '');
   const requestPath = basePath + '/remote.php/dav/files/' + encodeURIComponent(cfg.user) + target;
-  return {
-    cfg,
-    request: lib.request({
-      method,
-      hostname: base.hostname,
-      port: base.port || (base.protocol === 'https:' ? 443 : 80),
-      path: requestPath,
-      agent: davAgents[base.protocol],
-      headers: {
-        Authorization: auth,
-        'User-Agent': 'FortesDrive-Gateway',
-        ...headers,
-      },
-    }),
-  };
+  const request = lib.request({
+    method,
+    hostname: base.hostname,
+    port: base.port || (base.protocol === 'https:' ? 443 : 80),
+    path: requestPath,
+    agent: davAgents[base.protocol],
+    headers: {
+      Authorization: auth,
+      'User-Agent': 'FortesDrive-Gateway',
+      ...headers,
+    },
+  });
+  request.setNoDelay(true);
+  return { cfg, request };
 }
 
 /** Requisição simples cujo corpo é lido inteiro (respostas pequenas). */
@@ -323,7 +322,7 @@ async function putFileOnce(cfg, key, filePath, size, sha256Hex) {
       });
       response.on('error', reject);
     });
-    const source = fs.createReadStream(filePath, { highWaterMark: 1024 * 1024 });
+    const source = fs.createReadStream(filePath, { highWaterMark: 4 * 1024 * 1024 });
     source.on('error', reject);
     source.pipe(req);
   });

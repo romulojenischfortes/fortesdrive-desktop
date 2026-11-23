@@ -4,7 +4,7 @@ const { createReadStream } = require("node:fs");
 const os = require("node:os");
 const crypto = require("node:crypto");
 
-const SMALL_FILE_BYTES = 8 * 1024 * 1024;
+const SMALL_FILE_BYTES = 16 * 1024 * 1024;
 const STREAM_CHUNK = 8 * 1024 * 1024;
 const EMPTY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 const fastSha256 = typeof crypto.hash === "function"
@@ -64,8 +64,8 @@ if (!isMainThread && parentPort) {
 } else {
   const { Worker } = require("node:worker_threads");
   const cpuCount = typeof os.availableParallelism === "function" ? os.availableParallelism() : (os.cpus()?.length || 4);
-  const POOL_SIZE = Math.max(4, Math.min(20, cpuCount));
-  const MAX_INFLIGHT_PER_WORKER = 16;
+  const POOL_SIZE = Math.max(4, Math.min(24, cpuCount));
+  const MAX_INFLIGHT_PER_WORKER = 24;
 
   let workers = null;
   let idleTimer = null;

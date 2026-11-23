@@ -42,8 +42,21 @@ class SyncEngine {
     this.state = { running: false, syncing: false, queue: 0, error: "", lastSync: null };
     this.badges = new ShellStatus();
     this.selfWrites = new Map();
+    this.dirtyPaths = new Set();
+    this.dirtyOverflow = false;
     this.manifests = new Map();
     this.manifestSaves = new Map();
+  }
+  noteChangedPath(relative) {
+    if (typeof relative !== "string" || !relative) return;
+    const clean = relative.split(path.sep).join("/").replace(/^\/+|\/+$/g, "");
+    if (!clean || clean === ".fortesdrive" || clean.startsWith(".fortesdrive/") || clean.startsWith(".fortesdrive-transfer-")) return;
+    if (this.dirtyPaths.size >= 2500) {
+      this.dirtyOverflow = true;
+      this.dirtyPaths.clear();
+      return;
+    }
+    this.dirtyPaths.add(clean);
   }
   async setWatchFolder(folder) {
     if (this.state.syncing) throw new Error("Aguarde a sincronização terminar antes de trocar a pasta");
@@ -52,6 +65,8 @@ class SyncEngine {
     await this.stop();
     this.watchFolder = canonical;
     this.completedScan = null;
+    this.dirtyPaths.clear();
+    this.dirtyOverflow = false;
     this.store.set("watchFolder", canonical);
     native.configureIndex(this.indexPath());
     this.folderConfigured = true;
@@ -73,13 +88,17 @@ class SyncEngine {
         ignored: /(^|[/\\])(?:\.fortesdrive([/\\]|$)|\.fortesdrive-transfer-)/,
         ignoreInitial: true, followSymlinks: false,
         usePolling: !!this.pollingFallback, interval: 1000, binaryInterval: 1000,
-        awaitWriteFinish: { stabilityThreshold: 2000, pollInterval: 400 },
+        awaitWriteFinish: { stabilityThreshold: 450, pollInterval: 120 },
       });
       this.watcher = watcher;
       this.state.running = true;
       watcher.on("all", (event, absolute) => {
         if (this.watcher !== watcher) return;
         this.badges.dirty(absolute);
+        if (this.watchFolder && absolute) {
+          const rel = path.relative(this.watchFolder, absolute);
+          if (rel && !rel.startsWith("..")) this.noteChangedPath(rel);
+        }
         if (this.isSelfWrite(absolute)) return;
         this.completedScan = null;
         if (!this.debounce) this.debounce = setTimeout(() => {
@@ -122,6 +141,7 @@ class SyncEngine {
   getStatus() { return { ...this.state, machineRole: this.store.get("machineRole", "client"), nativeStreaming: true, watchFolder: this.watchFolder, folderConfigured: this.folderConfigured, deviceId: this.deviceId }; }
   markSelfWrite(relative) {
     if (typeof relative !== "string" || !relative) return;
+    this.noteChangedPath(relative);
     const key = this.selfKey(relative);
     this.selfWrites.set(key, Date.now());
     if (this.selfWrites.size > 20000) {
@@ -310,6 +330,8 @@ class SyncEngine {
             at: Date.now(),
           };
           if (result.complete) {
+            this.dirtyPaths.clear();
+            this.dirtyOverflow = false;
             this.completedScan = { folder, result, at: Date.now() };
             this.notify();
             break;
@@ -327,17 +349,51 @@ class SyncEngine {
       if (instant) return instant;
       await this.bgScanning;
     }
-    if (incremental && this.completedScan && this.completedScan.folder === this.watchFolder && Date.now() - this.completedScan.at < 15000) {
+    if (incremental && this.completedScan && this.completedScan.folder === this.watchFolder && !this.dirtyPaths.size && !this.dirtyOverflow && Date.now() - this.completedScan.at < 15000) {
       const cached = this.completedScan.result;
       this.completedScan = null;
       return cached;
     }
     if (this.scanning) return this.scanning;
+    // Via rápida O(k): com o watcher ativo e a árvore base já carregada, inspeciona
+    // apenas os caminhos tocados no disco em poucos milissegundos.
+    if (incremental && this.state.running && !this.dirtyOverflow && typeof native.hasCompletedTree === "function" && native.hasCompletedTree(this.watchFolder)) {
+      const dirtyBatch = [...this.dirtyPaths];
+      this.dirtyPaths.clear();
+      this.scanning = (async () => {
+        const startedAt = Date.now();
+        try {
+          const baselineFiles = userId ? (await this.loadManifestObject(userId)).files : {};
+          const result = await native.scanIncremental(this.watchFolder, dirtyBatch, baselineFiles);
+          this.state.scan = {
+            phase: "idle",
+            total: result.totalFiles,
+            hashed: result.files.length,
+            pending: 0,
+            totalBytes: result.totalBytes,
+            hashedBytes: result.hashedBytes,
+            bytesPerSec: result.bytesPerSec,
+            walking: false,
+            walkMs: result.walkMs,
+            ms: Date.now() - startedAt,
+            startedAt,
+            at: Date.now(),
+          };
+          return result;
+        } catch (error) {
+          for (const p of dirtyBatch) this.noteChangedPath(p);
+          throw error;
+        }
+      })().finally(() => { this.scanning = null; });
+      return this.scanning;
+    }
     const startedAt = Date.now();
     const live = { phase: "scanning", total: 0, hashed: 0, pending: 0, totalBytes: 0, hashedBytes: 0, bytesPerSec: 0, walking: true, startedAt };
     this.state.scan = live;
     this.scanning = (async () => {
       try {
+        this.dirtyPaths.clear();
+        this.dirtyOverflow = false;
         const baselineFiles = userId ? (await this.loadManifestObject(userId)).files : {};
         const result = await native.scan(this.watchFolder, baselineFiles, {
           hashBudgetMs,

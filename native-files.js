@@ -131,12 +131,12 @@ async function safePath(root, relative, createParents = false) {
 }
 // A varredura precisa terminar depressa mesmo com dezenas de milhares de
 // arquivos. Pastas, metadados e resumos SHA-256 saturam SSDs NVMe modernos.
-const READDIR_LANES = 128;  // pastas listadas ao mesmo tempo em paralelo
-const STAT_LANES = 512;     // informações de itens pedidas ao mesmo tempo
-const HASH_LANES = 128;     // arquivos/lotes despachados simultaneamente ao pool multi-thread
-const SMALL_HASH_BATCH = 64;
-const SMALL_BATCH_ITEM_BYTES = 1024 * 1024;
-const SMALL_BATCH_MAX_BYTES = 8 * 1024 * 1024;
+const READDIR_LANES = 160;  // pastas listadas ao mesmo tempo em paralelo
+const STAT_LANES = 640;     // informações de itens pedidas ao mesmo tempo
+const HASH_LANES = 192;     // arquivos/lotes despachados simultaneamente ao pool multi-thread
+const SMALL_HASH_BATCH = 96;
+const SMALL_BATCH_ITEM_BYTES = 2 * 1024 * 1024;
+const SMALL_BATCH_MAX_BYTES = 16 * 1024 * 1024;
 // Uma única pasta ou arquivo que não responde (disco removido, OneDrive que
 // nunca baixa) não pode segurar a pasta inteira: cada operação tem o seu limite.
 const OP_TIMEOUT_MS = 20 * 1000;
@@ -150,8 +150,8 @@ const READDIR_TRIES = 2;
 // longo que as demais.
 const ROOT_TIMEOUT_MS = 60 * 1000;
 // A primeira passagem percorre toda a árvore e já libera os primeiros milhares de
-// arquivos em poucos segundos para o upload iniciar na hora.
-const HASH_BUDGET_MS = 2500;
+// arquivos em ~1 segundo para o upload iniciar na hora.
+const HASH_BUDGET_MS = 1200;
 
 function withTimeout(promise, ms, message) {
   let timer;
@@ -178,6 +178,9 @@ function createLimiter(limit) {
 // O que já foi percorrido e o que falta resumir, por pasta raiz. A árvore é
 // conhecida numa passagem só; este estado guarda o resultado dela.
 const walks = new Map();
+// Árvore completa em memória para reconciliação incremental O(1) via journal de
+// eventos do sistema de arquivos (padrão Google Drive / OneDrive).
+const completedTrees = new Map();
 function newWalk() {
   return { files: [], pending: [], directories: [], skipped: [], seen: new Set(), totalFiles: 0, totalBytes: 0, hashedBytes: 0, startedAt: Date.now(), walked: false, walkMs: 0, complete: false };
 }
@@ -239,7 +242,7 @@ async function walkTree(root, walk, report) {
 }
 
 async function scan(root, baseline = {}, { hashBudget = Infinity, hashBudgetMs = HASH_BUDGET_MS, onProgress, restart = false } = {}) {
-  if (cacheRoot !== root) { cacheRoot = root; checksums.clear(); walks.clear(); }
+  if (cacheRoot !== root) { cacheRoot = root; checksums.clear(); walks.clear(); completedTrees.clear(); }
   // O índice gravado na execução anterior volta já carregado: reabrir o cliente
   // não obriga a resumir de novo o que não mudou.
   await loadIndex();
@@ -387,6 +390,13 @@ async function scan(root, baseline = {}, { hashBudget = Infinity, hashBudgetMs =
     // O índice acompanha a pasta: o que sumiu do disco sai dele também.
     for (const key of [...index.keys()]) if (!walk.seen.has(key)) { index.delete(key); indexDirty = true; }
     saveIndexSoon();
+    completedTrees.set(root, {
+      files: new Map(walk.files.map(f => [f.path, f])),
+      dirs: new Map(walk.directories.map(d => [d.path, d])),
+      skipped: new Map(walk.skipped.map(s => [s.path, s])),
+      completedAt: Date.now(),
+      walkMs: walk.walkMs,
+    });
   }
   const elapsedSec = Math.max(0.001, (Date.now() - walk.startedAt) / 1000);
   return {
@@ -486,4 +496,193 @@ function peekScan(root) {
   };
 }
 
-module.exports = { safePath, scan, peekScan, read, write, move, checksum, assertExpected, configureIndex, shutdownPool: hashPool.shutdownPool, MAX_BYTES, MAX_SCAN_BYTES };
+function hasCompletedTree(root, maxAgeMs = 10 * 60 * 1000) {
+  if (cacheRoot !== root) return false;
+  const tree = completedTrees.get(root);
+  return Boolean(tree && Date.now() - tree.completedAt < maxAgeMs);
+}
+
+/**
+ * Atualiza em O(k) apenas os caminhos sinalizados pelo monitor de eventos,
+ * evitando revarrer dezenas de milhares de arquivos a cada edição ou exclusão.
+ */
+async function scanIncremental(root, dirtyRelatives = [], baseline = {}) {
+  if (!hasCompletedTree(root)) return scan(root, baseline);
+  await loadIndex();
+  for (const entry of Object.values(baseline)) {
+    if (entry.path && entry.ctimeMs != null && !checksums.has(entry.path)) checksums.set(entry.path, entry);
+  }
+  const tree = completedTrees.get(root);
+  const startedAt = Date.now();
+  const describe = (relative, stat, identity, digest) => ({
+    path: relative, name: relative.slice(relative.lastIndexOf("/") + 1),
+    size: stat.size, mtimeMs: stat.mtimeMs, ctimeMs: stat.ctimeMs, checksum: digest, identity,
+  });
+
+  const targets = [...new Set((dirtyRelatives || []).map(r => String(r || "").replace(/\\/g, "/").replace(/^\/+|\/+$/g, "")).filter(Boolean))];
+  if (!targets.length) {
+    const files = [...tree.files.values()];
+    const totalBytes = files.reduce((sum, f) => sum + f.size, 0);
+    return {
+      files, directories: [...tree.dirs.values()], skipped: [...tree.skipped.values()],
+      totalBytes, totalFiles: files.length, hashedBytes: totalBytes, bytesPerSec: 0,
+      pendingHash: 0, pendingBytes: 0, walked: true, complete: true, walkMs: 0, unread: [],
+    };
+  }
+
+  const hashFileItem = async (relative, absolute, stat, identity) => {
+    if (stat.size > MAX_SCAN_BYTES) {
+      tree.skipped.set(relative, { path: relative, size: stat.size, reason: "Acima do limite de 10 GiB por arquivo do servidor" });
+      return;
+    }
+    const known = checksums.get(relative);
+    const sameIdentity = !known?.identity || !identity || known.identity === identity;
+    if (known && known.size === stat.size && known.mtimeMs === stat.mtimeMs && sameIdentity) {
+      tree.files.set(relative, describe(relative, stat, identity, known.checksum));
+      return;
+    }
+    try {
+      let digest, after;
+      if (stat.size === 0) {
+        digest = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        after = await withTimeout(fs.stat(nativePath(absolute)), OP_TIMEOUT_MS, "O arquivo demorou demais para responder");
+      } else {
+        const verified = await hashPool.hashAndStat(nativePath(absolute), stat.size, READ_TIMEOUT_MS);
+        digest = verified.digest;
+        after = verified.after;
+      }
+      if (stat.size !== after.size || stat.mtimeMs !== after.mtimeMs) {
+        remember(root, relative, null);
+        tree.skipped.set(relative, { path: relative, reason: "Arquivo em edição ou download" });
+        return;
+      }
+      const afterIdentity = `${after.dev}:${after.ino}`;
+      remember(root, relative, { size: after.size, mtimeMs: after.mtimeMs, ctimeMs: after.ctimeMs, identity: afterIdentity, checksum: digest });
+      tree.files.set(relative, describe(relative, after, afterIdentity, digest));
+    } catch (e) {
+      tree.skipped.set(relative, { path: relative, reason: "Não foi possível ler: " + e.message });
+    }
+  };
+
+  const visitSubtree = async (folderAbs, prefixRel) => {
+    let entries;
+    try {
+      entries = await withTimeout(fs.readdir(nativePath(folderAbs), { withFileTypes: true }), OP_TIMEOUT_MS, "A pasta demorou demais para responder");
+    } catch (e) {
+      tree.skipped.set(prefixRel.replace(/\/$/, ""), { path: prefixRel.replace(/\/$/, ""), reason: "Pasta não pôde ser lida: " + e.message });
+      return;
+    }
+    const subdirs = [];
+    const fileTasks = [];
+    for (const entry of entries) {
+      if (entry.name === ".fortesdrive" || entry.name.startsWith(".fortesdrive-transfer-")) continue;
+      const rel = prefixRel + entry.name;
+      if (entry.isSymbolicLink()) { tree.skipped.set(rel, { path: rel, reason: "Link simbólico não sincronizado" }); continue; }
+      if (!validName(entry.name)) { tree.skipped.set(rel, { path: rel, reason: `Nome incompatível com o computador: ${entry.name}` }); continue; }
+      const abs = path.join(folderAbs, entry.name);
+      let st;
+      try { st = await withTimeout(fs.stat(nativePath(abs)), OP_TIMEOUT_MS, "O item demorou demais para responder"); }
+      catch (e) { tree.skipped.set(rel, { path: rel, reason: e.message }); continue; }
+      if (!st.isFile() && !st.isDirectory()) { tree.skipped.set(rel, { path: rel, reason: "Tipo não suportado" }); continue; }
+      const id = `${st.dev}:${st.ino}`;
+      if (st.isDirectory()) {
+        tree.dirs.set(rel, { path: rel, identity: id });
+        subdirs.push({ abs, prefix: rel + "/" });
+      } else {
+        fileTasks.push(() => hashFileItem(rel, abs, st, id));
+      }
+    }
+    const limiter = createLimiter(64);
+    await Promise.all([
+      ...fileTasks.map(fn => limiter(fn)),
+      ...subdirs.map(d => visitSubtree(d.abs, d.prefix)),
+    ]);
+  };
+
+  // Remove entradas antigas dos caminhos afetados antes de reinspecionar no disco.
+  for (const rel of targets) {
+    if (rel === ".fortesdrive" || rel.startsWith(".fortesdrive/") || rel.startsWith(".fortesdrive-transfer-")) continue;
+    const prefix = rel + "/";
+    if (tree.files.delete(rel)) remember(root, rel, null);
+    tree.dirs.delete(rel);
+    tree.skipped.delete(rel);
+    for (const k of [...tree.files.keys()]) if (k.startsWith(prefix)) { tree.files.delete(k); remember(root, k, null); }
+    for (const k of [...tree.dirs.keys()]) if (k.startsWith(prefix)) tree.dirs.delete(k);
+    for (const k of [...tree.skipped.keys()]) if (k.startsWith(prefix)) tree.skipped.delete(k);
+  }
+
+  const targetLimiter = createLimiter(64);
+  await Promise.all(targets.map(rel => targetLimiter(async () => {
+    const parts = rel.split("/");
+    if (parts.some(p => p === ".fortesdrive" || p.startsWith(".fortesdrive-transfer-"))) return;
+    if (parts.some(p => !validName(p))) {
+      const absCheck = path.join(root, ...parts);
+      const exists = await fs.lstat(nativePath(absCheck)).then(() => true, () => false);
+      if (exists) tree.skipped.set(rel, { path: rel, reason: `Nome incompatível com o computador: ${parts.find(p => !validName(p))}` });
+      return;
+    }
+    // Garante ancestrais registrados em tree.dirs quando arquivo nasce em pasta nova.
+    let parentAcc = "";
+    for (let i = 0; i < parts.length - 1; i++) {
+      parentAcc = parentAcc ? parentAcc + "/" + parts[i] : parts[i];
+      if (!tree.dirs.has(parentAcc)) {
+        const parentAbs = path.join(root, ...parentAcc.split("/"));
+        const pStat = await fs.lstat(nativePath(parentAbs)).catch(() => null);
+        if (pStat?.isDirectory() && !pStat.isSymbolicLink()) {
+          tree.dirs.set(parentAcc, { path: parentAcc, identity: `${pStat.dev}:${pStat.ino}` });
+        }
+      }
+    }
+    const absolute = path.join(root, ...parts);
+    let lstat;
+    try { lstat = await withTimeout(fs.lstat(nativePath(absolute)), OP_TIMEOUT_MS, "O item demorou demais para responder"); }
+    catch (e) {
+      if (e.code === "ENOENT") return;
+      tree.skipped.set(rel, { path: rel, reason: e.message });
+      return;
+    }
+    if (lstat.isSymbolicLink()) {
+      tree.skipped.set(rel, { path: rel, reason: "Link simbólico não sincronizado" });
+      return;
+    }
+    let stat = lstat;
+    try { stat = await withTimeout(fs.stat(nativePath(absolute)), OP_TIMEOUT_MS, "O item demorou demais para responder"); }
+    catch (e) {
+      if (e.code === "ENOENT") return;
+      tree.skipped.set(rel, { path: rel, reason: e.message });
+      return;
+    }
+    if (!stat.isFile() && !stat.isDirectory()) {
+      tree.skipped.set(rel, { path: rel, reason: "Tipo não suportado" });
+      return;
+    }
+    const identity = `${stat.dev}:${stat.ino}`;
+    if (stat.isDirectory()) {
+      tree.dirs.set(rel, { path: rel, identity });
+      await visitSubtree(absolute, rel + "/");
+    } else {
+      await hashFileItem(rel, absolute, stat, identity);
+    }
+  })));
+
+  const files = [...tree.files.values()];
+  const totalBytes = files.reduce((sum, f) => sum + f.size, 0);
+  const walkMs = Date.now() - startedAt;
+  return {
+    files,
+    directories: [...tree.dirs.values()],
+    skipped: [...tree.skipped.values()],
+    totalBytes,
+    totalFiles: files.length,
+    hashedBytes: totalBytes,
+    bytesPerSec: walkMs > 0 ? Math.round(totalBytes / (walkMs / 1000)) : 0,
+    pendingHash: 0,
+    pendingBytes: 0,
+    walked: true,
+    complete: true,
+    walkMs,
+    unread: [],
+  };
+}
+
+module.exports = { safePath, scan, scanIncremental, hasCompletedTree, remember, peekScan, read, write, move, checksum, assertExpected, configureIndex, shutdownPool: hashPool.shutdownPool, MAX_BYTES, MAX_SCAN_BYTES };

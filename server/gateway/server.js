@@ -56,13 +56,13 @@ const MAX_UPLOAD_BYTES = Number(process.env.MAX_UPLOAD_BYTES || 10737418240);
 // Envio em lote: o cliente manda até 30 arquivos ao mesmo tempo. O gateway
 // aceita esses 30 e, se chegar mais, o arquivo espera a vez (acquireUploadSlot)
 // em vez de ser recusado — a fila nunca para no meio.
-const MAX_CONCURRENT_UPLOADS = Number(process.env.MAX_CONCURRENT_UPLOADS || 64);
+const MAX_CONCURRENT_UPLOADS = Number(process.env.MAX_CONCURRENT_UPLOADS || 96);
 // Sincronização em lote faz dezenas de milhares de chamadas por minuto através do
 // mesmo túnel Cloudflare: o limite barra abuso sem frear transferências assinadas.
-const RATE_LIMIT_PER_MINUTE = Number(process.env.RATE_LIMIT_PER_MINUTE || 60000);
+const RATE_LIMIT_PER_MINUTE = Number(process.env.RATE_LIMIT_PER_MINUTE || 120000);
 // Tempo máximo que um arquivo espera por uma vaga antes de o cliente tentar de novo.
 const UPLOAD_SLOT_WAIT_MS = Number(process.env.UPLOAD_SLOT_WAIT_MS || 120000);
-const VERSION = '2.2.2';
+const VERSION = '2.3.0';
 const STARTED_AT = Date.now();
 const MAX_SIGNATURE_LIFETIME_MS = 25 * 3600 * 1000;
 // Pasta onde estão os arquivos gravados antes da migração (o volume da pasta
@@ -269,7 +269,7 @@ function cachedStorage(maxAgeMs) {
 // "armazenamento offline" e recusava todos os arquivos da pasta. Agora o
 // resultado recente é reaproveitado e a resposta nunca espera mais que alguns
 // segundos pelo teste.
-const STATUS_CACHE_MS = 20000;
+const STATUS_CACHE_MS = 45000;
 const STATUS_PROBE_MAX_MS = 4000;
 
 async function statusProbe() {
@@ -422,7 +422,7 @@ function streamFile(filePath, res, options) {
   return new Promise((resolve) => {
     // Blocos maiores por leitura: menos idas ao disco e mais dados em voo por
     // conexão, o que faz diferença em links rápidos e túneis com latência.
-    const stream = fs.createReadStream(filePath, { highWaterMark: 1024 * 1024, ...options });
+    const stream = fs.createReadStream(filePath, { highWaterMark: 4 * 1024 * 1024, ...options });
     stream.on('error', () => {
       if (!res.headersSent) sendJson(res, 500, { error: 'Falha ao ler o arquivo no disco.' });
       else res.destroy();
