@@ -4,6 +4,7 @@ const crypto = require("crypto");
 const path = require("path");
 const fs = require("fs/promises");
 const native = require("./native-files");
+const { isKnownBrowserCachePath } = require("./browser-cache");
 const {ShellStatus} = require("./shell-status");
 
 const yieldLoop = () => new Promise(resolve => setImmediate(resolve));
@@ -46,6 +47,14 @@ class SyncEngine {
     this.dirtyOverflow = false;
     this.manifests = new Map();
     this.manifestSaves = new Map();
+  }
+  relativeFromWatch(absolute) {
+    if (!this.watchFolder || typeof absolute !== "string" || !absolute) return null;
+    const rootClean = native.stripExtendedPrefix ? native.stripExtendedPrefix(this.watchFolder) : this.watchFolder;
+    const targetClean = native.stripExtendedPrefix ? native.stripExtendedPrefix(absolute) : absolute;
+    const rel = path.relative(rootClean, targetClean);
+    if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) return null;
+    return rel.split(path.sep).join("/").replace(/^\/+|\/+$/g, "");
   }
   noteChangedPath(relative) {
     if (typeof relative !== "string" || !relative) return;
@@ -94,11 +103,10 @@ class SyncEngine {
       this.state.running = true;
       watcher.on("all", (event, absolute) => {
         if (this.watcher !== watcher) return;
+        const rel = this.relativeFromWatch(absolute);
+        if (rel && isKnownBrowserCachePath(rel)) return;
         this.badges.dirty(absolute);
-        if (this.watchFolder && absolute) {
-          const rel = path.relative(this.watchFolder, absolute);
-          if (rel && !rel.startsWith("..")) this.noteChangedPath(rel);
-        }
+        if (rel) this.noteChangedPath(rel);
         if (this.isSelfWrite(absolute)) return;
         this.completedScan = null;
         if (!this.debounce) this.debounce = setTimeout(() => {
@@ -132,7 +140,7 @@ class SyncEngine {
     await this.starting?.catch(() => {});
     this.state.running = false;
     await this.bgScanning?.catch(() => {});
-    await this.flushManifests().catch(() => {});
+    await Promise.allSettled([this.flushManifests(), native.flushIndex?.()]);
     const watcher = this.watcher;
     this.watcher = null;
     await watcher?.close();
@@ -151,8 +159,8 @@ class SyncEngine {
   }
   selfKey(relative) { return process.platform === "win32" ? relative.toLowerCase() : relative; }
   isSelfWrite(absolute) {
-    if (!this.watchFolder) return false;
-    const relative = path.relative(this.watchFolder, absolute).split(path.sep).join("/");
+    const relative = this.relativeFromWatch(absolute);
+    if (!relative) return false;
     const at = this.selfWrites.get(this.selfKey(relative));
     if (!at) return false;
     if (Date.now() - at > 120000) { this.selfWrites.delete(this.selfKey(relative)); return false; }

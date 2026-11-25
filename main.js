@@ -375,7 +375,7 @@ function registerHandlers() {
       return { saved: true, count: result.count };
     },
     setState: async state => {
-      const allowed = ["syncing", "queue", "error", "lastSync", "userEmail", "online", "conflicts", "syncedCount", "skipped", "issues", "progress", "progressMode", "progressLabel", "localBytes", "localFiles", "cloudBytes", "cloudFiles", "pendingUploadBytes", "pendingUploadFiles", "historyError"];
+      const allowed = ["syncing", "queue", "error", "lastSync", "userEmail", "online", "conflicts", "syncedCount", "skipped", "retriableSkipped", "ignored", "ignoredItems", "issues", "progress", "progressMode", "progressLabel", "localBytes", "localFiles", "cloudBytes", "cloudFiles", "pendingUploadBytes", "pendingUploadFiles", "historyError"];
       for (const key of allowed) if (Object.hasOwn(state, key)) syncEngine.state[key] = state[key];
       applyWindowsProgress();
       const current = syncEngine.state;

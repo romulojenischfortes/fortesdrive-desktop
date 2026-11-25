@@ -1,6 +1,6 @@
 {
   "name": "fortesdrive-desktop",
-  "version": "1.12.0",
+  "version": "1.13.0",
   "description": "FortesDrive Desktop — instalador unificado cliente e servidor, sincronizacao nativa em fluxo",
   "author": "FortesDrive",
   "license": "MIT",
@@ -32,6 +32,7 @@
       "transfer-history.js",
       "server-tunnel.js",
       "build/icon.png",
+      "browser-cache.js",
       "hash-pool.js",
       "native-files.js",
       "native-transfers.js",

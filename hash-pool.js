@@ -5,11 +5,36 @@ const os = require("node:os");
 const crypto = require("node:crypto");
 
 const SMALL_FILE_BYTES = 16 * 1024 * 1024;
-const STREAM_CHUNK = 8 * 1024 * 1024;
+const STREAM_CHUNK = 4 * 1024 * 1024;
+const BATCH_WORKER_CONCURRENCY = 16;
 const EMPTY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 const fastSha256 = typeof crypto.hash === "function"
   ? (buf) => crypto.hash("sha256", buf, "hex")
   : (buf) => crypto.createHash("sha256").update(buf).digest("hex");
+
+// Buffer reutilizável por leitura sequencial grande: evita alocar/coletar
+// centenas de buffers de 8 MB na heap V8 durante a verificação de vídeos/ISOs.
+let reusableReadBuffer = null;
+let reusableBusy = false;
+
+async function readLargeHandleSha256(handle) {
+  const ownBuffer = reusableBusy ? Buffer.allocUnsafe(STREAM_CHUNK) : (reusableReadBuffer ||= Buffer.allocUnsafe(STREAM_CHUNK));
+  const claimedShared = !reusableBusy && ownBuffer === reusableReadBuffer;
+  if (claimedShared) reusableBusy = true;
+  try {
+    const hash = crypto.createHash("sha256");
+    let position = 0;
+    for (;;) {
+      const { bytesRead } = await handle.read(ownBuffer, 0, ownBuffer.length, position);
+      if (bytesRead <= 0) break;
+      position += bytesRead;
+      hash.update(bytesRead === ownBuffer.length ? ownBuffer : ownBuffer.subarray(0, bytesRead));
+    }
+    return hash.digest("hex");
+  } finally {
+    if (claimedShared) reusableBusy = false;
+  }
+}
 
 async function computeFileHash(file, size) {
   if (size === 0) return EMPTY_SHA256;
@@ -17,38 +42,65 @@ async function computeFileHash(file, size) {
     const buffer = await fs.readFile(file);
     return fastSha256(buffer);
   }
-  const hash = crypto.createHash("sha256");
-  for await (const chunk of createReadStream(file, { highWaterMark: STREAM_CHUNK })) {
-    hash.update(chunk);
+  const handle = await fs.open(file, "r");
+  try {
+    return await readLargeHandleSha256(handle);
+  } finally {
+    await handle.close().catch(() => {});
   }
-  return hash.digest("hex");
 }
 
 async function hashOneFile(file, size) {
-  const digest = await computeFileHash(file, size);
-  const after = await fs.stat(file);
-  return {
-    digest,
-    after: {
-      size: after.size,
-      mtimeMs: after.mtimeMs,
-      ctimeMs: after.ctimeMs,
-      dev: after.dev,
-      ino: after.ino,
-    },
-  };
+  if (size === 0) {
+    const after = await fs.stat(file);
+    return {
+      digest: EMPTY_SHA256,
+      after: { size: after.size, mtimeMs: after.mtimeMs, ctimeMs: after.ctimeMs, dev: after.dev, ino: after.ino },
+    };
+  }
+  // Abre o descritor uma única vez para ler os bytes e consultar o metadado pós-leitura
+  // sem reabrir o caminho no NTFS.
+  const handle = await fs.open(file, "r");
+  try {
+    let digest;
+    if (size != null && size <= SMALL_FILE_BYTES) {
+      const buffer = await handle.readFile();
+      digest = fastSha256(buffer);
+    } else {
+      digest = await readLargeHandleSha256(handle);
+    }
+    const after = await handle.stat();
+    return {
+      digest,
+      after: {
+        size: after.size,
+        mtimeMs: after.mtimeMs,
+        ctimeMs: after.ctimeMs,
+        dev: after.dev,
+        ino: after.ino,
+      },
+    };
+  } finally {
+    await handle.close().catch(() => {});
+  }
 }
 
 if (!isMainThread && parentPort) {
   parentPort.on("message", async (msg) => {
     const { id, batch, file, size } = msg;
     if (Array.isArray(batch)) {
-      const results = await Promise.all(batch.map(async (entry) => {
-        try {
-          const res = await hashOneFile(entry.file, entry.size);
-          return { ok: true, digest: res.digest, after: res.after };
-        } catch (error) {
-          return { ok: false, error: error.message || "Falha ao ler arquivo" };
+      const results = new Array(batch.length);
+      let cursor = 0;
+      await Promise.all(Array.from({ length: Math.min(BATCH_WORKER_CONCURRENCY, batch.length) }, async () => {
+        while (cursor < batch.length) {
+          const idx = cursor++;
+          const entry = batch[idx];
+          try {
+            const res = await hashOneFile(entry.file, entry.size);
+            results[idx] = { ok: true, digest: res.digest, after: res.after };
+          } catch (error) {
+            results[idx] = { ok: false, error: error.message || "Falha ao ler arquivo" };
+          }
         }
       }));
       parentPort.postMessage({ id, ok: true, results });

@@ -2,6 +2,7 @@ const fs = require("fs/promises");
 const path = require("path");
 const crypto = require("crypto");
 const hashPool = require("./hash-pool");
+const { classifyBrowserCachePath } = require("./browser-cache");
 const MAX_BYTES = 100 * 1024 * 1024; // IPC legado: nunca carrega arquivos grandes na RAM.
 const MAX_SCAN_BYTES = 10 * 1024 * 1024 * 1024;
 
@@ -28,7 +29,15 @@ let indexFile = null;
 let indexLoaded = false;
 let indexDirty = false;
 let indexTimer = null;
+let journalTimer = null;
+let journalBuffer = [];
+let journalEntriesCount = 0;
+let compacting = Promise.resolve();
 const index = new Map();
+
+function journalPath() {
+  return indexFile ? indexFile + ".journal" : null;
+}
 
 function configureIndex(file) {
   if (indexFile === file) return;
@@ -36,7 +45,11 @@ function configureIndex(file) {
   indexLoaded = false;
   index.clear();
   clearTimeout(indexTimer);
+  clearTimeout(journalTimer);
   indexTimer = null;
+  journalTimer = null;
+  journalBuffer = [];
+  journalEntriesCount = 0;
   indexDirty = false;
 }
 
@@ -48,19 +61,63 @@ async function loadIndex() {
     const data = JSON.parse(await fs.readFile(indexFile, "utf8"));
     for (const [relative, entry] of Object.entries(data || {})) if (entry?.checksum) index.set(relative, entry);
   } catch (e) {
-    // Primeira execução ou índice ilegível: a varredura resume os arquivos.
+    // Primeira execução ou índice base ainda não gravado.
   }
+  const jFile = journalPath();
+  if (!jFile) return;
+  try {
+    const rawJournal = await fs.readFile(jFile, "utf8");
+    const lines = rawJournal.split("\n");
+    for (const line of lines) {
+      if (!line) continue;
+      try {
+        const rec = JSON.parse(line);
+        if (!rec || typeof rec.k !== "string") continue;
+        if (rec.v?.checksum) index.set(rec.k, rec.v);
+        else index.delete(rec.k);
+        journalEntriesCount++;
+      } catch {}
+    }
+  } catch {}
 }
 
 const yieldLoop = () => new Promise(resolve => setImmediate(resolve));
 
-function saveIndexSoon(delayMs = 20000) {
-  if (!indexFile || indexTimer) return;
-  indexTimer = setTimeout(async () => {
-    indexTimer = null;
-    if (!indexDirty) return;
+async function flushJournalNow() {
+  if (!indexFile || !journalBuffer.length) return;
+  const lines = journalBuffer.splice(0, journalBuffer.length);
+  const jFile = journalPath();
+  if (!jFile) return;
+  try {
+    await fs.mkdir(path.dirname(jFile), { recursive: true });
+    await fs.appendFile(jFile, lines.join(""), "utf8");
+    journalEntriesCount += lines.length;
+    if (journalEntriesCount >= 2500) saveIndexSoon(500);
+  } catch {}
+}
+
+function scheduleJournalFlush() {
+  if (!indexFile || journalTimer) return;
+  journalTimer = setTimeout(() => {
+    journalTimer = null;
+    void flushJournalNow();
+  }, 400);
+  journalTimer.unref?.();
+}
+
+function compactIndexNow() {
+  if (!indexFile) return Promise.resolve();
+  compacting = compacting.catch(() => {}).then(async () => {
+    clearTimeout(journalTimer);
+    journalTimer = null;
+    journalBuffer = [];
+    if (!indexDirty && journalEntriesCount === 0) return;
     indexDirty = false;
+    const targetFile = indexFile;
+    const jFile = journalPath();
+    if (!targetFile) return;
     try {
+      await fs.mkdir(path.dirname(targetFile), { recursive: true });
       const snapshot = [...index.entries()];
       const chunks = ["{"];
       for (let i = 0; i < snapshot.length; i++) {
@@ -69,24 +126,47 @@ function saveIndexSoon(delayMs = 20000) {
         if ((i + 1) % 4000 === 0) await yieldLoop();
       }
       chunks.push("}");
-      const temp = indexFile + ".tmp";
+      const temp = targetFile + ".tmp";
       await fs.writeFile(temp, chunks.join(""), "utf8");
-      await fs.rename(temp, indexFile);
-    } catch (e) {
-      // O índice é só um acelerador: falhar ao gravá-lo não afeta a sincronização.
-    }
+      await fs.rename(temp, targetFile);
+      journalEntriesCount = 0;
+      if (jFile) await fs.rm(jFile, { force: true }).catch(() => {});
+    } catch {}
+  });
+  return compacting;
+}
+
+function saveIndexSoon(delayMs = 15000) {
+  if (!indexFile || indexTimer) return;
+  indexTimer = setTimeout(() => {
+    indexTimer = null;
+    void compactIndexNow();
   }, delayMs);
   indexTimer.unref?.();
+}
+
+async function flushIndex() {
+  clearTimeout(indexTimer);
+  indexTimer = null;
+  await flushJournalNow();
+  if (indexDirty || journalEntriesCount > 0) await compactIndexNow();
 }
 
 // Nomes que o Windows não aceita: um só arquivo assim não pode derrubar a pasta.
 const BAD_CHARS = /[<>:"|?*\x00-\x1f]/;
 const RESERVED = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i;
 const WINDOWS = process.platform === "win32";
+
 function validName(name) {
   return !!name && name !== "." && name !== ".." && name !== ".fortesdrive"
     && !BAD_CHARS.test(name) && !/[ .]$/.test(name) && !RESERVED.test(name);
 }
+
+function stripExtendedPrefix(p) {
+  if (typeof p !== "string") return "";
+  return p.startsWith("\\\\?\\") ? p.slice(4) : p;
+}
+
 // Documentos jurídicos passam fácil dos 260 caracteres que o Windows atende por
 // padrão. O prefixo nativo libera o caminho longo; antes, essas pastas eram
 // puladas inteiras e nunca chegavam à nuvem.
@@ -100,6 +180,11 @@ function remember(root, relative, entry) {
   if (entry) { checksums.set(relative, entry); index.set(relative, entry); }
   else { checksums.delete(relative); index.delete(relative); }
   indexDirty = true;
+  if (indexFile) {
+    journalBuffer.push(JSON.stringify({ k: relative, v: entry || null }) + "\n");
+    if (journalBuffer.length >= 256) void flushJournalNow();
+    else scheduleJournalFlush();
+  }
   saveIndexSoon();
 }
 
@@ -182,7 +267,7 @@ const walks = new Map();
 // eventos do sistema de arquivos (padrão Google Drive / OneDrive).
 const completedTrees = new Map();
 function newWalk() {
-  return { files: [], pending: [], directories: [], skipped: [], seen: new Set(), totalFiles: 0, totalBytes: 0, hashedBytes: 0, startedAt: Date.now(), walked: false, walkMs: 0, complete: false };
+  return { files: [], pending: [], directories: [], skipped: [], ignored: [], seen: new Set(), totalFiles: 0, totalBytes: 0, hashedBytes: 0, startedAt: Date.now(), walked: false, walkMs: 0, complete: false };
 }
 
 /**
@@ -204,24 +289,27 @@ async function walkTree(root, walk, report) {
         ));
         break;
       } catch (e) {
-        // Uma pasta que não responde é tentada de novo antes de ser dada como
-        // ilegível: uma falha passageira não pode excluir o conteúdo dela.
         if (attempt < READDIR_TRIES) { await new Promise(resolve => setTimeout(resolve, 200 * (attempt + 1))); continue; }
-        // Sem a raiz não existe varredura nenhuma. Antes, o motivo virava um item
-        // "fora da sincronização" com caminho vazio — e caminho vazio protege a
-        // pasta inteira, então o envio e o download paravam sem dizer por quê.
         if (!prefix) throw new Error("A pasta de sincronização não pôde ser lida: " + e.message);
         walk.skipped.push({ path: prefix.replace(/\/$/, ""), reason: "Pasta não pôde ser lida: " + e.message });
         return;
       }
     }
+    const siblingNamesLower = new Set(entries.map(item => item.name.toLowerCase()));
     const subfolders = [];
     await Promise.all(entries.map(async entry => {
       if (entry.name === ".fortesdrive" || entry.name.startsWith(".fortesdrive-transfer-")) return;
-      if (entry.isSymbolicLink()) { walk.skipped.push({ path: prefix + entry.name, reason: "Link simbólico não sincronizado" }); return; }
-      // O nome é conferido aqui, sem reabrir pasta por pasta.
-      if (!validName(entry.name)) { walk.skipped.push({ path: prefix + entry.name, reason: `Nome incompatível com o computador: ${entry.name}` }); return; }
       const relative = prefix + entry.name;
+      // Verifica diretórios/entradas temporárias de cache de navegador ANTES de
+      // validar nomes ou descer em dezenas de milhares de arquivos efêmeros.
+      const cacheMatch = classifyBrowserCachePath(relative, siblingNamesLower);
+      if (cacheMatch && (entry.isDirectory() || cacheMatch.rootPath === relative)) {
+        walk.ignored.push({ path: cacheMatch.rootPath, kind: "browser_cache", ignored: true, reason: cacheMatch.reason });
+        return;
+      }
+      if (entry.isSymbolicLink()) { walk.skipped.push({ path: relative, reason: "Link simbólico não sincronizado" }); return; }
+      // O nome é conferido aqui, sem reabrir pasta por pasta.
+      if (!validName(entry.name)) { walk.skipped.push({ path: relative, reason: `Nome incompatível com o computador: ${entry.name}` }); return; }
       const absolute = path.join(folder, entry.name);
       let stat;
       try { stat = await info(() => withTimeout(fs.stat(nativePath(absolute)), OP_TIMEOUT_MS, "O item demorou demais para responder")); }
@@ -229,7 +317,16 @@ async function walkTree(root, walk, report) {
       // Pula reparse points do OneDrive (Files On-Demand) e outros não regulares.
       if (!stat.isFile() && !stat.isDirectory()) { walk.skipped.push({ path: relative, reason: "Tipo não suportado" }); return; }
       const identity = `${stat.dev}:${stat.ino}`;
-      if (stat.isDirectory()) { walk.directories.push({ path: relative, identity }); subfolders.push(entry.name); return; }
+      if (stat.isDirectory()) {
+        const dirCache = classifyBrowserCachePath(relative, siblingNamesLower);
+        if (dirCache) {
+          walk.ignored.push({ path: dirCache.rootPath, kind: "browser_cache", ignored: true, reason: dirCache.reason });
+          return;
+        }
+        walk.directories.push({ path: relative, identity });
+        subfolders.push(entry.name);
+        return;
+      }
       walk.totalBytes += stat.size; walk.totalFiles++;
       if (stat.size > MAX_SCAN_BYTES) { walk.skipped.push({ path: relative, size: stat.size, reason: "Acima do limite de 10 GiB por arquivo do servidor" }); return; }
       walk.seen.add(relative);
@@ -390,17 +487,19 @@ async function scan(root, baseline = {}, { hashBudget = Infinity, hashBudgetMs =
     // O índice acompanha a pasta: o que sumiu do disco sai dele também.
     for (const key of [...index.keys()]) if (!walk.seen.has(key)) { index.delete(key); indexDirty = true; }
     saveIndexSoon();
+    void flushJournalNow();
     completedTrees.set(root, {
       files: new Map(walk.files.map(f => [f.path, f])),
       dirs: new Map(walk.directories.map(d => [d.path, d])),
       skipped: new Map(walk.skipped.map(s => [s.path, s])),
+      ignored: new Map(walk.ignored.map(ig => [ig.path, ig])),
       completedAt: Date.now(),
       walkMs: walk.walkMs,
     });
   }
   const elapsedSec = Math.max(0.001, (Date.now() - walk.startedAt) / 1000);
   return {
-    files: walk.files, directories: walk.directories, skipped: walk.skipped,
+    files: walk.files, directories: walk.directories, skipped: walk.skipped, ignored: walk.ignored,
     totalBytes: walk.totalBytes, totalFiles: walk.totalFiles,
     hashedBytes: walk.hashedBytes,
     bytesPerSec: Math.round(walk.hashedBytes / elapsedSec),
@@ -483,6 +582,7 @@ function peekScan(root) {
     files: walk.files.slice(),
     directories: walk.directories.slice(),
     skipped: walk.skipped.slice(),
+    ignored: walk.ignored.slice(),
     totalBytes: walk.totalBytes,
     totalFiles: walk.totalFiles,
     hashedBytes: walk.hashedBytes,
@@ -519,12 +619,13 @@ async function scanIncremental(root, dirtyRelatives = [], baseline = {}) {
     size: stat.size, mtimeMs: stat.mtimeMs, ctimeMs: stat.ctimeMs, checksum: digest, identity,
   });
 
+  tree.ignored ||= new Map();
   const targets = [...new Set((dirtyRelatives || []).map(r => String(r || "").replace(/\\/g, "/").replace(/^\/+|\/+$/g, "")).filter(Boolean))];
   if (!targets.length) {
     const files = [...tree.files.values()];
     const totalBytes = files.reduce((sum, f) => sum + f.size, 0);
     return {
-      files, directories: [...tree.dirs.values()], skipped: [...tree.skipped.values()],
+      files, directories: [...tree.dirs.values()], skipped: [...tree.skipped.values()], ignored: [...tree.ignored.values()],
       totalBytes, totalFiles: files.length, hashedBytes: totalBytes, bytesPerSec: 0,
       pendingHash: 0, pendingBytes: 0, walked: true, complete: true, walkMs: 0, unread: [],
     };
@@ -572,11 +673,17 @@ async function scanIncremental(root, dirtyRelatives = [], baseline = {}) {
       tree.skipped.set(prefixRel.replace(/\/$/, ""), { path: prefixRel.replace(/\/$/, ""), reason: "Pasta não pôde ser lida: " + e.message });
       return;
     }
+    const siblingNamesLower = new Set(entries.map(item => item.name.toLowerCase()));
     const subdirs = [];
     const fileTasks = [];
     for (const entry of entries) {
       if (entry.name === ".fortesdrive" || entry.name.startsWith(".fortesdrive-transfer-")) continue;
       const rel = prefixRel + entry.name;
+      const cacheMatch = classifyBrowserCachePath(rel, siblingNamesLower);
+      if (cacheMatch && (entry.isDirectory() || cacheMatch.rootPath === rel)) {
+        tree.ignored.set(cacheMatch.rootPath, { path: cacheMatch.rootPath, kind: "browser_cache", ignored: true, reason: cacheMatch.reason });
+        continue;
+      }
       if (entry.isSymbolicLink()) { tree.skipped.set(rel, { path: rel, reason: "Link simbólico não sincronizado" }); continue; }
       if (!validName(entry.name)) { tree.skipped.set(rel, { path: rel, reason: `Nome incompatível com o computador: ${entry.name}` }); continue; }
       const abs = path.join(folderAbs, entry.name);
@@ -606,15 +713,45 @@ async function scanIncremental(root, dirtyRelatives = [], baseline = {}) {
     if (tree.files.delete(rel)) remember(root, rel, null);
     tree.dirs.delete(rel);
     tree.skipped.delete(rel);
+    tree.ignored.delete(rel);
     for (const k of [...tree.files.keys()]) if (k.startsWith(prefix)) { tree.files.delete(k); remember(root, k, null); }
     for (const k of [...tree.dirs.keys()]) if (k.startsWith(prefix)) tree.dirs.delete(k);
     for (const k of [...tree.skipped.keys()]) if (k.startsWith(prefix)) tree.skipped.delete(k);
+    for (const k of [...tree.ignored.keys()]) if (k.startsWith(prefix)) tree.ignored.delete(k);
   }
+
+  const readParentSiblingSet = async (parts) => {
+    if (parts.length < 1) return null;
+    const parentAbs = parts.length > 1 ? path.join(root, ...parts.slice(0, -1)) : root;
+    try {
+      const list = await fs.readdir(nativePath(parentAbs));
+      return new Set(list.map(n => n.toLowerCase()));
+    } catch {
+      return null;
+    }
+  };
 
   const targetLimiter = createLimiter(64);
   await Promise.all(targets.map(rel => targetLimiter(async () => {
     const parts = rel.split("/");
     if (parts.some(p => p === ".fortesdrive" || p.startsWith(".fortesdrive-transfer-"))) return;
+    // Avalia cache temporário do navegador ANTES de validName, impedindo que
+    // entradas voláteis dentro do cache virem erro de "Nome incompatível".
+    let cacheMatch = classifyBrowserCachePath(rel);
+    if (!cacheMatch) {
+      const parentSiblings = await readParentSiblingSet(parts);
+      if (parentSiblings) cacheMatch = classifyBrowserCachePath(rel, parentSiblings);
+    }
+    if (cacheMatch) {
+      const rootCacheAbs = path.join(root, ...cacheMatch.rootPath.split("/"));
+      const rootExists = await fs.lstat(nativePath(rootCacheAbs)).then(() => true, () => false);
+      if (rootExists) {
+        tree.ignored.set(cacheMatch.rootPath, { path: cacheMatch.rootPath, kind: "browser_cache", ignored: true, reason: cacheMatch.reason });
+      } else {
+        tree.ignored.delete(cacheMatch.rootPath);
+      }
+      return;
+    }
     if (parts.some(p => !validName(p))) {
       const absCheck = path.join(root, ...parts);
       const exists = await fs.lstat(nativePath(absCheck)).then(() => true, () => false);
@@ -658,6 +795,12 @@ async function scanIncremental(root, dirtyRelatives = [], baseline = {}) {
     }
     const identity = `${stat.dev}:${stat.ino}`;
     if (stat.isDirectory()) {
+      const parentSiblings = await readParentSiblingSet(parts);
+      const dirCache = classifyBrowserCachePath(rel, parentSiblings);
+      if (dirCache) {
+        tree.ignored.set(dirCache.rootPath, { path: dirCache.rootPath, kind: "browser_cache", ignored: true, reason: dirCache.reason });
+        return;
+      }
       tree.dirs.set(rel, { path: rel, identity });
       await visitSubtree(absolute, rel + "/");
     } else {
@@ -672,6 +815,7 @@ async function scanIncremental(root, dirtyRelatives = [], baseline = {}) {
     files,
     directories: [...tree.dirs.values()],
     skipped: [...tree.skipped.values()],
+    ignored: [...tree.ignored.values()],
     totalBytes,
     totalFiles: files.length,
     hashedBytes: totalBytes,
@@ -685,4 +829,4 @@ async function scanIncremental(root, dirtyRelatives = [], baseline = {}) {
   };
 }
 
-module.exports = { safePath, scan, scanIncremental, hasCompletedTree, remember, peekScan, read, write, move, checksum, assertExpected, configureIndex, shutdownPool: hashPool.shutdownPool, MAX_BYTES, MAX_SCAN_BYTES };
+module.exports = { safePath, nativePath, stripExtendedPrefix, scan, scanIncremental, hasCompletedTree, remember, peekScan, read, write, move, checksum, assertExpected, configureIndex, flushIndex, shutdownPool: hashPool.shutdownPool, MAX_BYTES, MAX_SCAN_BYTES };
