@@ -13,7 +13,7 @@ const desktopRoot = path.resolve(__dirname, '..');
 const standalone = fs.existsSync(path.join(desktopRoot, 'server/gateway/server.js'));
 const root = standalone ? desktopRoot : path.resolve(desktopRoot, '..');
 const prefix = standalone ? '' : path.basename(desktopRoot) + '/';
-const handlerPattern = /^async function handleUpload\(req, res, key\) \{[\s\S]*?^\}(?=\s*(?:function streamFile|async function handleDownload)\()/m;
+const handlerPattern = /^async function handleUpload\(req, res, key, url\) \{[\s\S]*?^\}(?=\s*(?:function streamFile|async function handleDownload)\()/m;
 const readOptional = async file => {
   try { return await fsp.readFile(path.join(root, file), 'utf8'); } catch (error) { if (error.code !== 'ENOENT') throw error; return null; }
 };
@@ -117,12 +117,12 @@ for (const [name, file] of variants) test(name, async t => {
 
 test('repair payload matches every distributed gateway upload handler', async () => {
   const repair = await fsp.readFile(path.join(desktopRoot, 'server/repair-uploads.bat'), 'utf8');
-  const payload = repair.match(/\$handler = @'\r?\n([\s\S]*?)\r?\n'@/)[1].trim();
+  const payload = repair.match(/\$handler = @'\r?\n([\s\S]*?)\r?\n'@/)[1].replace(/\r\n/g, '\n').trim();
   for (const [, file] of variants) {
     const raw = await readOptional(file);
     if (raw == null) continue;
     const source = file.endsWith('.bat') ? raw.match(/\$arquivoGateway = @'\r?\n([\s\S]*?)\r?\n'@/)[1] : raw;
-    assert.equal(source.match(handlerPattern)?.[0].trim(), payload, file);
+    assert.equal(source.replace(/\r\n/g, '\n').match(handlerPattern)?.[0].trim(), payload, file);
   }
   assert.match(repair, /compose build --no-cache gateway/);
   assert.match(repair, /compose config --quiet/);
