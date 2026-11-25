@@ -191,6 +191,31 @@ function remember(root, relative, entry) {
 const verifiedDirs = new Map();
 const VERIFIED_DIR_TTL_MS = 5000;
 
+// O Windows pode negar a troca atômica por um instante quando o antivírus ou o
+// indexador está com o destino aberto. Algumas tentativas curtas resolvem sem
+// perder o conteúdo já verificado.
+async function renameAtomic(from, to) {
+  if (!WINDOWS) return fs.rename(from, to);
+  for (let attempt = 0; ; attempt++) {
+    try { return await fs.rename(from, to); }
+    catch (error) {
+      if (!["EPERM", "EACCES", "EBUSY"].includes(error.code) || attempt >= 4) throw error;
+      await new Promise(resolve => setTimeout(resolve, 40 * 2 ** attempt));
+    }
+  }
+}
+
+// Zera tudo o que pertence a uma raiz. Chamado ao trocar a pasta monitorada para
+// que nenhum caminho, resumo ou diretório verificado da pasta anterior sobreviva.
+function resetRoot() {
+  scanGeneration++;
+  walks.clear();
+  completedTrees.clear();
+  checksums.clear();
+  verifiedDirs.clear();
+  cacheRoot = null;
+}
+
 async function safePath(root, relative, createParents = false) {
   if (typeof relative !== "string" || !relative || relative.includes("\\") || relative.includes("\0")) throw new Error("Caminho inválido");
   const parts = relative.split("/");
@@ -216,12 +241,12 @@ async function safePath(root, relative, createParents = false) {
 }
 // A varredura precisa terminar depressa mesmo com dezenas de milhares de
 // arquivos. Pastas, metadados e resumos SHA-256 saturam SSDs NVMe modernos.
-const READDIR_LANES = 160;  // pastas listadas ao mesmo tempo em paralelo
-const STAT_LANES = 640;     // informações de itens pedidas ao mesmo tempo
-const HASH_LANES = 192;     // arquivos/lotes despachados simultaneamente ao pool multi-thread
-const SMALL_HASH_BATCH = 96;
+const READDIR_LANES = 256;  // pastas listadas ao mesmo tempo em paralelo
+const STAT_LANES = 1024;    // informações de itens pedidas ao mesmo tempo
+const HASH_LANES = 256;     // arquivos/lotes despachados simultaneamente ao pool multi-thread
+const SMALL_HASH_BATCH = 128;
 const SMALL_BATCH_ITEM_BYTES = 2 * 1024 * 1024;
-const SMALL_BATCH_MAX_BYTES = 16 * 1024 * 1024;
+const SMALL_BATCH_MAX_BYTES = 32 * 1024 * 1024;
 // Uma única pasta ou arquivo que não responde (disco removido, OneDrive que
 // nunca baixa) não pode segurar a pasta inteira: cada operação tem o seu limite.
 const OP_TIMEOUT_MS = 20 * 1000;
@@ -266,8 +291,16 @@ const walks = new Map();
 // Árvore completa em memória para reconciliação incremental O(1) via journal de
 // eventos do sistema de arquivos (padrão Google Drive / OneDrive).
 const completedTrees = new Map();
+// Cada passagem carrega a geração da raiz: uma passagem antiga que termina
+// depois da troca de pasta é descartada em vez de poluir a pasta nova.
+let scanGeneration = 0;
 function newWalk() {
-  return { files: [], pending: [], directories: [], skipped: [], ignored: [], seen: new Set(), totalFiles: 0, totalBytes: 0, hashedBytes: 0, startedAt: Date.now(), walked: false, walkMs: 0, complete: false };
+  return { files: [], pending: [], directories: [], skipped: [], ignored: [], ignoredSet: new Set(), seen: new Set(), totalFiles: 0, totalBytes: 0, hashedBytes: 0, startedAt: Date.now(), walked: false, walkMs: 0, complete: false, generation: scanGeneration };
+}
+function ignoreOnce(walk, match) {
+  if (walk.ignoredSet.has(match.rootPath)) return;
+  walk.ignoredSet.add(match.rootPath);
+  walk.ignored.push({ path: match.rootPath, kind: match.kind || "browser_cache", ignored: true, reason: match.reason });
 }
 
 /**
@@ -304,7 +337,7 @@ async function walkTree(root, walk, report) {
       // validar nomes ou descer em dezenas de milhares de arquivos efêmeros.
       const cacheMatch = classifyBrowserCachePath(relative, siblingNamesLower);
       if (cacheMatch && (entry.isDirectory() || cacheMatch.rootPath === relative)) {
-        walk.ignored.push({ path: cacheMatch.rootPath, kind: "browser_cache", ignored: true, reason: cacheMatch.reason });
+        ignoreOnce(walk, cacheMatch);
         return;
       }
       if (entry.isSymbolicLink()) { walk.skipped.push({ path: relative, reason: "Link simbólico não sincronizado" }); return; }
@@ -320,7 +353,7 @@ async function walkTree(root, walk, report) {
       if (stat.isDirectory()) {
         const dirCache = classifyBrowserCachePath(relative, siblingNamesLower);
         if (dirCache) {
-          walk.ignored.push({ path: dirCache.rootPath, kind: "browser_cache", ignored: true, reason: dirCache.reason });
+          ignoreOnce(walk, dirCache);
           return;
         }
         walk.directories.push({ path: relative, identity });
@@ -351,6 +384,7 @@ async function scan(root, baseline = {}, { hashBudget = Infinity, hashBudgetMs =
   // Uma varredura concluída recomeça na passagem seguinte — é assim que arquivos
   // novos ou alterados aparecem. O resumo já conhecido volta do cache, sem reler.
   if (!walk || walk.complete || restart) { walk = newWalk(); walks.set(root, walk); }
+  const generation = scanGeneration;
   let lastReport = 0;
   const report = (force = false) => {
     if (!force && Date.now() - lastReport < 150) return;
@@ -383,6 +417,7 @@ async function scan(root, baseline = {}, { hashBudget = Infinity, hashBudgetMs =
       walks.delete(root);
       throw error;
     }
+    if (generation !== scanGeneration) throw new Error("A pasta monitorada foi trocada durante a leitura; recomeçando.");
     walk.walked = true;
     walk.walkMs = Date.now() - startedAt;
     
@@ -550,7 +585,7 @@ async function write(root, relative, bytes, hash, expected) {
   try {
     await fs.writeFile(temp, buffer, { flag: "wx" });
     await assertExpected(absolute, expected);
-    await fs.rename(temp, absolute);
+    await renameAtomic(temp, absolute);
   } finally { await fs.rm(temp, { force: true }); }
   const saved = await fs.stat(absolute);
   // Quem acabou de gravar já conhece o resumo: a próxima varredura não relê o arquivo.
@@ -562,7 +597,7 @@ async function move(root, from, to, expected) {
   const source = await safePath(root, from), destination = await safePath(root, to, true);
   await assertExpected(source, expected);
   await assertExpected(destination, null);
-  await fs.rename(source, destination);
+  await renameAtomic(source, destination);
   const saved = await fs.stat(destination);
   remember(root, from, null);
   remember(root, to, { size: saved.size, mtimeMs: saved.mtimeMs, identity: `${saved.dev}:${saved.ino}`, checksum: expected });
@@ -665,6 +700,38 @@ async function scanIncremental(root, dirtyRelatives = [], baseline = {}) {
     }
   };
 
+  const hashSmallBatch = async items => {
+    const todo = [];
+    for (const item of items) {
+      const known = checksums.get(item.relative);
+      const sameIdentity = !known?.identity || !item.identity || known.identity === item.identity;
+      if (known && known.size === item.stat.size && known.mtimeMs === item.stat.mtimeMs && sameIdentity) {
+        tree.files.set(item.relative, describe(item.relative, item.stat, item.identity, known.checksum));
+      } else todo.push(item);
+    }
+    if (!todo.length) return;
+    try {
+      const results = await hashPool.hashBatch(todo.map(item => ({ file: nativePath(item.absolute), size: item.stat.size })), READ_TIMEOUT_MS);
+      for (let i = 0; i < todo.length; i++) {
+        const item = todo[i], result = results[i];
+        if (!result?.ok) {
+          tree.skipped.set(item.relative, { path: item.relative, reason: "Não foi possível ler: " + (result?.error || "falha na leitura") });
+          continue;
+        }
+        if (item.stat.size !== result.after.size || item.stat.mtimeMs !== result.after.mtimeMs) {
+          remember(root, item.relative, null);
+          tree.skipped.set(item.relative, { path: item.relative, reason: "Arquivo em edição ou download" });
+          continue;
+        }
+        const afterIdentity = `${result.after.dev}:${result.after.ino}`;
+        remember(root, item.relative, { size: result.after.size, mtimeMs: result.after.mtimeMs, ctimeMs: result.after.ctimeMs, identity: afterIdentity, checksum: result.digest });
+        tree.files.set(item.relative, describe(item.relative, result.after, afterIdentity, result.digest));
+      }
+    } catch (error) {
+      for (const item of todo) tree.skipped.set(item.relative, { path: item.relative, reason: "Não foi possível ler: " + error.message });
+    }
+  };
+
   const visitSubtree = async (folderAbs, prefixRel) => {
     let entries;
     try {
@@ -696,12 +763,19 @@ async function scanIncremental(root, dirtyRelatives = [], baseline = {}) {
         tree.dirs.set(rel, { path: rel, identity: id });
         subdirs.push({ abs, prefix: rel + "/" });
       } else {
-        fileTasks.push(() => hashFileItem(rel, abs, st, id));
+        fileTasks.push({ relative: rel, absolute: abs, stat: st, identity: id });
       }
     }
-    const limiter = createLimiter(64);
+    // Arquivos pequenos vão em lote para as threads nativas; os grandes seguem
+    // individualmente. Uma passagem por uma pasta inteira fica O(poucos lotes).
+    const small = [], large = [];
+    for (const task of fileTasks) (task.stat.size <= SMALL_BATCH_ITEM_BYTES ? small : large).push(task);
+    const groups = [];
+    for (let i = 0; i < small.length; i += SMALL_HASH_BATCH) groups.push(small.slice(i, i + SMALL_HASH_BATCH));
+    const limiter = createLimiter(HASH_LANES);
     await Promise.all([
-      ...fileTasks.map(fn => limiter(fn)),
+      ...large.map(task => limiter(() => hashFileItem(task.relative, task.absolute, task.stat, task.identity))),
+      ...groups.map(group => limiter(() => hashSmallBatch(group))),
       ...subdirs.map(d => visitSubtree(d.abs, d.prefix)),
     ]);
   };
@@ -829,4 +903,4 @@ async function scanIncremental(root, dirtyRelatives = [], baseline = {}) {
   };
 }
 
-module.exports = { safePath, nativePath, stripExtendedPrefix, scan, scanIncremental, hasCompletedTree, remember, peekScan, read, write, move, checksum, assertExpected, configureIndex, flushIndex, shutdownPool: hashPool.shutdownPool, MAX_BYTES, MAX_SCAN_BYTES };
+module.exports = { safePath, nativePath, stripExtendedPrefix, scan, scanIncremental, hasCompletedTree, remember, peekScan, read, write, move, checksum, assertExpected, configureIndex, flushIndex, resetRoot, renameAtomic, shutdownPool: hashPool.shutdownPool, MAX_BYTES, MAX_SCAN_BYTES };

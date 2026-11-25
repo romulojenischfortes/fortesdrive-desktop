@@ -6,7 +6,7 @@ const crypto = require("node:crypto");
 
 const SMALL_FILE_BYTES = 16 * 1024 * 1024;
 const STREAM_CHUNK = 4 * 1024 * 1024;
-const BATCH_WORKER_CONCURRENCY = 16;
+const BATCH_WORKER_CONCURRENCY = 24;
 const EMPTY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 const fastSha256 = typeof crypto.hash === "function"
   ? (buf) => crypto.hash("sha256", buf, "hex")
@@ -116,8 +116,8 @@ if (!isMainThread && parentPort) {
 } else {
   const { Worker } = require("node:worker_threads");
   const cpuCount = typeof os.availableParallelism === "function" ? os.availableParallelism() : (os.cpus()?.length || 4);
-  const POOL_SIZE = Math.max(4, Math.min(24, cpuCount));
-  const MAX_INFLIGHT_PER_WORKER = 24;
+  const POOL_SIZE = Math.max(6, Math.min(32, cpuCount));
+  const MAX_INFLIGHT_PER_WORKER = 32;
 
   let workers = null;
   let idleTimer = null;

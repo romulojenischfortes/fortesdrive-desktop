@@ -9,6 +9,18 @@
 const CHROME_SCOPED_DIR = /^scoped_dir\d+_\d+$/i;
 const CHROMIUM_TEMP_ENTRY = /^\.(?:com\.google\.chrome|org\.chromium\.chromium)\.[a-z0-9._-]+$/i;
 
+// Diretórios internos do sistema operacional que existem em qualquer volume e
+// devolvem acesso negado: são ignorados sem virar erro de sincronização quando
+// o usuário escolhe a raiz de um disco como pasta.
+const ROOT_OS_SYSTEM_DIRS = new Set([
+  "$recycle.bin",
+  "system volume information",
+  "$winreagent",
+  "config.msi",
+  "msocache",
+  "perflogs",
+]);
+
 // Diretórios técnicos exclusivos de motores Chromium/GPU/WebView (não colidem com pastas humanas).
 const UNAMBIGUOUS_ENGINE_CACHE_DIRS = new Set([
   "gpucache",
@@ -112,6 +124,14 @@ function classifyBrowserCachePath(relativePath, siblingNamesLower = null) {
   const parts = normalizeSegments(relativePath);
   if (!parts.length) return null;
   const lower = parts.map((p) => p.toLowerCase());
+
+  if (ROOT_OS_SYSTEM_DIRS.has(lower[0])) {
+    return {
+      rootPath: parts[0],
+      kind: "os_system",
+      reason: "Diretório protegido do sistema operacional ignorado automaticamente",
+    };
+  }
 
   for (let i = 0; i < parts.length; i++) {
     const seg = lower[i];

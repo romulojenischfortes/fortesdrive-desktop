@@ -47,6 +47,43 @@ class SyncEngine {
     this.dirtyOverflow = false;
     this.manifests = new Map();
     this.manifestSaves = new Map();
+    // Identifica a raiz ativa: resultados de um ciclo da pasta anterior são
+    // descartados em vez de aparecerem como erro na pasta nova.
+    this.rootGeneration = 1;
+  }
+  resetRootState() {
+    this.state = {
+      running: false,
+      syncing: false,
+      scanning: false,
+      queue: 0,
+      error: "",
+      watcherError: "",
+      badgeError: "",
+      historyError: "",
+      lastSync: null,
+      conflicts: 0,
+      syncedCount: 0,
+      skipped: 0,
+      retriableSkipped: 0,
+      ignored: 0,
+      ignoredItems: [],
+      retryingItems: [],
+      issues: [],
+      localBytes: 0,
+      localFiles: 0,
+      cloudBytes: 0,
+      cloudFiles: 0,
+      pendingUploadBytes: 0,
+      pendingUploadFiles: 0,
+      pendingHash: 0,
+      progress: -1,
+      progressMode: "none",
+      progressLabel: "",
+      userEmail: this.state.userEmail || "",
+      online: this.state.online !== false,
+      scan: { phase: "idle", total: 0, hashed: 0, pending: 0, totalBytes: 0, hashedBytes: 0, bytesPerSec: 0, walking: false, at: Date.now() },
+    };
   }
   relativeFromWatch(absolute) {
     if (!this.watchFolder || typeof absolute !== "string" || !absolute) return null;
@@ -72,10 +109,18 @@ class SyncEngine {
     const canonical = await fs.realpath(folder);
     if (!(await fs.stat(canonical)).isDirectory()) throw new Error("Selecione um diretório");
     await this.stop();
+    this.rootGeneration++;
     this.watchFolder = canonical;
     this.completedScan = null;
     this.dirtyPaths.clear();
     this.dirtyOverflow = false;
+    this.selfWrites.clear();
+    this.scanning = null;
+    this.bgScanning = null;
+    this.resetRootState();
+    // Descarta árvore, resumos e diretórios verificados da pasta anterior: sem
+    // isso a pasta nova herdava caminhos e erros da antiga.
+    native.resetRoot?.();
     this.store.set("watchFolder", canonical);
     native.configureIndex(this.indexPath());
     this.folderConfigured = true;
@@ -146,7 +191,7 @@ class SyncEngine {
     await watcher?.close();
     await this.closing;
   }
-  getStatus() { return { ...this.state, machineRole: this.store.get("machineRole", "client"), nativeStreaming: true, watchFolder: this.watchFolder, folderConfigured: this.folderConfigured, deviceId: this.deviceId }; }
+  getStatus() { return { ...this.state, machineRole: this.store.get("machineRole", "client"), nativeStreaming: true, watchFolder: this.watchFolder, folderConfigured: this.folderConfigured, deviceId: this.deviceId, rootGeneration: this.rootGeneration }; }
   markSelfWrite(relative) {
     if (typeof relative !== "string" || !relative) return;
     this.noteChangedPath(relative);

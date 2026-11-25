@@ -10,16 +10,16 @@ const native = require('./native-files');
 const hashPool = require('./hash-pool');
 const MAX_TRANSFER_BYTES = 10 * 1024 * 1024 * 1024;
 const STREAM_HIGH_WATER_MARK = 4 * 1024 * 1024;
-const DIRECT_UPLOAD_BYTES = 2 * 1024 * 1024;
+const DIRECT_UPLOAD_BYTES = 4 * 1024 * 1024;
 const RANGE_PART_MIN_BYTES = 4 * 1024 * 1024;
 const RANGE_THRESHOLD_BYTES = 8 * 1024 * 1024;
-const MAX_RANGE_PARTS = 8;
+const MAX_RANGE_PARTS = 12;
 const fastSha256 = typeof crypto.hash === 'function'
   ? buf => crypto.hash('sha256', buf, 'hex')
   : buf => crypto.createHash('sha256').update(buf).digest('hex');
 const agents = {
-  'https:': new https.Agent({ keepAlive: true, keepAliveMsecs: 60000, maxSockets: 256, maxFreeSockets: 128, scheduling: 'lifo' }),
-  'http:': new http.Agent({ keepAlive: true, keepAliveMsecs: 60000, maxSockets: 256, maxFreeSockets: 128, scheduling: 'lifo' }),
+  'https:': new https.Agent({ keepAlive: true, keepAliveMsecs: 60000, maxSockets: 384, maxFreeSockets: 192, scheduling: 'lifo' }),
+  'http:': new http.Agent({ keepAlive: true, keepAliveMsecs: 60000, maxSockets: 384, maxFreeSockets: 192, scheduling: 'lifo' }),
 };
 const verifiedInternalDirs = new Map();
 
@@ -306,7 +306,10 @@ async function download(root, relative, address, file, expected, progress, allow
 
     const destNative = native.nativePath ? native.nativePath(absolute) : absolute;
     await native.assertExpected(destNative, expected);
-    await fs.rename(stagingPath, destNative);
+    // Substituição atômica com novas tentativas curtas: um antivírus ou indexador
+    // lendo o destino no instante da troca não invalida um download já verificado.
+    if (native.renameAtomic) await native.renameAtomic(stagingPath, destNative);
+    else await fs.rename(stagingPath, destNative);
     if (partialMetaPath) await fs.rm(partialMetaPath, { force: true }).catch(() => {});
     const saved = await fs.stat(destNative);
     const identity = `${saved.dev}:${saved.ino}`;
