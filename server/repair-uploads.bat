@@ -8,6 +8,7 @@ set "FD_REPAIR_MODE=%~2"
 powershell -NoProfile -ExecutionPolicy Bypass -Command "$c=[IO.File]::ReadAllText($env:FD_REPAIR_SELF,[Text.Encoding]::UTF8); $m='#FD'+'REPAIR#'; $i=$c.IndexOf($m); iex $c.Substring($i+$m.Length)"
 set "FD_REPAIR_CODE=%ERRORLEVEL%"
 if /I "%FD_REPAIR_MODE%"=="patch-only" exit /b %FD_REPAIR_CODE%
+if /I "%FD_REPAIR_MODE%"=="automatic" exit /b %FD_REPAIR_CODE%
 echo.
 pause
 exit /b %FD_REPAIR_CODE%
@@ -27,6 +28,7 @@ try {
   Write-Host 'Mantem os dados, o .env, os volumes e o tunel. Reinicia apenas o gateway.'
   $folder = [string]$env:FD_REPAIR_DIR
   $patchOnly = $env:FD_REPAIR_MODE -eq 'patch-only'
+  $automatic = $env:FD_REPAIR_MODE -eq 'automatic'
   if (-not $patchOnly) {
     if (-not (Get-Command docker -ErrorAction SilentlyContinue)) { throw 'Abra o Docker Desktop antes de executar a atualizacao.' }
     Invoke-DockerRepair info
@@ -57,12 +59,12 @@ try {
   if (-not (Test-Path -LiteralPath $gateway) -or -not (Test-Path -LiteralPath (Join-Path $folder 'docker-compose.yml'))) { throw 'Esta pasta nao contem um servidor FortesDrive reconhecido. Nada foi alterado.' }
   $source = [IO.File]::ReadAllText($gateway, [Text.Encoding]::UTF8)
   if ($source -notmatch 'FortesDrive' -or $source -notmatch 'MAX_UPLOAD_BYTES' -or $source -notmatch 'acquireUploadSlot') { throw 'Versao do gateway nao reconhecida. Nada foi alterado.' }
-  $handlerPattern = [regex]::new('(?ms)^async function handleUpload\(req, res, key, url\) \{.*?^\}\s*(?=(?:function streamFile|async function handleDownload)\()')
+  $handlerPattern = [regex]::new('(?ms)^async function handleUpload\(req, res, key(?:, url)?\) \{.*?^\}\s*(?=(?:function streamFile|async function handleDownload)\()')
   if ($handlerPattern.Matches($source).Count -ne 1) { throw 'Nao foi possivel localizar a rotina de upload com seguranca. Nada foi alterado.' }
   $versionPattern = [regex]::new("const VERSION = '[^']+';")
   if ($versionPattern.Matches($source).Count -ne 1) { throw 'Versao do servidor ausente. Nada foi alterado.' }
   $version = if ($source -match 'function uploadToFiler\(') { '1.1.1' } else { '2.4.0' }
-  if (-not $patchOnly) {
+  if (-not $patchOnly -and -not $automatic) {
     Write-Host ('Servidor localizado em: ' + $folder) -ForegroundColor Cyan
     $confirm = Read-Host 'Pausar os envios e aplicar a correcao neste servidor? [s/N]'
     if ($confirm -notmatch '^(s|sim)$') { Write-Host 'Cancelado. Nada foi alterado.'; exit 0 }
@@ -291,6 +293,8 @@ async function handleUpload(req, res, key, url) {
 '@
   $updated = $handlerPattern.Replace($source, [Text.RegularExpressions.MatchEvaluator]{ param($match) $handler + "`r`n`r`n" })
   $updated = $versionPattern.Replace($updated, "const VERSION = '$version';")
+  # Gateways anteriores recebiam apenas tres argumentos; os blocos precisam da URL.
+  $updated = $updated.Replace('return await handleUpload(req, res, key);', 'return await handleUpload(req, res, key, url);')
   $backup = $gateway + '.before-411-' + (Get-Date -Format 'yyyyMMdd-HHmmss') + '.bak'
   Copy-Item -LiteralPath $gateway -Destination $backup
   [IO.File]::WriteAllText($gateway, $updated, (New-Object Text.UTF8Encoding($false)))

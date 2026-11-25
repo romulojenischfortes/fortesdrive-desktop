@@ -19,9 +19,9 @@ const PROBE_TIMEOUT_MS = 8000;
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
-function run(file, args, cwd) {
+function run(file, args, cwd, timeout = 180000) {
   return new Promise(resolve => {
-    execFile(file, args, { cwd, windowsHide: true, timeout: 180000, maxBuffer: 1 << 20 }, error => resolve(!error));
+    execFile(file, args, { cwd, windowsHide: true, timeout, maxBuffer: 1 << 20 }, error => resolve(!error));
   });
 }
 
@@ -562,7 +562,20 @@ class ServerTunnel {
     );
   }
 
+  // Atualizações silenciosas entregavam o pacote novo, mas o Docker usava a cópia antiga.
+  async updateGatewayIfNeeded(version) {
+    if (process.platform !== 'win32' || !this.app?.isPackaged || !['2.0.2', '2.1.0', '2.2.2', '2.3.0'].includes(version)) return true;
+    const repair = path.join(process.resourcesPath, 'server', 'repair-uploads.bat');
+    if (!(await exists(repair))) return false;
+    this.update({ status: 'starting', error: 'Aplicando a atualização do servidor, preservando os arquivos...' });
+    return run('cmd.exe', ['/d', '/s', '/c', `call "${repair}" "${this.state.serverRoot}" automatic`], this.state.serverRoot, 10 * 60 * 1000);
+  }
+
   async ensureServer() {
+    const local = await this.probeLocal();
+    if (local.version && !(await this.updateGatewayIfNeeded(local.version))) {
+      return this.fail('A atualização do servidor não foi aplicada. Seus dados foram preservados; use "FortesDrive - configurar servidor" para concluir.');
+    }
     if (await answers(`http://127.0.0.1:${PORT}/health`)) return { ok: true };
     if (!(await exists(path.join(this.state.serverRoot, "docker-compose.yml")))) {
       return this.fail("A pasta raiz do servidor não foi encontrada neste computador. Escolha a pasta onde o servidor foi instalado.");

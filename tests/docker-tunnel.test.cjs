@@ -97,3 +97,13 @@ test('o pacote do servidor leva o Compose e o assistente', () => {
   assert.ok(exists('server/docker-compose.yml'));
   assert.ok(exists('server/setup-server.ps1'));
 });
+
+test('atualizacao silenciosa aplica o reparo ao gateway instalado sem pedir confirmacao', () => {
+  const repair = read('server/repair-uploads.bat');
+  assert.match(desktopTunnel, /await this\.updateGatewayIfNeeded\(local\.version\)/);
+  assert.match(desktopTunnel, /process\.resourcesPath, 'server', 'repair-uploads\.bat'/);
+  assert.match(desktopTunnel, /automatic/);
+  assert.match(repair, /\$automatic = \$env:FD_REPAIR_MODE -eq 'automatic'/);
+  assert.match(repair, /if \(-not \$patchOnly -and -not \$automatic\)/);
+  assert.match(repair, /"automatic" exit \/b %FD_REPAIR_CODE%/);
+});

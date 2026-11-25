@@ -100,3 +100,26 @@ test('a primeira instalação não apaga o segredo recém-criado ao gravar a pas
     assert.match(fs.readFileSync(path.join(folder, '.env'), 'utf8'), new RegExp(`STORAGE_SIGNING_SECRET=${secret}`));
   } finally { fs.rmSync(folder, { recursive: true, force: true }); }
 });
+
+test('reparo migra o gateway anterior de tres argumentos e preserva os dados', { skip: process.platform !== 'win32' || !repair }, () => {
+  const folder = fs.mkdtempSync(path.join(os.tmpdir(), 'fd-old-gateway-'));
+  try {
+    fs.mkdirSync(path.join(folder, 'gateway')); fs.mkdirSync(path.join(folder, 'data'));
+    const old = read('server/gateway/server.js')
+      .replace("const VERSION = '2.4.0';", "const VERSION = '2.3.0';")
+      .replace('async function handleUpload(req, res, key, url)', 'async function handleUpload(req, res, key)')
+      .replace('return await handleUpload(req, res, key, url);', 'return await handleUpload(req, res, key);');
+    fs.writeFileSync(path.join(folder, 'gateway/server.js'), old);
+    fs.writeFileSync(path.join(folder, 'docker-compose.yml'), compose);
+    fs.writeFileSync(path.join(folder, '.env'), `STORAGE_SIGNING_SECRET=${secret}\n`);
+    fs.writeFileSync(path.join(folder, 'data/preservado.txt'), 'nao apagar');
+    const script = repair.slice(repair.indexOf('#FDREPAIR#') + '#FDREPAIR#'.length);
+    runPowerShell(`$env:FD_REPAIR_DIR=$env:FD_TEST_FOLDER; $env:FD_REPAIR_MODE='patch-only'; ${script}`, folder);
+    const updated = fs.readFileSync(path.join(folder, 'gateway/server.js'), 'utf8');
+    assert.match(updated, /async function handleUpload\(req, res, key, url\)/);
+    assert.match(updated, /return await handleUpload\(req, res, key, url\);/);
+    assert.match(updated, /const VERSION = '2\.4\.0';/);
+    assert.equal(fs.readFileSync(path.join(folder, 'data/preservado.txt'), 'utf8'), 'nao apagar');
+    assert.ok(fs.readFileSync(path.join(folder, '.env'), 'utf8').includes(secret));
+  } finally { fs.rmSync(folder, { recursive: true, force: true }); }
+});
