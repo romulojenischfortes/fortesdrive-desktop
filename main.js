@@ -367,6 +367,13 @@ function registerHandlers() {
       await fs.access(absolute);
       shell.showItemInFolder(absolute);
     },
+    // Abrir a pasta sincronizada no Explorador: o app instalado dá acesso
+    // direto ao conteúdo local, sem passar pela nuvem.
+    openSyncFolder: async () => {
+      if (!syncEngine.watchFolder) return { opened: false };
+      const failure = await shell.openPath(syncEngine.watchFolder);
+      return { opened: !failure, error: failure || null };
+    },
     exportTransferHistory: async (userId, options) => {
       const result = await transferHistory.csv(userId, options);
       const choice = await dialog.showSaveDialog(mainWindow, { title: "Salvar histórico de arquivos", defaultPath: "FortesDrive-historico.csv", filters: [{ name: "Planilha CSV", extensions: ["csv"] }] });

@@ -32,7 +32,8 @@ async function exists(target) {
 async function answers(url) {
   try {
     const response = await fetch(url, { signal: AbortSignal.timeout(5000) });
-    return response.ok;
+    const body = await response.json().catch(() => null);
+    return response.ok && body?.ok === true;
   } catch { return false; }
 }
 
@@ -451,8 +452,45 @@ class ServerTunnel {
     return advice;
   }
 
+  // O Docker não dispara child.exit: vigia também o túnel nomeado, não só o binário.
+  watchConnection() {
+    if (this.monitor || this.state.mode !== 'named') return;
+    this.monitor = setInterval(() => {
+      this.checkConnection().catch(error => this.update({ status: 'error', error: error.message, url: '' }));
+    }, 30000);
+    this.monitor.unref?.();
+  }
+
+  async checkConnection() {
+    if ((!this.state.enabled && !this.manual) || this.busy || this.starting || this.checking) return;
+    this.checking = true;
+    const epoch = this.connectionEpoch || 0;
+    try {
+      const pub = await this.probePublic('https://' + this.state.hostname);
+      if (epoch !== (this.connectionEpoch || 0)) return;
+      if (pub.ok) {
+        this.connectionFailures = 0; this.nextRecoveryAt = 0;
+        this.update({ status: 'online', url: pub.url, error: '', attempts: 0 });
+        return;
+      }
+      this.connectionFailures = (this.connectionFailures || 0) + 1;
+      this.update({ status: 'reconnecting', url: '', error: pub.message });
+      if (this.connectionFailures < 2 || Date.now() < (this.nextRecoveryAt || 0)) return;
+      this.nextRecoveryAt = Date.now() + 120000;
+      await this.start({ force: true });
+    } finally { this.checking = false; }
+  }
+
+  // Uma única inicialização, inclusive na abertura automática do modo servidor.
+  start(options = {}) {
+    if (this.starting) return this.starting;
+    this.starting = this.startOnce(options).finally(() => { this.starting = null; });
+    return this.starting;
+  }
+
   // ── Máquina de estados do túnel ────────────────────────────────────────
-  async start({ attempts = 0, force = false } = {}) {
+  async startOnce({ attempts = 0, force = false } = {}) {
+    const epoch = this.connectionEpoch || 0;
     if (!this.state.enabled && !this.manual && !force) {
       return { ok: false, message: "A subida automática está desativada." };
     }
@@ -468,7 +506,10 @@ class ServerTunnel {
     // O token é lido antes de subir os serviços: é ele que diz se o túnel do
     // Docker (perfil "tunnel" do Compose) entra junto.
     await this.readTunnelFiles();
+    if (epoch !== (this.connectionEpoch || 0)) return { ok: false, message: 'Inicialização cancelada.' };
+    this.watchConnection();
     const server = await this.ensureServer();
+    if (epoch !== (this.connectionEpoch || 0)) return { ok: false, message: 'Inicialização cancelada.' };
     if (!server.ok) return server;
     if (!this.state.enabled && !this.manual) {
       return { ok: false, message: "A subida automática foi desativada." };
@@ -478,13 +519,15 @@ class ServerTunnel {
     // O assistente do servidor já pode ter deixado o túnel no ar: nesse caso ele
     // é usado como está, sem abrir um segundo conector.
     const plan = tunnelPlan({ token: this.token, hostname: this.state.hostname, port: PORT });
-    if (plan.url && (await answers(plan.url + "/health"))) {
+    const online = plan.url && (await answers(plan.url + '/health'));
+    if (epoch !== (this.connectionEpoch || 0)) return { ok: false, message: 'Inicialização cancelada.' };
+    if (online) {
       this.update({ status: "online", url: plan.url, error: "", attempts: 0 });
       return { ok: true, message: "Túnel conectado e validado em " + plan.url + "." };
     }
     // Túnel nomeado roda no Docker: o serviço cloudflared do Compose entrega o
     // endereço ao gateway por http://gateway:8790, dentro da rede dos contêineres.
-    if (plan.mode === "named") return this.startContainer(plan);
+    if (plan.mode === "named") return this.startContainer(plan, epoch);
     return this.launch(plan);
   }
 
@@ -494,16 +537,21 @@ class ServerTunnel {
   }
 
   /** Sobe o serviço do túnel no Docker e espera o endereço público responder. */
-  async startContainer(plan) {
+  async startContainer(plan, epoch = this.connectionEpoch || 0) {
     this.update({ status: "starting", error: "", url: "" });
-    const started = await this.compose(["--profile", "tunnel", "up", "-d", "--no-deps", "cloudflared"]);
+    const args = ["--profile", "tunnel", "up", "-d", "--no-deps", "cloudflared"];
+    args.splice(args.length - 1, 0, '--force-recreate');
+    const started = await this.compose(args);
+    if (epoch !== (this.connectionEpoch || 0)) return { ok: false, message: 'Inicialização cancelada.' };
     if (!started) {
       return this.fail('Não foi possível subir o túnel no Docker. Abra o Docker Desktop e confira "docker compose logs cloudflared" na pasta do servidor.');
     }
     for (let i = 0; i < LAUNCH_TIMEOUT_MS / 1000; i++) {
       await sleep(1000);
       if (!this.state.enabled && !this.manual) return { ok: false, message: "A subida automática foi desativada." };
-      if (await answers(plan.url + "/health")) {
+      const online = await answers(plan.url + '/health');
+      if (epoch !== (this.connectionEpoch || 0)) return { ok: false, message: 'Inicialização cancelada.' };
+      if (online) {
         this.update({ status: "online", url: plan.url, mode: "named", error: "", attempts: 0 });
         return { ok: true, message: "Túnel conectado e validado em " + plan.url + "." };
       }
@@ -619,6 +667,9 @@ class ServerTunnel {
   }
 
   async stop() {
+    this.connectionEpoch = (this.connectionEpoch || 0) + 1;
+    clearInterval(this.monitor); this.monitor = null;
+    this.connectionFailures = 0; this.nextRecoveryAt = 0;
     clearTimeout(this.retry);
     const child = this.child;
     this.child = null;

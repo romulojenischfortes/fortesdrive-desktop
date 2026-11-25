@@ -11,6 +11,8 @@ const hashPool = require('./hash-pool');
 const MAX_TRANSFER_BYTES = 10 * 1024 * 1024 * 1024;
 const STREAM_HIGH_WATER_MARK = 4 * 1024 * 1024;
 const DIRECT_UPLOAD_BYTES = 4 * 1024 * 1024;
+const UPLOAD_CHUNK_BYTES = 8 * 1024 * 1024;
+const CHUNK_UPLOAD_THRESHOLD = 24 * 1024 * 1024;
 const RANGE_PART_MIN_BYTES = 4 * 1024 * 1024;
 const RANGE_THRESHOLD_BYTES = 8 * 1024 * 1024;
 const MAX_RANGE_PARTS = 12;
@@ -48,7 +50,7 @@ function request(url, method, headers) {
   const transport = url.protocol === 'https:' ? https : http;
   const req = transport.request(url, { method, headers, agent: agents[url.protocol] });
   req.setNoDelay(true);
-  req.setTimeout(120000, () => req.destroy(new Error('A transferência ficou sem resposta; o arquivo permanece pendente.')));
+  req.setTimeout(120000, () => req.destroy(Object.assign(new Error('A transferência ficou sem resposta; o arquivo permanece pendente.'), { code: 'ETIMEDOUT' })));
   return req;
 }
 async function responseJson(response) {
@@ -58,10 +60,67 @@ async function responseJson(response) {
     if (text.length > 32768) throw new Error('Resposta inválida do servidor.');
   }
   let body;
-  try { body = JSON.parse(text); } catch { throw new Error('O endereço não respondeu como servidor FortesDrive.'); }
-  if (response.statusCode < 200 || response.statusCode >= 300) throw Object.assign(new Error(body.error || 'Envio recusado pelo servidor.'), { status: response.statusCode });
+  try { body = JSON.parse(text); } catch { throw Object.assign(new Error('O endereço não respondeu como servidor FortesDrive.'), { status: response.statusCode }); }
+  if (response.statusCode < 200 || response.statusCode >= 300) throw Object.assign(new Error(body.error || 'Envio recusado pelo servidor.'), { status: response.statusCode, retryAfterMs: Math.max(0, Number(response.headers['retry-after']) || 0) * 1000 });
   return body;
 }
+async function sendUploadBuffer(url, bytes, headers) {
+  const req = request(url, 'PUT', { ...headers, 'Content-Length': bytes.length });
+  return new Promise((resolve, reject) => {
+    req.once('error', reject);
+    req.once('response', response => responseJson(response).then(resolve, reject));
+    req.end(bytes);
+  }).catch(error => { req.destroy(); throw error; });
+}
+
+async function sendUploadPart(url, bytes, headers) {
+  for (let attempt = 0; ; attempt++) {
+    try { return await sendUploadBuffer(url, bytes, headers); }
+    catch (error) {
+      const transient = [408, 425, 429, 500, 502, 503, 504, 520, 522, 524, 530].includes(error.status)
+        || ['ECONNRESET', 'ETIMEDOUT', 'EPIPE', 'EAI_AGAIN', 'ECONNREFUSED'].includes(error.code);
+      if (!transient || attempt >= 3) throw error;
+      await new Promise(resolve => setTimeout(resolve, Math.max(500 * 2 ** attempt, error.retryAfterMs || 0)));
+    }
+  }
+}
+
+async function uploadInParts(targetPath, url, expected, before, progress) {
+  const handle = await fs.open(targetPath, 'r');
+  const parts = Math.ceil(expected.size / UPLOAD_CHUNK_BYTES);
+  const hash = crypto.createHash('sha256');
+  const headers = { 'Content-Type': 'application/octet-stream', 'x-fd-sha256': expected.checksum, 'x-fd-size': String(expected.size) };
+  try {
+    const opened = await handle.stat();
+    if (opened.dev !== before.dev || opened.ino !== before.ino || opened.size !== before.size || opened.mtimeMs !== before.mtimeMs) throw new Error('Arquivo alterado antes do envio.');
+    for (let part = 0; part < parts; part++) {
+      const offset = part * UPLOAD_CHUNK_BYTES;
+      const bytes = Buffer.allocUnsafe(Math.min(UPLOAD_CHUNK_BYTES, expected.size - offset));
+      let read = 0;
+      while (read < bytes.length) {
+        const result = await handle.read(bytes, read, bytes.length - read, offset + read);
+        if (!result.bytesRead) throw new Error('Arquivo alterado durante a leitura.');
+        read += result.bytesRead;
+      }
+      hash.update(bytes);
+      const partUrl = new URL(url);
+      partUrl.searchParams.set('part', String(part)); partUrl.searchParams.set('parts', String(parts));
+      const stored = await sendUploadPart(partUrl, bytes, headers);
+      if (stored.ok !== true || stored.partial !== true || stored.part !== part || stored.parts !== parts) throw new Error('O servidor instalado não confirmou o bloco; atualize o servidor antes de reenviar.');
+      progress?.(offset + bytes.length, expected.size);
+    }
+    const afterRead = await handle.stat();
+    const current = await fs.lstat(targetPath);
+    const digest = hash.digest('hex');
+    if (digest !== expected.checksum.toLowerCase() || afterRead.size !== before.size || afterRead.mtimeMs !== before.mtimeMs || afterRead.ctimeMs !== before.ctimeMs || current.dev !== before.dev || current.ino !== before.ino || current.size !== before.size || current.mtimeMs !== before.mtimeMs) throw new Error('Arquivo alterado durante o envio; nenhum conteúdo parcial foi confirmado.');
+    const finalUrl = new URL(url);
+    finalUrl.searchParams.set('finalize', '1'); finalUrl.searchParams.set('parts', String(parts));
+    const body = await sendUploadBuffer(finalUrl, Buffer.alloc(0), headers);
+    if (body.ok !== true || body.size !== expected.size || body.checksum !== digest) throw new Error('Integridade ou confirmação divergente; o arquivo não foi concluído.');
+    return body;
+  } finally { await handle.close(); }
+}
+
 async function upload(root, relative, authorization, expected, progress, allowLocal = false) {
   checkedSize(expected.size);
   if (!/^[a-f0-9]{64}$/i.test(expected.checksum || '')) throw new Error('Checksum obrigatório.');
@@ -98,6 +157,16 @@ async function upload(root, relative, authorization, expected, progress, allowLo
     const identity = `${after.dev}:${after.ino}`;
     native.remember?.(root, relative, { size: after.size, mtimeMs: after.mtimeMs, ctimeMs: after.ctimeMs, identity, checksum: digest });
     return { storageKey: authorization.storageKey, checksum: digest, size: after.size, mtimeMs: after.mtimeMs, ctimeMs: after.ctimeMs, identity };
+  }
+
+  // O IPC nativo não passa pelo upload do navegador: precisa dividir o arquivo aqui.
+  if (expected.size >= CHUNK_UPLOAD_THRESHOLD) {
+    const body = await uploadInParts(targetPath, url, expected, before, progress);
+    const after = await fs.lstat(targetPath);
+    if (after.size !== before.size || after.mtimeMs !== before.mtimeMs || after.dev !== before.dev || after.ino !== before.ino) throw new Error('Arquivo alterado durante o envio.');
+    const identity = `${after.dev}:${after.ino}`;
+    native.remember?.(root, relative, { size: after.size, mtimeMs: after.mtimeMs, ctimeMs: after.ctimeMs, identity, checksum: body.checksum });
+    return { storageKey: authorization.storageKey, checksum: body.checksum, size: after.size, mtimeMs: after.mtimeMs, ctimeMs: after.ctimeMs, identity };
   }
 
   const hash = crypto.createHash('sha256');
@@ -198,13 +267,17 @@ async function download(root, relative, address, file, expected, progress, allow
   let keepPartialForResume = false;
   let stagingPath = tempFallbackPath;
 
-  const persistPartialMeta = async () => {
-    if (!partialMetaPath) return;
-    const tmpMeta = partialMetaPath + '.tmp';
-    try {
+  // As faixas terminam juntas: um único escritor evita perder checkpoints no mesmo .tmp.
+  let metaSaving = Promise.resolve();
+  const persistPartialMeta = () => {
+    if (!partialMetaPath) return Promise.resolve();
+    metaSaving = metaSaving.then(async () => {
+      await handle.sync();
+      const tmpMeta = partialMetaPath + '.tmp';
       await fs.writeFile(tmpMeta, JSON.stringify({ checksum: targetChecksum, size: total, parts, done: [...completedSegments] }), 'utf8');
       await fs.rename(tmpMeta, partialMetaPath);
-    } catch {}
+    });
+    return metaSaving;
   };
 
   try {
@@ -276,7 +349,10 @@ async function download(root, relative, address, file, expected, progress, allow
             await persistPartialMeta();
           })());
         }
-        await Promise.all(tasks);
+        // Uma faixa que cai não fecha o arquivo enquanto as outras ainda gravam.
+        const completed = await Promise.allSettled(tasks);
+        const failure = completed.find(result => result.status === 'rejected');
+        if (failure) throw failure.reason;
         await handle.close(); handle = null;
         let verifiedDigest = await hashPool.computeFileHash(stagingPath, total);
         if (verifiedDigest !== targetChecksum) {

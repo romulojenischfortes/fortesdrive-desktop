@@ -62,7 +62,7 @@ const MAX_CONCURRENT_UPLOADS = Number(process.env.MAX_CONCURRENT_UPLOADS || 96);
 const RATE_LIMIT_PER_MINUTE = Number(process.env.RATE_LIMIT_PER_MINUTE || 120000);
 // Tempo máximo que um arquivo espera por uma vaga antes de o cliente tentar de novo.
 const UPLOAD_SLOT_WAIT_MS = Number(process.env.UPLOAD_SLOT_WAIT_MS || 120000);
-const VERSION = '2.3.0';
+const VERSION = '2.4.0';
 const STARTED_AT = Date.now();
 const MAX_SIGNATURE_LIFETIME_MS = 25 * 3600 * 1000;
 // Pasta onde estão os arquivos gravados antes da migração (o volume da pasta
@@ -136,7 +136,7 @@ function setCorsHeaders(req, res) {
     : (origin && ALLOWED_ORIGINS.includes(origin) ? origin : ALLOWED_ORIGINS[0] || '*');
   res.setHeader('Access-Control-Allow-Origin', allow);
   res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, PUT, DELETE, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'content-type, x-fd-sha256, ngrok-skip-browser-warning');
+  res.setHeader('Access-Control-Allow-Headers', 'content-type, x-fd-sha256, x-fd-size, ngrok-skip-browser-warning');
   res.setHeader('Access-Control-Expose-Headers', 'content-length, content-range, accept-ranges');
   res.setHeader('Vary', 'Origin');
 }
@@ -352,30 +352,153 @@ function releaseUploadSlot() {
   next.resolve(true);
 }
 
-async function handleUpload(req, res, key) {
+/** Blocos de envios abandonados não ficam ocupando a pasta de dados. */
+async function cleanupChunkSessions() {
+  const dir = path.join(TMP_DIR, '.chunks');
+  try {
+    const entries = await fsp.readdir(dir, { withFileTypes: true });
+    const now = Date.now();
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      const full = path.join(dir, entry.name);
+      const stats = await fsp.stat(full).catch(() => null);
+      if (stats && now - stats.mtimeMs > 6 * 60 * 60 * 1000) await fsp.rm(full, { recursive: true, force: true });
+    }
+  } catch {
+    /* área de preparo ainda vazia */
+  }
+}
+
+// ── Envio em blocos (mesma técnica do Google Drive) ────────────────────
+// O túnel que expõe este servidor corta qualquer corpo acima de 100 MB: um
+// arquivo grande numa única requisição derrubava a conexão no meio e o app
+// repetia o erro sem parar. O cliente manda blocos pequenos e pede a montagem
+// no fim — cada requisição fica muito abaixo do corte, uma queda de rede custa
+// só um bloco e o arquivo nunca é publicado pela metade.
+async function handleUpload(req, res, key, url) {
   const declared = String(req.headers['x-fd-sha256'] || '').toLowerCase();
   const lengthHeader = req.headers['content-length'];
   const contentLength = lengthHeader == null ? null : Number(lengthHeader);
+  const sizeHeader = req.headers['x-fd-size'];
+  const declaredSize = sizeHeader == null ? null : Number(sizeHeader);
+  const parts = Number(url?.searchParams.get('parts') || 0);
+  const partIndex = Number(url?.searchParams.get('part') ?? -1);
+  const finalize = url?.searchParams.get('finalize') === '1';
+  const chunked = Number.isInteger(parts) && parts > 1;
+  // Em um gateway antigo (sem o módulo do Nextcloud) `nextcloud` não existe: o
+  // teste abaixo é seguro ali também — é esta a rotina que o reparo distribui.
+  const backend = typeof nextcloud !== 'undefined' && nextcloud ? nextcloud : null;
+
+  const chunkDir = path.join(TMP_DIR, '.chunks');
+  const chunkPathFor = (session, index) => path.join(session, String(index).padStart(5, '0') + '.part');
+
+  async function storeChunk(session, index) {
+    await fsp.mkdir(session, { recursive: true });
+    const { pipeline } = require('node:stream/promises');
+    const output = fs.createWriteStream(chunkPathFor(session, index), { flags: 'w', highWaterMark: 1024 * 1024 });
+    await pipeline(req, output);
+  }
+
+  async function assembleChunks(session, count, target) {
+    const { pipeline } = require('node:stream/promises');
+    const hash = crypto.createHash('sha256');
+    let total = 0;
+    const source = (async function* () {
+      for (let index = 0; index < count; index += 1) {
+        const chunkFile = chunkPathFor(session, index);
+        const exists = await fsp.stat(chunkFile).catch(() => null);
+        if (!exists) {
+          throw Object.assign(new Error('Faltou o bloco ' + (index + 1) + ' de ' + count + '; envie novamente.'), { status: 409 });
+        }
+        const stream = fs.createReadStream(chunkFile, { highWaterMark: 4 * 1024 * 1024 });
+        for await (const chunk of stream) {
+          hash.update(chunk);
+          total += chunk.length;
+          yield chunk;
+        }
+      }
+    })();
+    await pipeline(source, fs.createWriteStream(target, { flags: 'wx', highWaterMark: 4 * 1024 * 1024 }));
+    return { digest: hash.digest('hex'), written: total };
+  }
+
+  async function publishObject(target, digest) {
+    if (!backend) {
+      const finalPath = objectPath(key);
+      await fsp.mkdir(path.dirname(finalPath), { recursive: true });
+      await fsp.rename(target, finalPath);
+      return 'disk';
+    }
+    await backend.putFile(key, target, digest);
+    return 'nextcloud';
+  }
 
   if (!/^[a-f0-9]{64}$/.test(declared)) {
+    req.resume();
     return sendJson(res, 422, { error: 'Informe o checksum SHA-256 em x-fd-sha256.' });
   }
-  if (contentLength !== null && (!/^\d+$/.test(String(lengthHeader)) || !Number.isSafeInteger(contentLength))) {
+  if (declaredSize !== null && (!Number.isSafeInteger(declaredSize) || declaredSize < 0)) {
+    req.resume();
     return sendJson(res, 400, { error: 'Tamanho informado inválido.' });
   }
-  if (contentLength !== null && contentLength > MAX_UPLOAD_BYTES) {
+  if (declaredSize !== null && declaredSize > MAX_UPLOAD_BYTES) {
+    req.resume();
+    return sendJson(res, 413, { error: 'Arquivo acima do limite configurado no servidor.' });
+  }
+  if (!chunked && contentLength !== null && (!/^\d+$/.test(String(lengthHeader)) || !Number.isSafeInteger(contentLength))) {
+    return sendJson(res, 400, { error: 'Tamanho informado inválido.' });
+  }
+  if (!chunked && contentLength !== null && contentLength > MAX_UPLOAD_BYTES) {
     return sendJson(res, 413, { error: 'Arquivo acima do limite configurado no servidor.' });
   }
   req.socket?.setNoDelay?.(true);
+
+  // ── Um bloco do arquivo: guarda e responde rápido. ──
+  if (chunked && !finalize) {
+    if (!Number.isInteger(partIndex) || partIndex < 0 || partIndex >= parts) {
+      req.resume();
+      return sendJson(res, 400, { error: 'Bloco inválido.' });
+    }
+    if (!(await acquireUploadSlot())) {
+      req.resume();
+      return sendJson(res, 429, { error: 'O servidor está ocupado com outros envios. Tente novamente em instantes.' });
+    }
+    const session = path.join(chunkDir, crypto.createHash('sha256').update(key).digest('hex').slice(0, 32));
+    try {
+      await storeChunk(session, partIndex);
+      return sendJson(res, 200, { ok: true, key, partial: true, part: partIndex, parts });
+    } catch (error) {
+      console.error('[gateway] falha no bloco ' + partIndex + ' de ' + key + ': ' + error.message);
+      if (!res.destroyed) sendJson(res, 500, { error: 'Não foi possível guardar este bloco: ' + error.message });
+      return;
+    } finally {
+      releaseUploadSlot();
+    }
+  }
+
   if (!(await acquireUploadSlot())) {
+    req.resume();
     return sendJson(res, 429, { error: 'O servidor está ocupado com outros envios. Tente novamente em instantes.' });
   }
 
   const tempPath = path.join(TMP_DIR, crypto.randomUUID() + '.part');
-  // Em um gateway antigo (sem o módulo do Nextcloud) `nextcloud` não existe: o
-  // teste abaixo é seguro ali também — é esta a rotina que o reparo distribui.
-  const backend = typeof nextcloud !== 'undefined' && nextcloud ? nextcloud : null;
+  const sessionDir = chunked ? path.join(chunkDir, crypto.createHash('sha256').update(key).digest('hex').slice(0, 32)) : null;
   try {
+    // ── Montagem: junta os blocos, confere o conteúdo e publica. ──
+    if (chunked) {
+      req.resume();
+      const { digest, written } = await assembleChunks(sessionDir, parts, tempPath);
+      if (declaredSize !== null && written !== declaredSize) {
+        throw Object.assign(new Error('O conteúdo recebido não corresponde ao tamanho informado.'), { status: 422 });
+      }
+      if (digest !== declared) {
+        throw Object.assign(new Error('Checksum divergente: o arquivo chegou corrompido e não foi gravado.'), { status: 422 });
+      }
+      const published = await publishObject(tempPath, digest);
+      await fsp.rm(sessionDir, { recursive: true, force: true });
+      return sendJson(res, 200, { ok: true, key, size: written, checksum: digest, backend: published, chunks: parts });
+    }
+
     const finalPath = backend ? null : objectPath(key);
     if (finalPath) await fsp.mkdir(path.dirname(finalPath), { recursive: true });
     const hash = crypto.createHash('sha256');
@@ -410,6 +533,7 @@ async function handleUpload(req, res, key) {
     sendJson(res, 200, { ok: true, key, size: written, checksum: digest, backend: backend ? 'nextcloud' : 'disk' });
   } catch (error) {
     if (!req.destroyed) req.resume();
+    if (sessionDir) await fsp.rm(sessionDir, { recursive: true, force: true }).catch(() => {});
     console.error('[gateway] falha no envio de ' + key + ': ' + error.message);
     if (!res.destroyed) sendJson(res, error.status || (backend ? 502 : 500), { error: error.message });
   } finally {
@@ -756,7 +880,7 @@ const server = http.createServer(async (req, res) => {
 
       if (op === 'put') {
         if (req.method !== 'PUT') return sendJson(res, 405, { error: 'Use PUT para enviar conteúdo.' });
-        return await handleUpload(req, res, key);
+        return await handleUpload(req, res, key, url);
       }
       if (op === 'get') {
         if (req.method !== 'GET' && req.method !== 'HEAD') return sendJson(res, 405, { error: 'Use GET para baixar.' });
@@ -781,6 +905,8 @@ server.keepAliveTimeout = 65000;
 
 // Estado da migração anterior (se houve) fica disponível já na primeira consulta.
 loadMigration().catch(() => {});
+// Blocos de envios interrompidos no passado não ficam ocupando a pasta de dados.
+cleanupChunkSessions().catch(() => {});
 
 server.listen(PORT, '0.0.0.0', () => {
   console.log('[gateway] FortesDrive storage gateway ' + VERSION + ' na porta ' + PORT);

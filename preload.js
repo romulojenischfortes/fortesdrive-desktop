@@ -9,6 +9,7 @@ const channels = {
   notify: "notify", publishSyncStatus: "publishSyncStatus",
   recordTransferCompletion: "recordTransferCompletion", recordTransferCompletions: "recordTransferCompletions", getTransferHistory: "getTransferHistory",
   exportTransferHistory: "exportTransferHistory", revealTransferHistoryItem: "revealTransferHistoryItem",
+  openSyncFolder: "openSyncFolder",
   getBadgeSetup: "getBadgeSetup", repairBadges: "repairBadges",
   getUpdateStatus: "getUpdateStatus", checkForUpdates: "checkForUpdates",
   getInstallationHealth: "getInstallationHealth", confirmInstallation: "confirmInstallation",
